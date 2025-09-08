@@ -33,9 +33,16 @@ vfa x mydata.vfa -o ./restore
 # Create an encrypted archive
 vfa c secret.vfa ./docs --method lzma --level 9 --solid --password
 
-# Build a self-extracting archive (Windows)
-pyinstaller --onefile sfx_stub.py -n vfa_sfx
-copy /b dist\vfa_sfx.exe + secret.vfa Secret_SFX.exe
+# Build executables for your platform.
+
+# Windows (PowerShell)
+py build.py
+python build.py --debug
+python build.py --name-suffix _beta --noconsole-sfx
+
+# Linux / macOS
+python3 build.py
+python3 build.py --debug --name-suffix _beta
 ```
 
 ---
