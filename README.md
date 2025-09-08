@@ -67,4 +67,4 @@ copy /b dist\vfa_sfx.exe + secret.vfa Secret_SFX.exe
 
 ---
 
-Copyright (c) 2025 TG11 LLC
+Copyright © 2025 TG11 LLC
