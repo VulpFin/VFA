@@ -1,0 +1,19 @@
+# === VFA core dependencies ===
+zstandard>=0.22.0
+brotli>=1.1.0
+cryptography>=42.0.0
+argon2-cffi>=23.1.0
+colorama>=0.4.6
+
+# === SFX build tool ===
+pyinstaller>=6.0
+
+# === Security tools ===
+pip-audit>=2.7.0
+safety>=3.0.0
+bandit>=1.7.9
+
+# Note: Trivy and Grype are not Python packages.
+# Install them separately:
+#   https://aquasecurity.github.io/trivy/
+#   https://github.com/anchore/grype
