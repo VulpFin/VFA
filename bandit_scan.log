@@ -1,0 +1,397 @@
+[main]  INFO    profile include tests: None
+[main]  INFO    profile exclude tests: None
+[main]  INFO    cli include tests: None    
+[main]  INFO    cli exclude tests: None    
+[main]  INFO    running on Python 3.10.5   
+Run started:2025-09-08 09:21:22.684023
+
+Test results:
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\sfx_stub.py:344:12
+343                 try: os.utime(out_path, (e["mtime"], e["mtime"]))
+344                 except Exception: pass
+345                 LOGGER.debug(f"Extracted {e['path']} ({len(seg)} bytes)")
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\sfx_stub.py:388:12
+387                     os.utime(out_path, (e["mtime"], e["mtime"]))
+388                 except Exception:
+389                     pass
+390                 LOGGER.debug(f"Extracted {e['path']} ({e['size']} bytes)")
+
+--------------------------------------------------
+>> Issue: [B404:blacklist] Consider possible security implications associated with the subprocess module.
+   Severity: Low   Confidence: High
+   CWE: CWE-78 (https://cwe.mitre.org/data/definitions/78.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/blacklists/blacklist_imports.html#b404-import-subprocess
+   Location: .\vfa.py:18:0
+17      from __future__ import annotations
+18      import argparse, getpass, io, os, sys, struct, time, pathlib, platform, json, stat, subprocess, ctypes
+19      from dataclasses import dataclass, field
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:369:16
+368                         out[n]=v
+369                     except Exception: pass
+370             except Exception: pass
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:370:8
+369                     except Exception: pass
+370             except Exception: pass
+371         return out
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:377:12
+376                 try: os.setxattr(path, n, v, follow_symlinks=follow_symlinks)
+377                 except Exception: pass
+378
+
+--------------------------------------------------
+>> Issue: [B607:start_process_with_partial_path] Starting a process with a partial executable path
+   Severity: Low   Confidence: High
+   CWE: CWE-78 (https://cwe.mitre.org/data/definitions/78.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b607_start_process_with_partial_path.html
+   Location: .\vfa.py:381:12
+380         try:
+381             r = subprocess.run(["getfacl","--absolute-names","--tabs","-p","--", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+382             if r.returncode==0: return r.stdout.decode("utf-8", "replace")
+
+--------------------------------------------------
+>> Issue: [B603:subprocess_without_shell_equals_true] subprocess call - check for execution of untrusted input.
+   Severity: Low   Confidence: High
+   CWE: CWE-78 (https://cwe.mitre.org/data/definitions/78.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b603_subprocess_without_shell_equals_true.html
+   Location: .\vfa.py:381:12
+380         try:
+381             r = subprocess.run(["getfacl","--absolute-names","--tabs","-p","--", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+382             if r.returncode==0: return r.stdout.decode("utf-8", "replace")
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:383:4
+382             if r.returncode==0: return r.stdout.decode("utf-8", "replace")
+383         except Exception: pass
+384         return None
+
+--------------------------------------------------
+>> Issue: [B607:start_process_with_partial_path] Starting a process with a partial executable path
+   Severity: Low   Confidence: High
+   CWE: CWE-78 (https://cwe.mitre.org/data/definitions/78.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b607_start_process_with_partial_path.html
+   Location: .\vfa.py:388:12
+387         try:
+388             p = subprocess.Popen(["setfacl","--restore=-"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+389             p.communicate(input=text.encode("utf-8", "replace"))
+
+--------------------------------------------------
+>> Issue: [B603:subprocess_without_shell_equals_true] subprocess call - check for execution of untrusted input.
+   Severity: Low   Confidence: High
+   CWE: CWE-78 (https://cwe.mitre.org/data/definitions/78.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b603_subprocess_without_shell_equals_true.html
+   Location: .\vfa.py:388:12
+387         try:
+388             p = subprocess.Popen(["setfacl","--restore=-"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+389             p.communicate(input=text.encode("utf-8", "replace"))
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:390:4
+389             p.communicate(input=text.encode("utf-8", "replace"))
+390         except Exception: pass
+391
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:407:4
+406             if res!=0: pass
+407         except Exception: pass
+408
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:471:8
+470                         ads.append({"name": name, "hex": None})
+471             except Exception:
+472                 pass
+473             if ads: meta["ads"]=ads
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:474:4
+473             if ads: meta["ads"]=ads
+474         except Exception: pass
+475         return meta
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:482:4
+481                 win32file.SetFileAttributesW(path, int(meta["attrs"]))
+482         except Exception: pass
+483         if any(k in meta for k in ("ctime","atime","mtime")):
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:495:8
+494                 win32file.SetFileTime(h, ct, at, mt); h.Close()
+495             except Exception: pass
+496         if "sddl" in meta:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:504:8
+503                     win32security.GROUP_SECURITY_INFORMATION, sd)
+504             except Exception: pass
+505         if "ads" in meta:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:511:12
+510                         with open(path + s["name"], "wb") as sf: sf.write(data)
+511                 except Exception: pass
+512
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:827:12
+826                 try: os.chmod(out_path, e.mode)
+827                 except Exception: pass
+828                 try: os.utime(out_path, (e.mtime, e.mtime))
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:829:12
+828                 try: os.utime(out_path, (e.mtime, e.mtime))
+829                 except Exception: pass
+830                 if e.meta_json and WIN:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:832:16
+831                     try: win_apply_meta(str(out_path), json.loads(e.meta_json.decode()), True)
+832                     except Exception: pass
+833                 if e.meta_json and LIN and args.posixmeta:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:837:20
+836                         try: os.chown(out_path, pos.get("uid", -1), pos.get("gid", -1))
+837                         except Exception: pass
+838                         if args.xattrs and "xattrs" in meta:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:841:16
+840                         if args.acl and meta.get("acl"): setfacl_restore(meta["acl"], str(out_path))
+841                     except Exception: pass
+842                 LOGGER.trace(f"Created directory {e.path}")
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:862:12
+861                     meta=json.loads(e.meta_json.decode()); target=meta.get("link_target","")
+862                 except Exception: pass
+863                 try:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:866:20
+865                         try: os.remove(out_path)
+866                         except Exception: pass
+867                         os.symlink(target, out_path)
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:869:20
+868                         try: os.lchmod(out_path, e.mode)
+869                         except Exception: pass
+870                         if args.posixmeta and "posix" in meta:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:873:24
+872                             try: os.lchown(out_path, pos.get("uid",-1), pos.get("gid",-1))
+873                             except Exception: pass
+874                         if args.xattrs and "xattrs" in meta:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:876:12
+875                             apply_xattrs(str(out_path), {k:bytes.fromhex(v) for k,v in meta["xattrs"].items()}, follow_symlinks=False)
+876                 except Exception: pass
+877                 LOGGER.trace(f"Created symlink {e.path} -> {target}")
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:898:12
+897                 try: os.chmod(out_path, e.mode)
+898                 except Exception: pass
+899                 try: os.utime(out_path, (e.mtime, e.mtime))
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:900:12
+899                 try: os.utime(out_path, (e.mtime, e.mtime))
+900                 except Exception: pass
+901
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:904:16
+903                     try: win_apply_meta(str(out_path), json.loads(e.meta_json.decode()), False)
+904                     except Exception: pass
+905
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:910:20
+909                         try: os.chown(out_path, pos.get("uid",-1), pos.get("gid",-1))
+910                         except Exception: pass
+911                         if args.xattrs and "xattrs" in meta:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:918:16
+917                                     fallocate_punch_hole(fw.fileno(), off, ln)
+918                     except Exception: pass
+919
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:928:12
+927                     meta=json.loads(e.meta_json.decode()); target=meta.get("hardlink_to","")
+928                 except Exception: pass
+929                 try:
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:935:24
+934                                 if out_path.exists(): os.remove(out_path)
+935                             except Exception: pass
+936                             os.link(src, out_path)
+
+--------------------------------------------------
+>> Issue: [B110:try_except_pass] Try, Except, Pass detected.
+   Severity: Low   Confidence: High
+   CWE: CWE-703 (https://cwe.mitre.org/data/definitions/703.html)
+   More Info: https://bandit.readthedocs.io/en/1.8.6/plugins/b110_try_except_pass.html
+   Location: .\vfa.py:938:12
+937                             LOGGER.trace(f"Created hardlink {e.path} -> {target}")
+938                 except Exception: pass
+939
+
+--------------------------------------------------
+
+Code scanned:
+        Total lines of code: 1263
+        Total lines skipped (#nosec): 0
+
+Run metrics:
+        Total issues (by severity):
+                Undefined: 0
+                Low: 37
+                Medium: 0
+                High: 0
+        Total issues (by confidence):
+                Undefined: 0
+                Low: 0
+                Medium: 0
+                High: 37
+Files skipped (0):
