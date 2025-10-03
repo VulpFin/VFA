@@ -1,15 +1,15 @@
 # Copyright (C) 2025 TG11
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
 # published by the Free Software Foundation, either version 3 of the
 # License, or (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
@@ -1007,42 +1007,140 @@ def cmd_append(args):
             f"added {human_bytes(prog.done_bytes)} | archive now {human_bytes(arch_final)}"
         )
 
+
 # ---------- CLI ----------
 def build_argparser():
-    ap=argparse.ArgumentParser(prog="vfa", description="Vulpfin Archive (.vfa) — CPython prototype")
-    sub=ap.add_subparsers(dest="cmd", required=True)
+    ap = argparse.ArgumentParser(
+        prog="vfa", description="Vulpfin Archive (.vfa) — Python Prototype"
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
 
-    ap_c=sub.add_parser("c", help="Create archive")
-    ap_c.add_argument("output"); ap_c.add_argument("inputs", nargs="+")
-    ap_c.add_argument("--method", default=("zstd" if HAVE_ZSTD else "zlib"), choices=list(NAME_TO_METHOD.keys()))
-    ap_c.add_argument("--level", type=int, default=5)
-    ap_c.add_argument("--block-exp", type=int, default=22, dest="block_exp")
-    ap_c.add_argument("--threads", type=int, default=0); ap_c.add_argument("--max-ram-mib", type=int, default=0)
-    ap_c.add_argument("--password", action="store_true")
+    # --- Create ---
+    ap_c = sub.add_parser("c", help="Create archive")
+    ap_c.add_argument("output", help="Archive filename to create (.vfa)")
+    ap_c.add_argument("inputs", nargs="+", help="Input files/folders to include")
+    ap_c.add_argument(
+        "--method",
+        default=("zstd" if HAVE_ZSTD else "zlib"),
+        choices=list(NAME_TO_METHOD.keys()),
+        help="Compression method, default zstd",
+    )
+    ap_c.add_argument(
+        "--level",
+        type=int,
+        default=5,
+        help="Method specific compression level, default 5",
+    )
+    ap_c.add_argument(
+        "--block-exp",
+        type=int,
+        default=22,
+        dest="block_exp",
+        help="Block size as power-of-two exponent (default 2^22=4MiB)",
+    )
+    ap_c.add_argument("--threads", type=int, default=0, help="Worker threads (0=auto)")
+    ap_c.add_argument(
+        "--max-ram-mib", type=int, default=0, help="Max RAM usage (MiB, 0=unlimited)"
+    )
+    ap_c.add_argument(
+        "--password",
+        action="store_true",
+        help="Enable password prompt (encrypt archive)",
+    )
     # Solid options
     ap_c.add_argument("--solid", action="store_true", help="Solid mode (single stream)")
-    ap_c.add_argument("--solid-chunk-exp", type=int, default=None, help="Split solid stream into chunks of 2^N bytes (uncompressed)")
-    ap_c.add_argument("--solid-by", choices=["none","ext"], default="none", help="Order solid stream by grouping (ext groups similar files together)")
+    ap_c.add_argument(
+        "--solid-chunk-exp",
+        type=int,
+        default=None,
+        help="Split solid stream into chunks of 2^N bytes (uncompressed)",
+    )
+    ap_c.add_argument(
+        "--solid-by",
+        choices=["none", "ext"],
+        default="none",
+        help="Order solid stream by grouping (ext groups similar files together)",
+    )
     # Windows / POSIX meta
-    ap_c.add_argument("--winmeta", action="store_true", help="Windows: store attributes/ACL/ADS/timestamps")
-    ap_c.add_argument("--posixmeta", action="store_true", help="Linux/Unix: store uid/gid/mode/atime/mtime/ctime (+links)")
-    ap_c.add_argument("--xattrs", action="store_true", help="Store extended attributes (xattrs)")
-    ap_c.add_argument("--acl", action="store_true", help="Store POSIX ACLs via getfacl/setfacl")
-    ap_c.add_argument("--selinux", action="store_true", help="Store SELinux context (if present)")
-    ap_c.add_argument("--sparse", action="store_true", help="Detect & restore sparse holes (Linux only)")
+    ap_c.add_argument(
+        "--winmeta",
+        action="store_true",
+        help="Windows: store attributes/ACL/ADS/timestamps",
+    )
+    ap_c.add_argument(
+        "--posixmeta",
+        action="store_true",
+        help="Linux/Unix: store uid/gid/mode/atime/mtime/ctime (+links)",
+    )
+    ap_c.add_argument(
+        "--xattrs", action="store_true", help="Store extended attributes (xattrs)"
+    )
+    ap_c.add_argument(
+        "--acl", action="store_true", help="Store POSIX ACLs via getfacl/setfacl"
+    )
+    ap_c.add_argument(
+        "--selinux", action="store_true", help="Store SELinux context (if present)"
+    )
+    ap_c.add_argument(
+        "--sparse",
+        action="store_true",
+        help="Detect & restore sparse holes (Linux only)",
+    )
     # KDF tuning
-    ap_c.add_argument("--kdf-time", type=int, default=3); ap_c.add_argument("--kdf-mem-kib", type=int, default=256*1024); ap_c.add_argument("--kdf-parallel", type=int, default=4)
-    ap_c.add_argument("--scrypt-n", type=int, default=1<<15); ap_c.add_argument("--scrypt-r", type=int, default=8); ap_c.add_argument("--scrypt-p", type=int, default=1)
+    ap_c.add_argument(
+        "--kdf-time", type=int, default=3, help="Argon2id: time cost (iterations)"
+    )
+    ap_c.add_argument(
+        "--kdf-mem-kib",
+        type=int,
+        default=256 * 1024,
+        help="Argon2id: memory cost (KiB)",
+    )
+    ap_c.add_argument("--kdf-parallel", type=int, default=4, help="Argon2id: parallelism")
+    ap_c.add_argument("--scrypt-n", type=int, default=1 << 15, help="scrypt: N parameter")
+    ap_c.add_argument("--scrypt-r", type=int, default=8, help="scrypt: R parameter")
+    ap_c.add_argument("--scrypt-p", type=int, default=1, help="scrypt: P parameter")
 
-    ap_a=sub.add_parser("a", help="Append files to archive (non-solid only)")
-    ap_a.add_argument("archive"); ap_a.add_argument("inputs", nargs="+")
-    ap_a.add_argument("--method", default=None, choices=list(NAME_TO_METHOD.keys()))
-    ap_a.add_argument("--level", type=int, default=None)
-    ap_a.add_argument("--password", action="store_true", help="Prompt for password if encrypted")
+    # --- Append ---
+    ap_a = sub.add_parser("a", help="Append files to archive (non-solid only)")
+    ap_a.add_argument("archive")
+    ap_a.add_argument("inputs", nargs="+")
+    ap_a.add_argument(
+        "--method",
+        default=None,
+        choices=list(NAME_TO_METHOD.keys()),
+        help="Override compression method",
+    )
+    ap_a.add_argument(
+        "--level", type=int, default=None, help="Override compression level"
+    )
+    ap_a.add_argument(
+        "--password", action="store_true", help="Prompt for password if encrypted"
+    )
 
-    ap_l=sub.add_parser("l", help="List archive"); ap_l.add_argument("archive"); ap_l.add_argument("--password", action="store_true")
-    ap_t=sub.add_parser("t", help="Test archive"); ap_t.add_argument("archive"); ap_t.add_argument("--password", action="store_true")
-    ap_x=sub.add_parser("x", help="Extract archive"); ap_x.add_argument("archive"); ap_x.add_argument("-o","--output", default="."); ap_x.add_argument("--password", action="store_true")
+    # --- List ---
+    ap_l = sub.add_parser("l", help="List archive")
+    ap_l.add_argument("archive")
+    ap_l.add_argument(
+        "--password", action="store_true", help="Prompt for password if encrypted"
+    )
+
+    # --- Test ---
+    ap_t = sub.add_parser("t", help="Test archive")
+    ap_t.add_argument("archive")
+    ap_t.add_argument(
+        "--password", action="store_true", help="Prompt for password if encrypted"
+    )
+
+    # --- Extract ---
+    ap_x = sub.add_parser("x", help="Extract archive")
+    ap_x.add_argument("archive")
+    ap_x.add_argument(
+        "-o", "--output", default=".", help="Output directory (default: current)"
+    )
+    ap_x.add_argument(
+        "--password", action="store_true", help="Prompt for password if encrypted"
+    )
 
     # Logging flags for all subcommands
     for sp in (ap_c, ap_a, ap_l, ap_t, ap_x):
@@ -1053,6 +1151,7 @@ def build_argparser():
         sp.add_argument("-v","--verbose", action="store_true",
             help="Shortcut for --log-level info")
     return ap
+
 
 def main(argv=None):
     ap=build_argparser(); args=ap.parse_args(argv)
