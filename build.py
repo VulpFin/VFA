@@ -136,6 +136,33 @@ def build_sfx(debug=False, name_suffix="", icon_path=None, noconsole=False):
     shutil.move(str(src), str(dst))
     print(f"[build] SFX  => {dst}")
 
+def build_viewer(debug=False, name_suffix="", icon_path=None, noconsole=False):
+    entry = ROOT / "vfa_viewer.py"
+    if not exists(entry):
+        raise SystemExit("vfa_viewer.py not found next to build.py")
+
+    name = f"vfa_viewer{name_suffix}"
+    args = PYI + base_pyinstaller_args(debug=debug) + [
+        "-n", name,
+        str(entry),
+    ]
+    # For SFX, you may prefer console to keep debug logs. Allow override:
+    if noconsole and is_windows():
+        args += ["--noconsole"]
+    # Icon
+    if icon_path and is_windows() and exists(icon_path):
+        args += ["--icon", str(icon_path)]
+
+    run(args)
+
+    # Move artifact to bin/<platform>/
+    out_dir = ROOT / "bin" / ("windows" if is_windows() else "linux" if is_linux() else "macos")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = ROOT / "dist" / (name + (".exe" if is_windows() else ""))
+    dst = out_dir / (name + (".exe" if is_windows() else ""))
+    shutil.move(str(src), str(dst))
+    print(f"[build] Viewer  => {dst}")
+
 def main():
     ap = argparse.ArgumentParser(description="Build VFA and SFX with PyInstaller")
     ap.add_argument("--no-clean", action="store_true", help="Do not clean build/dist before building")
@@ -143,6 +170,7 @@ def main():
     ap.add_argument("--name-suffix", default="", help="Append suffix to output binary names")
     ap.add_argument("--icon", default="VFA.ico", help="Windows icon (.ico). If missing, skip.")
     ap.add_argument("--noconsole-sfx", action="store_true", help="Build SFX without console on Windows")
+    ap.add_argument("--noconsole-viewer", action="store_true", help="Build SFX without console on Windows")
     args = ap.parse_args()
 
     ensure_pyinstaller()
@@ -157,6 +185,9 @@ def main():
 
     # Build SFX stub
     build_sfx(debug=args.debug, name_suffix=args.name_suffix, icon_path=icon_path, noconsole=args.noconsole_sfx)
+
+    # Build Viewer
+    build_viewer(debug=args.debug, name_suffix=args.name_suffix, icon_path=icon_path, noconsole=args.noconsole_viewer)
 
     print("\n[build] All done!")
     print("       Outputs in ./bin/windows or ./bin/linux (depending on your OS).")
