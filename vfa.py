@@ -19,6 +19,8 @@ import argparse, getpass, io, os, sys, struct, time, pathlib, platform, json, st
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from datetime import datetime
+# from vulp_codec import compress_block, decompress_block
+global LOGGER
 
 # ---------- Optional deps ----------
 try:
@@ -34,7 +36,7 @@ try:
 except Exception:
     argon2ll = None; HAVE_ARGON2 = False
 
-import zlib, lzma, hashlib
+import zlib, lzma, hashlib, bz2
 try:
     import brotli; HAVE_BROTLI=True
 except Exception:
@@ -51,6 +53,10 @@ try:
     import xxhash; HAVE_XXH=True
 except Exception:
     HAVE_XXH=False
+try:
+    import lz4.frame as lz4f; HAVE_LZ4=True
+except Exception:
+    HAVE_LZ4=False
 
 WIN = (platform.system() == "Windows")
 LIN = (sys.platform.startswith("linux"))
@@ -114,14 +120,107 @@ class Progress:
         return elapsed, eta, rate, ratio
 
 # ---------- Constants ----------
-MAGIC=b"VFA1"; END_MAGIC=b"/VFA1"; VERSION=1
+MAGIC = b"VFA1"
+END_MAGIC = b"/VFA1"
+VERSION = 1
 
-AEAD_NONE=0; AEAD_AESGCM=1
-KDF_NONE=0; KDF_ARGON2ID=1; KDF_SCRYPT=2
+AEAD_NONE = 0
+AEAD_AESGCM = 1
+KDF_NONE = 0
+KDF_ARGON2ID = 1
+KDF_SCRYPT = 2
 
-M_NONE=0; M_ZLIB=1; M_LZMA=2; M_BROTLI=3; M_ZSTD=4
-METHOD_NAMES={M_NONE:"none",M_ZLIB:"zlib",M_LZMA:"lzma",M_BROTLI:"brotli",M_ZSTD:"zstd"}
-NAME_TO_METHOD={v:k for k,v in METHOD_NAMES.items()}
+M_NONE = 0
+M_ZLIB = 1
+M_LZMA = 2
+M_BROTLI = 3
+M_ZSTD = 4
+M_XZ = 5
+M_BZ2 = 6
+M_LZ4 = 7
+# M_VULP = #
+
+# id -> canonical lowercase name
+METHOD_NAMES = {
+    M_NONE: "none",
+    M_ZLIB: "zlib",
+    M_LZMA: "lzma",
+    M_BROTLI: "brotli",
+    M_ZSTD: "zstd",
+    M_XZ: "xz",
+    M_BZ2: "bz2",
+    M_LZ4: "lz4",
+#    M_VULP: "vulp",
+}
+
+# name -> id (pure reverse map)
+NAME_TO_METHOD = {name: mid for (mid, name) in METHOD_NAMES.items()}
+
+
+# Separate registry for implementations: id -> impl
+# (and optionally name -> impl if you like)
+class MethodImpl:
+    __slots__ = ("id", "name", "compress", "decompress", "level_min", "level_max")
+
+    def __init__(self, mid, name, compress, decompress, level_min=0, level_max=9):
+        self.id = int(mid)
+        self.name = name
+        self.compress = compress
+        self.decompress = decompress
+        self.level_min = int(level_min)
+        self.level_max = int(level_max)
+
+
+METHOD_IMPLS_BY_ID = {}  # int id -> MethodImpl
+METHOD_IMPLS_BY_NAME = {}  # str name -> MethodImpl
+
+
+def register_method(mid, name, compress, decompress, level_min=0, level_max=9):
+    impl = MethodImpl(mid, name, compress, decompress, level_min, level_max)
+    METHOD_IMPLS_BY_ID[mid] = impl
+    METHOD_IMPLS_BY_NAME[name] = impl
+
+"""
+# ---------- VULP glue ----------
+def vulp_compress(data: bytes, level: int = 5) -> bytes:
+    # Map level to block size (fast, simple knob): 256 KiB .. 2 MiB
+    if level is None:
+        level = 5
+    try:
+        level = int(level)
+    except Exception:
+        level = 5
+    if level < 0:
+        level = 0
+    if level > 12:
+        level = 12
+
+    base = 256 * 1024
+    top = 2 * 1024 * 1024
+    bs = base + ((top - base) * level) // 12
+
+    out = bytearray()
+    for i in range(0, len(data), bs):
+        out += compress_block(data[i : i + bs])
+    return bytes(out)
+
+
+def vulp_decompress(blob: bytes) -> bytes:
+    mv = memoryview(blob)
+    off = 0
+    out = bytearray()
+    while off < len(blob):
+        raw, off = decompress_block(mv, off)
+        out += raw
+    return bytes(out)
+
+
+# Register VULP without clobbering the name->id map
+register_method(
+    M_VULP, "vulp", vulp_compress, vulp_decompress, level_min=0, level_max=12
+)
+"""
+
 
 # Flags
 F_ENCRYPTED=1<<0
@@ -203,6 +302,7 @@ class FileEntry:
 class TOC:
     entries:List[FileEntry]=field(default_factory=list)
     def pack(self, solid: bool=False)->bytes:
+        if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("dataclass TOC function pack")
         out=io.BytesIO(); out.write(struct.pack("<I", len(self.entries)))
         for e in self.entries:
             p=e.path.encode("utf-8")
@@ -226,6 +326,7 @@ class TOC:
         return out.getvalue()
     @classmethod
     def unpack(cls, data:bytes, solid: bool=False)->"TOC":
+        if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("dataclass TOC classmethod function unpack")
         bio=io.BytesIO(data); (n,) = struct.unpack("<I", bio.read(4)); entries=[]
         for _ in range(n):
             (plen,) = struct.unpack("<H", bio.read(2)); path=bio.read(plen).decode("utf-8")
@@ -254,6 +355,7 @@ class TOC:
 
 # ---------- Crypto ----------
 def kdf_derive_key(password:bytes, header:HeaderV1)->bytes:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("crypto func kdf derive key")
     if header.kdf_id==KDF_ARGON2ID:
         if not HAVE_ARGON2: raise RuntimeError("argon2-cffi not installed")
         return argon2ll.hash_secret_raw(
@@ -268,40 +370,64 @@ def kdf_derive_key(password:bytes, header:HeaderV1)->bytes:
     raise RuntimeError("Archive not password-protected")
 
 def aead_encrypt(key:bytes, header:HeaderV1, index:int, plaintext:bytes, aad:bytes=b"")->bytes:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"crypto func aead encrypt with index {index}")
     if header.aead_id!=AEAD_AESGCM or not HAVE_AESGCM: raise RuntimeError("AESGCM unavailable")
     return AESGCM(key).encrypt(nonce_from(header.aead_nonce_prefix, index), plaintext, aad)
 def aead_decrypt(key:bytes, header:HeaderV1, index:int, ciphertext:bytes, aad:bytes=b"")->bytes:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"crypto func aead decrypt with index {index}")
     if header.aead_id!=AEAD_AESGCM or not HAVE_AESGCM: raise RuntimeError("AESGCM unavailable")
     return AESGCM(key).decrypt(nonce_from(header.aead_nonce_prefix, index), ciphertext, aad)
 
 # ---------- Compression ----------
 def compress_block(method:int, level:int, data:bytes)->bytes:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"compression func compress block with method {method} data {len(data)} level {level}")
     if method==M_NONE: return data
     if method==M_ZLIB: return zlib.compress(data, level if 1<=level<=9 else 6)
     if method==M_LZMA:
-        preset=max(0,min(9,level)); return lzma.compress(data, format=lzma.FORMAT_XZ, preset=preset)
+        preset=max(0,min(9,level));
+        return lzma.compress(data, format=lzma.FORMAT_ALONE, preset=preset)
+        # LZMA ALONE
+    if method==M_XZ:
+        preset=max(0,min(9,level));
+        return lzma.compress(data, format=lzma.FORMAT_XZ, preset=preset)
+        # LZMA XZ
     if method==M_BROTLI:
         if not HAVE_BROTLI: raise RuntimeError("brotli not installed")
         return brotli.compress(data, quality=max(0,min(11,level)))
     if method==M_ZSTD:
         if not HAVE_ZSTD: raise RuntimeError("zstandard not installed")
         return zstd.ZstdCompressor(level=max(-5,min(22,level))).compress(data)
+    if method==M_BZ2:
+        return bz2.compress(data, compresslevel=max(1, min(9, level if level else 9)))
+    if method==M_LZ4:
+        if not HAVE_LZ4:
+            raise RuntimeError("lz4 not installed (pip install lz4)")
+        return lz4f.compress(data, compression_level=max(0, min(16, level if level else 9)))
     raise RuntimeError("unknown method")
 
 def decompress_block(method:int, data:bytes)->bytes:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"compression func decompress block with method {method} data {len(data)}")
     if method==M_NONE: return data
     if method==M_ZLIB: return zlib.decompress(data)
-    if method==M_LZMA: return lzma.decompress(data)
+    if method==M_LZMA: return lzma.decompress(data, format=lzma.FORMAT_ALONE)
+    if method==M_XZ: return lzma.decompress(data, format=lzma.FORMAT_XZ)
     if method==M_BROTLI:
         if not HAVE_BROTLI: raise RuntimeError("brotli not installed")
         return brotli.decompress(data)
     if method==M_ZSTD:
         if not HAVE_ZSTD: raise RuntimeError("zstandard not installed")
         return zstd.ZstdDecompressor().decompress(data)
+    if method==M_BZ2:
+        return bz2.decompress(data)
+    if method==M_LZ4:
+        if not HAVE_LZ4:
+            raise RuntimeError("lz4 not installed (pip install lz4)")
+        return lz4f.decompress(data)
     raise RuntimeError("unknown method")
 
 # ---------- Footer ----------
 def write_footer(bw:io.BufferedWriter, toc_offset:int, toc_size:int, hash_kind:int, digest:bytes):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("footer func write footer")
     bw.write(struct.pack("<Q", toc_offset)); bw.write(struct.pack("<I", toc_size))
     bw.write(struct.pack("<B", hash_kind))
     if len(digest)==32: bw.write(digest)
@@ -309,6 +435,7 @@ def write_footer(bw:io.BufferedWriter, toc_offset:int, toc_size:int, hash_kind:i
     bw.write(END_MAGIC)
 
 def read_footer(br:io.BufferedReader):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("footer func read footer")
     br.seek(-(8+4+1+32+5), os.SEEK_END)
     toc_off=struct.unpack("<Q", br.read(8))[0]
     toc_sz=struct.unpack("<I", br.read(4))[0]
@@ -320,6 +447,7 @@ def read_footer(br:io.BufferedReader):
 # ---------- Walkers & Metadata ----------
 def iter_tree(paths: List[str]):
     """Yield (pathlib.Path, lstat, entry_type). Includes dirs (even empty), symlinks, files."""
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func iter tree")
     for p in paths:
         pth = pathlib.Path(p)
         if pth.is_dir():
@@ -344,9 +472,12 @@ def iter_tree(paths: List[str]):
                 yield pth, st, ET_FILE
 
 # Hardlink table (Linux): map (dev, ino) -> first path
-def hl_key(st): return (getattr(st, "st_dev", None), getattr(st, "st_ino", None))
+def hl_key(st):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func hl key")
+    return (getattr(st, "st_dev", None), getattr(st, "st_ino", None))
 
 def posix_capture_meta(path:str, st)->dict:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func posix capture meta")
     meta={"posix":{
         "uid": getattr(st,"st_uid",0),
         "gid": getattr(st,"st_gid",0),
@@ -358,6 +489,7 @@ def posix_capture_meta(path:str, st)->dict:
     return meta
 
 def list_xattrs(path:str, follow_symlinks:bool)->Dict[str,bytes]:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func list xattrs")
     out={}
     if hasattr(os, "listxattr") and hasattr(os, "getxattr"):
         try:
@@ -371,12 +503,14 @@ def list_xattrs(path:str, follow_symlinks:bool)->Dict[str,bytes]:
     return out
 
 def apply_xattrs(path:str, xattrs:Dict[str,bytes], follow_symlinks:bool):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func apply xattrs")
     if hasattr(os, "setxattr"):
         for n,v in xattrs.items():
             try: os.setxattr(path, n, v, follow_symlinks=follow_symlinks)
             except Exception: pass
 
 def getfacl_dump(path:str)->Optional[str]:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func getfacl dump")
     try:
         r = subprocess.run(["getfacl","--absolute-names","--tabs","-p","--", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if r.returncode==0: return r.stdout.decode("utf-8", "replace")
@@ -384,18 +518,21 @@ def getfacl_dump(path:str)->Optional[str]:
     return None
 
 def setfacl_restore(text:str, path:str):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func setfacl restore")
     try:
         p = subprocess.Popen(["setfacl","--restore=-"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         p.communicate(input=text.encode("utf-8", "replace"))
     except Exception: pass
 
 def selinux_get(path:str, follow_symlinks:bool)->Optional[bytes]:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func selinux get")
     try:
         return os.getxattr(path, "security.selinux", follow_symlinks=follow_symlinks)
     except Exception:
         return None
 
 def fallocate_punch_hole(fd:int, offset:int, length:int):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"walkers and metadata func fallocate punch hole")
     # Linux only, best-effort
     if not LIN: return
     try:
@@ -408,6 +545,7 @@ def fallocate_punch_hole(fd:int, offset:int, length:int):
 
 def detect_sparse(path:str)->List[Tuple[int,int]]:
     """Return list of (offset,length) holes using SEEK_HOLE/SEEK_DATA if supported; else []"""
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func detect sparse")
     holes=[]
     if not LIN: return holes
     try:
@@ -427,6 +565,7 @@ def detect_sparse(path:str)->List[Tuple[int,int]]:
 
 # ---------- Windows meta helpers ----------
 def win_capture_meta(path:str)->dict:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func win capture meta")
     meta={}
     if not (WIN and HAVE_WIN32): return meta
     try:
@@ -475,6 +614,7 @@ def win_capture_meta(path:str)->dict:
     return meta
 
 def win_apply_meta(path:str, meta:dict, is_dir:bool):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func win apply meta")
     if not (WIN and HAVE_WIN32): return
     try:
         if "attrs" in meta:
@@ -512,6 +652,7 @@ def win_apply_meta(path:str, meta:dict, is_dir:bool):
 
 # ---------- Core helpers ----------
 def _load_header_toc_and_key(br, need_password:bool):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func load header toc and key")
     header=HeaderV1.unpack(br); toc_off,toc_sz,hk,dig=read_footer(br); br.seek(toc_off)
     toc_data=br.read(toc_sz); key=None
     if header.flags & F_ENCRYPTED:
@@ -522,6 +663,7 @@ def _load_header_toc_and_key(br, need_password:bool):
     return header,toc,key,toc_off,toc_sz,hk,dig
 
 def _recompute_hash_until(bf, upto:int, hash_kind:int)->bytes:
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func recompute hash util")
     bf.seek(0); h=make_hasher(hash_kind); done=0
     while done<upto:
         chunk=bf.read(min(1024*1024, upto-done))
@@ -531,6 +673,7 @@ def _recompute_hash_until(bf, upto:int, hash_kind:int)->bytes:
 
 # ---------- Commands ----------
 def cmd_create(args):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd create")
     block_size=1<<args.block_exp; method=NAME_TO_METHOD.get(args.method)
     if method is None: raise SystemExit(f"Unknown method {args.method}")
     header=HeaderV1(); header.default_method=method; header.default_level=args.level
@@ -640,8 +783,7 @@ def cmd_create(args):
             meta_bytes = json.dumps(meta_obj, ensure_ascii=False).encode("utf-8") if meta_obj else None
 
             if header.flags & F_SOLID:
-                if LOGGER.level >= VLog.LEVELS["debug"]:
-                    LOGGER.debug(f"Queuing file {rel} ({human_bytes(size)}) for solid stream")
+                LOGGER.debug(f"Queuing file {rel} ({human_bytes(size)}) for solid stream")
                 t0 = time.time()
                 with open(rel, "rb") as fr:
                     data = fr.read()
@@ -662,8 +804,7 @@ def cmd_create(args):
                 cur_off += size
                 toc.entries.append(entry)
             else:
-                if LOGGER.level >= VLog.LEVELS["debug"]:
-                    LOGGER.debug(f"Compressing file {rel} ({human_bytes(size)})")
+                LOGGER.debug(f"Compressing file {rel} ({human_bytes(size)})")
                 t0 = time.time()
                 entry = FileEntry(rel, st_mode, st_mtime, size, [], 0, ET_FILE, meta_bytes)
                 with open(rel, "rb") as fr:
@@ -695,28 +836,43 @@ def cmd_create(args):
 
         # If solid: emit blocks from solid_buffer (single or chunked)
         if header.flags & F_SOLID:
+            if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("solid_buffer")
             whole = solid_buffer.getvalue()
             if args.solid_chunk_exp is not None:
+                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"solid chunk exp = {int(args.solid_chunk_exp)}")
                 seg_size = 1 << int(args.solid_chunk_exp)
                 if LOGGER.level >= VLog.LEVELS["trace"]:
                     LOGGER.trace(f"Emitting solid chunks of ~{human_bytes(seg_size)}")
                 pos = 0; total=len(whole)
                 while pos < total:
                     seg = whole[pos:pos+seg_size]; pos += len(seg)
+                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"seg = {len(seg)}, pos = {pos}")
                     comp=compress_block(method, args.level, seg)
+                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"comp = {len(comp)}")
                     payload = comp if key is None else aead_encrypt(key, header, block_index, comp, aad=b"vfa-data")
                     bw.write(struct.pack("<I", len(payload))); bw.write(struct.pack("<B", method)); bw.write(payload)
+                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("bw.write payload")
                     hasher_update(hasher, struct.pack("<I", len(payload))+struct.pack("<B", method)+payload, default_hash_kind())
+                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("hasher_update")
                     block_index += 1
+                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("block index inc.")
             else:
+                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("no solid chunk exp")
                 comp=compress_block(method, args.level, whole)
+                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"comp len = {len(comp)}")
                 payload = comp if key is None else aead_encrypt(key, header, block_index, comp, aad=b"vfa-data")
                 bw.write(struct.pack("<I", len(payload))); bw.write(struct.pack("<B", method)); bw.write(payload)
+                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("bw.write payload")
                 hasher_update(hasher, struct.pack("<I", len(payload))+struct.pack("<B", method)+payload, default_hash_kind())
+                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("hasher_update")
                 block_index += 1
+                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("block index inc.")
             arch_so_far = bw.tell()
+            if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"arch so far = {arch_so_far}")
             saved = max(0, prog.done_bytes - arch_so_far)
+            if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"saved = {saved}")
             ratio_now = (arch_so_far / prog.done_bytes) if prog.done_bytes else 0.0
+            if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"ratio = {ratio_now}")
             LOGGER.info(
                 f"Solid stream written | arch {human_bytes(arch_so_far)} | "
                 f"src {human_bytes(prog.done_bytes)} | saved {human_bytes(saved)} | ratio {ratio_now:.3f}"
@@ -728,6 +884,7 @@ def cmd_create(args):
         toc_off = bw.tell(); bw.write(toc_data); toc_sz=len(toc_data); hasher_update(hasher, toc_data, default_hash_kind())
         digest=hasher_digest(hasher, default_hash_kind()); write_footer(bw, toc_off, toc_sz, default_hash_kind(), digest)
         arch_final = bw.tell()
+        if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"arch final = {arch_final}")
 
     elapsed, eta, rate, ratio = prog.estimate()
     saved = max(0, prog.done_bytes - arch_final)
@@ -740,6 +897,7 @@ def cmd_create(args):
     print(f"Created {args.output} with {len(toc.entries)} entry(s). Solid={bool(header.flags & F_SOLID)}")
 
 def cmd_list(args):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd list")
     with open(args.archive,"rb") as f:
         br=f; header=HeaderV1.unpack(br); toc_off,toc_sz,hk,digest=read_footer(br)
         br.seek(toc_off); toc_data=br.read(toc_sz)
@@ -758,6 +916,7 @@ def cmd_list(args):
             print(f"{e.size:12d}  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.mtime))}  [{kind}]  {e.path}  ({blocks_info})")
 
 def cmd_test(args):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd test")
     LOGGER.info("Verifying archive footer hash and block integrity...")
     with open(args.archive,"rb") as f:
         br=f; header=HeaderV1.unpack(br); toc_off,toc_sz,hk,digest=read_footer(br)
@@ -776,15 +935,18 @@ def cmd_test(args):
         if header.flags & F_SOLID:
             total_expected = sum(e.size for e in toc.entries if e.entry_type==ET_FILE)
             data_total=0
+            solid_block_idx = 0
             while br.tell() < toc_off:
                 hdr = br.read(5)
                 if len(hdr) < 5: break
-                blen = struct.unpack("<I", hdr[:4])[0]; meth = hdr[4]
+                blen = struct.unpack("<I", hdr[:4])[0];
+                meth = hdr[4]
                 payload = br.read(blen)
                 if key is not None:
-                    payload = aead_decrypt(key, header, 0, payload, aad=b"vfa-data")
+                    payload = aead_decrypt(key, header, solid_block_idx, payload, aad=b"vfa-data")
                 data = decompress_block(header.default_method, payload)
                 data_total += len(data)
+                solid_block_idx += 1
             if data_total != total_expected:
                 print("Solid size mismatch"); return
             print(f"Tested {sum(1 for e in toc.entries if e.entry_type==ET_FILE)} files in SOLID stream: OK.")
@@ -804,6 +966,7 @@ def cmd_test(args):
             print(f"Tested {sum(1 for e in toc.entries if e.entry_type==ET_FILE)} files, {blocks} blocks: OK.")
 
 def cmd_extract(args):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd extract")
     outdir=pathlib.Path(args.output or "."); outdir.mkdir(parents=True, exist_ok=True)
     with open(args.archive,"rb") as f:
         br=f; header=HeaderV1.unpack(br); toc_off,toc_sz,hk,digest=read_footer(br)
@@ -844,13 +1007,17 @@ def cmd_extract(args):
         solid_concat=None
         if header.flags & F_SOLID:
             parts=[]
+            solid_block_idx = 0
             while br.tell() < toc_off:
                 hdr=br.read(5)
                 if len(hdr)<5: break
-                blen=struct.unpack("<I", hdr[:4])[0]; meth=hdr[4]
+                blen=struct.unpack("<I", hdr[:4])[0];
+                meth=hdr[4]
                 payload=br.read(blen)
-                if key is not None: payload=aead_decrypt(key, header, 0, payload, aad=b"vfa-data")
+                if key is not None:
+                    payload=aead_decrypt(key, header, solid_block_idx, payload, aad=b"vfa-data")
                 parts.append(decompress_block(header.default_method, payload))
+                solid_block_idx += 1
             solid_concat=b"".join(parts)
 
         for e in syms:
@@ -877,6 +1044,7 @@ def cmd_extract(args):
             LOGGER.trace(f"Created symlink {e.path} -> {target}")
 
         for e in files:
+            LOGGER.debug(f"Extracting {e.path}")
             out_path = outdir / e.path
             out_path.parent.mkdir(parents=True, exist_ok=True)
             if header.flags & F_SOLID:
@@ -938,6 +1106,7 @@ def cmd_extract(args):
             except Exception: pass
 
 def cmd_append(args):
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd append")
     with open(args.archive, "r+b") as f:
         header,toc,key,toc_offset,toc_size,hash_kind,old_digest=_load_header_toc_and_key(f, need_password=args.password)
         if header.flags & F_SOLID:
@@ -965,8 +1134,7 @@ def cmd_append(args):
             st_mtime = int(getattr(st,"st_mtime", time.time()))
             size = int(st.st_size)
             entry=FileEntry(rel, st_mode, st_mtime, size, [], 0, ET_FILE)
-            if LOGGER.level >= VLog.LEVELS["debug"]:
-                LOGGER.debug(f"Compressing file {rel} ({human_bytes(size)})")
+            LOGGER.debug(f"Compressing file {rel} ({human_bytes(size)})")
             t0 = time.time()
             with open(rel,"rb") as fr:
                 rem=size
@@ -1010,6 +1178,7 @@ def cmd_append(args):
 
 # ---------- CLI ----------
 def build_argparser():
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa cli func build argparser")
     ap = argparse.ArgumentParser(
         prog="vfa", description="Vulpfin Archive (.vfa) — Python Prototype"
     )
@@ -1154,12 +1323,13 @@ def build_argparser():
 
 
 def main(argv=None):
+    # set global logger
+    global LOGGER
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa runner main")
     ap=build_argparser(); args=ap.parse_args(argv)
     # verbose alias
     if getattr(args, "verbose", False) and getattr(args, "log_level", None) == "warning":
         args.log_level = "info"
-    # set global logger
-    global LOGGER
     LOGGER = VLog(getattr(args, "log_level", "warning"))
 
     if args.cmd=="c": cmd_create(args)

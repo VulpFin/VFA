@@ -23,7 +23,7 @@
 # Usage:
 #   MySFX.exe [-o OUTPUT_DIR] [--password] [--quiet|--log-level debug] [--from-file PATH]
 
-import sys, os, io, struct, argparse, getpass, time, hashlib, zlib, lzma, pathlib
+import sys, os, io, struct, argparse, getpass, time, hashlib, zlib, lzma, pathlib, bz2
 from datetime import datetime
 
 # ---------------- Logging ----------------
@@ -58,7 +58,7 @@ END_MAGIC=b"/VFA1"
 AEAD_NONE=0; AEAD_AESGCM=1
 KDF_NONE=0;  KDF_ARGON2ID=1; KDF_SCRYPT=2
 
-M_NONE=0; M_ZLIB=1; M_LZMA=2; M_BROTLI=3; M_ZSTD=4
+M_NONE=0; M_ZLIB=1; M_LZMA=2; M_BROTLI=3; M_ZSTD=4; M_XZ=5; M_BZ2=6; M_LZ4=7
 F_ENCRYPTED=1<<0
 F_SOLID=1<<1
 
@@ -85,6 +85,10 @@ try:
     HAVE_ARGON2=True
 except Exception:
     argon2ll=None; HAVE_ARGON2=False
+try:
+    import lz4.frame as lz4f; HAVE_LZ4=True
+except Exception:
+    HAVE_LZ4=False
 
 # ---------------- Helpers ----------------
 
@@ -114,7 +118,12 @@ def _kdf(password:bytes, kdf_id:int, t:int, m:int, p:int, salt:bytes)->bytes:
 def _decompress(method:int, data:bytes)->bytes:
     if method==M_NONE: return data
     if method==M_ZLIB: return zlib.decompress(data)
-    if method==M_LZMA: return lzma.decompress(data)
+    if method==M_LZMA: return lzma.decompress(data, format=lzma.FORMAT_ALONE)
+    if method==M_XZ:   return lzma.decompress(data, format=lzma.FORMAT_XZ)
+    if method==M_BZ2:  return bz2.decompress(data)
+    if method==M_LZ4:
+        if not HAVE_LZ4: _die("lz4 not available (install 'lz4').")
+        return lz4f.decompress(data)
     if method==M_BROTLI:
         if not HAVE_BROTLI: _die("Brotli not available.")
         return brotli.decompress(data)

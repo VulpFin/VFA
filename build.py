@@ -83,6 +83,7 @@ def base_pyinstaller_args(debug=False):
         "--collect-all", "zstandard",
         "--collect-all", "brotli",
         "--collect-all", "argon2",
+        "--collect-all", "lz4"
     ]
     return args
 
