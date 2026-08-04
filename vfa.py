@@ -15,7 +15,7 @@
 
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, getpass, io, os, sys, struct, time, pathlib, platform, json, stat, subprocess, ctypes
+import argparse, getpass, io, os, sys, struct, time, pathlib, platform, json, stat, subprocess, ctypes, concurrent.futures
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from datetime import datetime
@@ -57,6 +57,13 @@ try:
     import lz4.frame as lz4f; HAVE_LZ4=True
 except Exception:
     HAVE_LZ4=False
+try:
+    from neural_codec import compress_neural, decompress_neural, hardware_acceleration_report
+    HAVE_NEURAL=True
+except Exception:
+    compress_neural = None; decompress_neural = None
+    def hardware_acceleration_report(): return "unavailable"
+    HAVE_NEURAL=False
 
 WIN = (platform.system() == "Windows")
 LIN = (sys.platform.startswith("linux"))
@@ -119,6 +126,90 @@ class Progress:
         ratio = (self.done_bytes / self.total_bytes) if self.total_bytes > 0 else 0.0
         return elapsed, eta, rate, ratio
 
+def human_seconds(seconds:float) -> str:
+    if seconds == float("inf") or seconds != seconds:
+        return "--:--"
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+class TerminalProgress:
+    """Tiny stderr progress renderer for long create/extract phases.
+
+    It intentionally has no third-party dependency. In auto mode it only renders
+    when stderr is a TTY, so scripts/CI logs do not get spammed with carriage
+    returns.
+    """
+    def __init__(self, total:int, label:str, enabled:bool=False, width:int=28):
+        self.total = max(0, int(total or 0))
+        self.label = label
+        self.enabled = bool(enabled)
+        self.width = width
+        self.done = 0
+        self.start_ts = time.time()
+        self.last_ts = 0.0
+        self.closed = False
+    def update(self, done:Optional[int]=None, advance:int=0, label:Optional[str]=None, force:bool=False):
+        if not self.enabled or self.closed:
+            return
+        if label is not None:
+            self.label = label
+        if done is not None:
+            self.done = max(0, int(done))
+        elif advance:
+            self.done = max(0, self.done + int(advance))
+        if self.total:
+            self.done = min(self.done, self.total)
+        now = time.time()
+        if not force and (now - self.last_ts) < 0.10:
+            return
+        self.last_ts = now
+        elapsed = now - self.start_ts
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        if self.total:
+            frac = min(1.0, self.done / self.total)
+            filled = int(round(frac * self.width))
+            bar = "#" * filled + "-" * (self.width - filled)
+            eta = (self.total - self.done) / rate if rate > 0 else float("inf")
+            pct = frac * 100.0
+            msg = (
+                f"\r{self.label:<22} [{bar}] {pct:6.2f}% "
+                f"{human_bytes(self.done)}/{human_bytes(self.total)} "
+                f"{human_bytes(int(rate))}/s ETA {human_seconds(eta)}"
+            )
+        else:
+            msg = f"\r{self.label:<22} {human_bytes(self.done)} {human_bytes(int(rate))}/s elapsed {human_seconds(elapsed)}"
+        # Keep lines bounded if terminal width is known.
+        try:
+            cols = os.get_terminal_size(sys.stderr.fileno()).columns
+            msg = msg[:max(20, cols - 1)]
+        except Exception:
+            pass
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+    def finish(self, label:Optional[str]=None):
+        if not self.enabled or self.closed:
+            return
+        if label is not None:
+            self.label = label
+        if self.total:
+            self.done = self.total
+        self.update(force=True)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        self.closed = True
+
+def progress_enabled(args) -> bool:
+    mode = getattr(args, "progress", "auto")
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stderr.isatty() and LOGGER.level < VLog.LEVELS["debug"]
+
 # ---------- Constants ----------
 MAGIC = b"VFA1"
 END_MAGIC = b"/VFA1"
@@ -138,6 +229,7 @@ M_ZSTD = 4
 M_XZ = 5
 M_BZ2 = 6
 M_LZ4 = 7
+M_NEURAL = 8
 # M_VULP = #
 
 # id -> canonical lowercase name
@@ -150,6 +242,7 @@ METHOD_NAMES = {
     M_XZ: "xz",
     M_BZ2: "bz2",
     M_LZ4: "lz4",
+    M_NEURAL: "neural",
 #    M_VULP: "vulp",
 }
 
@@ -403,6 +496,10 @@ def compress_block(method:int, level:int, data:bytes)->bytes:
         if not HAVE_LZ4:
             raise RuntimeError("lz4 not installed (pip install lz4)")
         return lz4f.compress(data, compression_level=max(0, min(16, level if level else 9)))
+    if method==M_NEURAL:
+        if not HAVE_NEURAL:
+            raise RuntimeError("neural codec unavailable (neural_codec.py missing or dependency import failed)")
+        return compress_neural(data, level)
     raise RuntimeError("unknown method")
 
 def decompress_block(method:int, data:bytes)->bytes:
@@ -423,7 +520,127 @@ def decompress_block(method:int, data:bytes)->bytes:
         if not HAVE_LZ4:
             raise RuntimeError("lz4 not installed (pip install lz4)")
         return lz4f.decompress(data)
+    if method==M_NEURAL:
+        if not HAVE_NEURAL:
+            raise RuntimeError("neural codec unavailable (neural_codec.py missing or dependency import failed)")
+        return decompress_neural(data)
     raise RuntimeError("unknown method")
+
+
+
+def resolve_worker_count(threads_hint:int) -> int:
+    """Return an actual compression worker count for --threads.
+
+    Historically VFA stored --threads in the header but never used it. 0 means
+    auto; keep the auto cap moderate so each worker can hold one block/chunk
+    without surprising memory use.
+    """
+    try:
+        n = int(threads_hint or 0)
+    except Exception:
+        n = 0
+    if n < 0:
+        n = 0
+    if n == 0:
+        return max(1, min(os.cpu_count() or 1, 8))
+    return max(1, n)
+
+
+def _compress_payload_job(seq:int, block_idx:int, method:int, level:int, chunk:bytes,
+                          encrypted:bool, header:HeaderV1, key:Optional[bytes]):
+    """Compress, and optionally encrypt, one archive payload.
+
+    The sequence number is separate from the archive block index so callers can
+    write results in input order even when worker threads finish out of order.
+    """
+    comp = compress_block(method, level, chunk)
+    payload = comp if not encrypted else aead_encrypt(key, header, block_idx, comp, aad=b"vfa-data")
+    return seq, block_idx, len(chunk), len(payload), method, payload
+
+
+def _write_record(bw, hasher, hash_kind:int, payload:bytes, method:int):
+    rec_hdr = struct.pack("<I", len(payload)) + struct.pack("<B", method)
+    bw.write(rec_hdr)
+    bw.write(payload)
+    hasher_update(hasher, rec_hdr + payload, hash_kind)
+
+
+
+def compress_and_write_chunks_ordered(bw, hasher, hash_kind:int, chunk_iter, method:int, level:int,
+                                      header:HeaderV1, key:Optional[bytes], start_block_index:int,
+                                      workers:int, progress:Optional[TerminalProgress]=None,
+                                      progress_label:str="Compress"):
+    """Compress/encrypt chunks on worker threads and write archive records in order.
+
+    Returns (block_meta_list, next_block_index). block_meta_list contains the
+    TOC tuples: (idx, uncompressed_size, payload_size, method).
+    """
+    encrypted = key is not None
+    workers = max(1, int(workers or 1))
+    metas = []
+
+    if workers <= 1:
+        block_idx = start_block_index
+        for chunk in chunk_iter:
+            if not chunk:
+                continue
+            _, idx, usz, csz, meth, payload = _compress_payload_job(
+                0, block_idx, method, level, chunk, encrypted, header, key
+            )
+            _write_record(bw, hasher, hash_kind, payload, meth)
+            metas.append((idx, usz, csz, meth))
+            if progress is not None:
+                progress.update(advance=usz, label=progress_label)
+            block_idx += 1
+        return metas, block_idx
+
+    max_inflight = max(2, workers * 2)
+    futures = {}
+    ready = {}
+    next_seq = 0
+    next_write_seq = 0
+    next_block_idx = start_block_index
+
+    def submit(ex, chunk:bytes):
+        nonlocal next_seq, next_block_idx
+        fut = ex.submit(
+            _compress_payload_job, next_seq, next_block_idx, method, level,
+            bytes(chunk), encrypted, header, key
+        )
+        futures[fut] = next_seq
+        next_seq += 1
+        next_block_idx += 1
+
+    def collect_done(done):
+        for fut in done:
+            seq = futures.pop(fut)
+            ready[seq] = fut.result()
+
+    def flush_ready():
+        nonlocal next_write_seq
+        while next_write_seq in ready:
+            seq, idx, usz, csz, meth, payload = ready.pop(next_write_seq)
+            _write_record(bw, hasher, hash_kind, payload, meth)
+            metas.append((idx, usz, csz, meth))
+            if progress is not None:
+                progress.update(advance=usz, label=progress_label)
+            next_write_seq += 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vfa-compress") as ex:
+        for chunk in chunk_iter:
+            if not chunk:
+                continue
+            submit(ex, chunk)
+            if len(futures) >= max_inflight:
+                done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                collect_done(done)
+                flush_ready()
+        while futures:
+            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            collect_done(done)
+            flush_ready()
+
+    return metas, next_block_idx
 
 # ---------- Footer ----------
 def write_footer(bw:io.BufferedWriter, toc_offset:int, toc_size:int, hash_kind:int, digest:bytes):
@@ -688,7 +905,11 @@ def cmd_create(args):
             header.kdf_id=KDF_SCRYPT; header.kdf_t=args.scrypt_n or (1<<15); header.kdf_m=args.scrypt_r or 8; header.kdf_p=args.scrypt_p or 1
         header.salt=os.urandom(16); header.aead_id=AEAD_AESGCM; header.aead_nonce_prefix=os.urandom(12); header.flags |= F_ENCRYPTED
         LOGGER.info("Encryption enabled (AES-256-GCM).")
-        pw=getpass.getpass("Password: ").encode(); key=kdf_derive_key(pw, header)
+        pw=getpass.getpass("Password: ").encode()
+        kdf_prog = TerminalProgress(0, "Deriving key", progress_enabled(args))
+        kdf_prog.update(force=True)
+        key=kdf_derive_key(pw, header)
+        kdf_prog.finish("Key ready")
 
     toc=TOC(); block_index=0
     hardlinks: Dict[Tuple[int,int], str] = {}
@@ -714,7 +935,13 @@ def cmd_create(args):
         total_files = len(file_items)
         total_bytes = sum(int(getattr(st, "st_size", 0)) for _, st, _ in file_items)
         prog = Progress(total_files, total_bytes)
-        LOGGER.info(f"Preparing to compress {total_files} files ({human_bytes(total_bytes)}). Solid={bool(args.solid)} method={args.method} lvl={args.level}")
+        show_progress = progress_enabled(args)
+        workers = resolve_worker_count(args.threads)
+        read_progress = TerminalProgress(total_bytes, "Queue solid", show_progress and bool(header.flags & F_SOLID))
+        file_progress = TerminalProgress(total_bytes, "Compress files", show_progress and not bool(header.flags & F_SOLID))
+        LOGGER.info(f"Preparing to compress {total_files} files ({human_bytes(total_bytes)}). Solid={bool(args.solid)} method={args.method} lvl={args.level} threads={workers}")
+        if method == M_NEURAL:
+            LOGGER.info(f"Experimental neural codec runtime: {hardware_acceleration_report()}")
         if (header.flags & F_SOLID) and args.solid_chunk_exp is not None:
             LOGGER.info(f"Solid chunk size ≈ {human_bytes(1<<int(args.solid_chunk_exp))}")
 
@@ -786,8 +1013,12 @@ def cmd_create(args):
                 LOGGER.debug(f"Queuing file {rel} ({human_bytes(size)}) for solid stream")
                 t0 = time.time()
                 with open(rel, "rb") as fr:
-                    data = fr.read()
-                    solid_buffer.write(data)
+                    while True:
+                        data = fr.read(1024 * 1024)
+                        if not data:
+                            break
+                        solid_buffer.write(data)
+                        read_progress.update(advance=len(data), label=f"Queue {fp.name[:14]}")
                 duration = time.time() - t0
                 prog.add_file(size, duration)
                 elapsed, eta, rate, ratio = prog.estimate()
@@ -807,16 +1038,21 @@ def cmd_create(args):
                 LOGGER.debug(f"Compressing file {rel} ({human_bytes(size)})")
                 t0 = time.time()
                 entry = FileEntry(rel, st_mode, st_mtime, size, [], 0, ET_FILE, meta_bytes)
-                with open(rel, "rb") as fr:
-                    rem=size
-                    while rem>0:
-                        chunk=fr.read(min(block_size, rem)); rem -= len(chunk)
-                        comp=compress_block(method, args.level, chunk)
-                        payload=comp if key is None else aead_encrypt(key, header, block_index, comp, aad=b"vfa-data")
-                        bw.write(struct.pack("<I", len(payload))); bw.write(struct.pack("<B", method)); bw.write(payload)
-                        entry.blocks.append((block_index, len(chunk), len(payload), method))
-                        hasher_update(hasher, struct.pack("<I", len(payload))+struct.pack("<B", method)+payload, default_hash_kind())
-                        block_index += 1
+                def file_chunks():
+                    with open(rel, "rb") as fr:
+                        rem = size
+                        while rem > 0:
+                            chunk = fr.read(min(block_size, rem))
+                            if not chunk:
+                                break
+                            rem -= len(chunk)
+                            yield chunk
+                block_metas, block_index = compress_and_write_chunks_ordered(
+                    bw, hasher, default_hash_kind(), file_chunks(), method, args.level,
+                    header, key, block_index, workers, file_progress,
+                    progress_label=f"Compress {fp.name[:12]}"
+                )
+                entry.blocks.extend(block_metas)
                 duration = time.time() - t0
                 toc.entries.append(entry)
                 prog.add_file(size, duration)
@@ -836,37 +1072,36 @@ def cmd_create(args):
 
         # If solid: emit blocks from solid_buffer (single or chunked)
         if header.flags & F_SOLID:
+            read_progress.finish("Queued solid")
             if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("solid_buffer")
             whole = solid_buffer.getvalue()
+            solid_progress = TerminalProgress(len(whole), "Compress solid", show_progress)
+            solid_progress.update(done=0, force=True)
             if args.solid_chunk_exp is not None:
                 if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"solid chunk exp = {int(args.solid_chunk_exp)}")
                 seg_size = 1 << int(args.solid_chunk_exp)
                 if LOGGER.level >= VLog.LEVELS["trace"]:
                     LOGGER.trace(f"Emitting solid chunks of ~{human_bytes(seg_size)}")
-                pos = 0; total=len(whole)
-                while pos < total:
-                    seg = whole[pos:pos+seg_size]; pos += len(seg)
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"seg = {len(seg)}, pos = {pos}")
-                    comp=compress_block(method, args.level, seg)
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"comp = {len(comp)}")
-                    payload = comp if key is None else aead_encrypt(key, header, block_index, comp, aad=b"vfa-data")
-                    bw.write(struct.pack("<I", len(payload))); bw.write(struct.pack("<B", method)); bw.write(payload)
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("bw.write payload")
-                    hasher_update(hasher, struct.pack("<I", len(payload))+struct.pack("<B", method)+payload, default_hash_kind())
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("hasher_update")
-                    block_index += 1
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("block index inc.")
+                def solid_chunks():
+                    pos = 0
+                    total = len(whole)
+                    while pos < total:
+                        seg = whole[pos:pos+seg_size]
+                        pos += len(seg)
+                        if LOGGER.level >= VLog.LEVELS["trace"]:
+                            LOGGER.trace(f"seg = {len(seg)}, pos = {pos}")
+                        yield seg
+                _solid_metas, block_index = compress_and_write_chunks_ordered(
+                    bw, hasher, default_hash_kind(), solid_chunks(), method, args.level,
+                    header, key, block_index, workers, solid_progress, progress_label="Compress solid"
+                )
             else:
                 if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("no solid chunk exp")
-                comp=compress_block(method, args.level, whole)
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"comp len = {len(comp)}")
-                payload = comp if key is None else aead_encrypt(key, header, block_index, comp, aad=b"vfa-data")
-                bw.write(struct.pack("<I", len(payload))); bw.write(struct.pack("<B", method)); bw.write(payload)
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("bw.write payload")
-                hasher_update(hasher, struct.pack("<I", len(payload))+struct.pack("<B", method)+payload, default_hash_kind())
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("hasher_update")
-                block_index += 1
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("block index inc.")
+                _solid_metas, block_index = compress_and_write_chunks_ordered(
+                    bw, hasher, default_hash_kind(), iter([whole]), method, args.level,
+                    header, key, block_index, workers, solid_progress, progress_label="Compress solid"
+                )
+            solid_progress.finish("Solid written")
             arch_so_far = bw.tell()
             if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"arch so far = {arch_so_far}")
             saved = max(0, prog.done_bytes - arch_so_far)
@@ -877,6 +1112,9 @@ def cmd_create(args):
                 f"Solid stream written | arch {human_bytes(arch_so_far)} | "
                 f"src {human_bytes(prog.done_bytes)} | saved {human_bytes(saved)} | ratio {ratio_now:.3f}"
             )
+
+        if not (header.flags & F_SOLID):
+            file_progress.finish("Compressed files")
 
         toc_data = toc.pack(solid=bool(header.flags & F_SOLID))
         LOGGER.trace("Writing TOC...")
@@ -1319,6 +1557,8 @@ def build_argparser():
             help="Logging verbosity (default: warning)")
         sp.add_argument("-v","--verbose", action="store_true",
             help="Shortcut for --log-level info")
+        sp.add_argument("--progress", choices=["auto", "always", "never"], default="auto",
+            help="Progress bar mode (default: auto; use always to force in non-TTY logs)")
     return ap
 
 
