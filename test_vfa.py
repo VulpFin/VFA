@@ -594,7 +594,9 @@ def t2_refuse(work):
     patch_frame2(p, off, 6, 0x80)
     refused("vfa2 refuse: unknown frame flag", p, "frame flags")
     for table, cid, needle, label in ((V2.CODERS, 2, "vulp-cm", "coder 2"), (V2.FILTERS, 5, "text", "filter 5")):
-        table[cid] = V2.Codec(cid, "test-only", (lambda raw, level=0: (b"", bytes(raw))), None)
+        # the test coder must shrink its input, or the writer (correctly) stores the chunk with coder 0 instead
+        enc = (lambda raw, level=0: (b"", bytes(raw)[:8])) if table is V2.CODERS else (lambda raw, params=b"": (b"", bytes(raw)))
+        table[cid] = V2.Codec(cid, "test-only", enc, None)
         try: p = build2(work / f"r_c{cid}.vfa", f, **({"coder": cid} if table is V2.CODERS else {"filt": cid}))
         finally: del table[cid]
         refused(f"vfa2 refuse: unimplemented {label} is named ({needle})", p, needle)
