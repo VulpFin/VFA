@@ -532,7 +532,8 @@ class Archive2(vx.Extractable):
         try: doc = json.loads(data.decode("utf-8"))
         except ValueError: return []                        # debug information only: never fail on it
         chunks = doc.get("chunks") if isinstance(doc, dict) else None
-        return [c for c in chunks if isinstance(c, dict)] if isinstance(chunks, list) else []
+        if not isinstance(chunks, list): return []
+        return [c for c in chunks if isinstance(c, dict) and type(c.get("chunk")) is int]
 
     def summary(self) -> str:
         coders = sorted({CODER_NAMES.get(c[3], f"#{c[3]}") for c in self.chunks}) if self.chunks else []

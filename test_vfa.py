@@ -828,7 +828,7 @@ def t2_codec(work, corpus):
         check(f"vfa2 auto routing: mixed solid chunk -> {rt[0]['filter'] if rt else '?'} "
               f"[{', '.join(sg['filter'] for sg in segs)}], round-trip", ok and len(segs) >= 2 and all(sg.get("why") for sg in segs), why)
     # a malformed (but checksummed) ROUTING record is ignored, never a crash: it is debug information only
-    for i, bad in enumerate((b'{"chunks":1}', b'[1,2]', b'{"chunks":[1,"x",{"chunk":"0","filter":7,"stored":[1]}]}', b"\xff\xfe", b"null")):
+    for i, bad in enumerate((b'{"chunks":1}', b'[1,2]', b'{"chunks":[1,"x",{"chunk":"0","filter":7,"stored":[1]}]}', b'{"chunks":[{"chunk":[]},{"chunk":{}},{"chunk":true}]}', b"\xff\xfe", b"null")):
         p = build2(work / f"v2badrt{i}.vfa", [("z/a.txt", b"routing " * 500)], records=[(V2.XR_ROUTING, 0, bad)])
         r = vfa("l", p, "--routing", expect=None)
         check(f"vfa2 malformed ROUTING record {bad[:40]!r} is ignored by 'vfa l --routing'", r.returncode == 0 and "Traceback" not in r.stderr, r.stderr[-300:])
