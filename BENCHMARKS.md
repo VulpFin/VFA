@@ -475,3 +475,36 @@ Ratio = compressed / original (lower is better). MB/s are of original data. RSS 
 | 7z-lzma2-mx9 | 0.2729 | 16,653 | 4.3 | 10.6 | 7.6 MiB | 5.6 MiB | - | ok |
 
 VFA rows include Python interpreter start-up (~0.3-1 s per run); on small inputs that dominates MB/s.
+
+### M4: peak RSS against file size (measured, Linux container, GNU time per process)
+
+VFA2 default settings (`vulp-lz`, dedup, 64 MiB chunks). Synthetic input like the harness's 4 GiB test: every MiB is
+512 KiB of random bytes plus 512 KiB of repeated text, so dedup removes the text and the archive is about half the
+input. Every row round-trips byte-identically.
+
+| input | create RSS (non-solid / solid) | extract RSS | extract time |
+|---:|---:|---:|---:|
+| 64 MiB | 206 / 198 MiB | 178 MiB | 0.3 s |
+| 256 MiB | 250 / 250 MiB | 204 MiB | 0.8 s |
+| 1 GiB | 259 / 259 MiB | 205 MiB | 3.0–3.5 s |
+| 4 GiB + 123,457 B (`test_vfa.py --big`) | 275 / 266 MiB | 207 MiB | - |
+
+Memory is bounded by the chunk size, not the file size. Writing holds about three copies of one chunk at once (raw
+chunk, filtered copy, LZ output) plus the long-range table (at most 16 MiB). Reading holds one decoded chunk:
+extraction goes chunk by chunk and decodes each chunk once. The writer's dedup index grows with the number of
+*distinct* 64 KiB segments: about 13 MiB at 4 GiB, capped at 2^20 segments (about 200 MiB).
+
+**Reading the M4 run (sample\ and its files, measured above).**
+- **sample\ (whole): VFA2 0.3988 solid / 0.4159 non-solid, against xz -9e 0.3975, zstd -22 0.3975 and 7z 0.4488.**
+  Long-range matching and dedup find the second setup exe, which the M3 coder could not. VFA2 compresses at
+  35 MB/s (xz: 3.5, zstd -22: 12) with 102 MiB of RAM (xz: 423, zstd -22: 708).
+- **Text (vfa.py): 0.3046, against 0.27–0.28 for xz/zstd -19/7z: VFA2 loses here.** About 4.6% of that is the coder:
+  vulp-lz uses a lazy parse and per-stream tANS, while zstd -19/xz use optimal parsing and context modelling. On a
+  61 KB file, about 4% is container overhead (header, frame, index, footer, routing record: ~540 bytes). The
+  context-mixing tier (M5) is the planned answer for text.
+- **Decompression speed: 100–200 MB/s for VFA2 on sample\, against ~1 GB/s for zstd.** The C decoder alone runs at
+  300–800 MB/s on these inputs; the rest is the Python container (CRC32, SHA-256, file writes).
+- **Already-compressed data (exe payload, icon, random.bin): within 0.1% of every other tool.** There is nothing to
+  find, and VFA2 stores what it cannot shrink.
+- **Small files (blob.bin, 1 MiB ramp): 899 bytes, against 359–746 for the others.** That is the fixed container
+  overhead on a tiny archive.

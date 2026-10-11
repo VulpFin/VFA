@@ -771,12 +771,12 @@ def cmd_create_v2(args):
         raise SystemExit(f"VFA2 has the coders 'lz' (default), 'tans' and 'stored'/'none'; --method {args.method} is a VFA1 method")
     coder = {"none": 0, "stored": 0, "tans": 1}.get(args.method, vfa2.CODER_LZ)
     if coder == vfa2.CODER_LZ and not vfa2.NATIVE:
-        raise SystemExit("--method lz needs the _vulp C extension (python build_vulp.py); --method tans works without it, slowly")
+        raise SystemExit(f"--method lz needs the C codec: {vfa2.NATIVE_PROBLEM}. (--method tans works without it, slowly.)")
     try: filt = vfa2.parse_filter(args.filter)
     except ValueError as e: raise SystemExit(str(e))
     if coder == 0 and filt is None: filt = (0, b"")
     if coder == 1 and not vfa2.NATIVE:
-        LOGGER.warning("The _vulp C extension is not built (python build_vulp.py); using the pure-Python reference coder, which is very slow")
+        LOGGER.warning(f"Using the very slow pure-Python reference coder: {vfa2.NATIVE_PROBLEM}")
     _check_exp("--chunk-exp", args.chunk_exp, 12)
     pw = get_password(args) if _wants_password(args) else None
     items = _collect_items(args, args.solid)

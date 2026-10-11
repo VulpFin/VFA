@@ -429,6 +429,19 @@ def peak_rss_of(p: subprocess.Popen) -> int:
     import resource
     return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024   # max over all children so far
 
+def run_peak(cmd, cwd=None, env=None):
+    """Run cmd; return its own peak RSS in bytes (0 if unknown). Linux: GNU time (a child's ru_maxrss would include
+    this harness's forked memory, and RUSAGE_CHILDREN is a max over all children). Windows: PeakWorkingSetSize."""
+    if sys.platform.startswith("linux") and os.path.isfile("/usr/bin/time"):
+        fd, rf = tempfile.mkstemp(); os.close(fd)
+        try:
+            subprocess.run(["/usr/bin/time", "-q", "-f", "%M", "-o", rf, *cmd], cwd=cwd, env=env)
+            kb = pathlib.Path(rf).read_text().split()
+            return int(kb[-1]) * 1024 if kb else 0
+        finally: os.unlink(rf)
+    p = subprocess.Popen(cmd, cwd=cwd, env=env); p.wait()
+    return peak_rss_of(p)
+
 def t_big(work, fmt="vfa1"):
     size = (4 << 30) + 123_457                          # > 4 GiB and not block-aligned
     src = work / "big"; shutil.rmtree(src, ignore_errors=True); src.mkdir()
@@ -447,10 +460,9 @@ def t_big(work, fmt="vfa1"):
     for flags in ([], ["--solid"]):
         arc = work / "big.vfa"
         codec = ["--method", "zstd", "--level", "3"] if fmt == "vfa1" else ["--format", "vfa2"]
-        p = subprocess.Popen([real_py, str(HERE / "vfa.py"), "c", str(arc), "big", *codec, *flags], cwd=work, env=env)
-        p.wait(); rss_c = peak_rss_of(p)
+        rss_c = run_peak([real_py, str(HERE / "vfa.py"), "c", str(arc), "big", *codec, *flags], cwd=work, env=env)
         out = work / "big_out"; shutil.rmtree(out, ignore_errors=True)
-        p = subprocess.Popen([real_py, str(HERE / "vfa.py"), "x", str(arc), "-o", str(out)], env=env); p.wait(); rss_x = peak_rss_of(p)
+        rss_x = run_peak([real_py, str(HERE / "vfa.py"), "x", str(arc), "-o", str(out)], env=env)
         g = hashlib.sha256()
         with open(out / "big/huge.bin", "rb") as fr:
             for b in iter(lambda: fr.read(1 << 24), b""): g.update(b)
@@ -1103,6 +1115,25 @@ def t2_lz(work, corpus):
         if len(res) == 2 and res[0] != res[1]: disagree.append(k)
     check(f"vfa2 lz: corrupted payloads never crash either decoder {stats}", not crash, str(crash[:3]))
     check("vfa2 lz: C and reference decoders agree on corrupted payloads (accept/refuse and bytes)", not disagree, str(disagree[:5]))
+    # a stale extension left over from an older build (API 1: no vulp-lz): refused cleanly, never half-used.
+    # vfa.py's own folder (with the real module) comes first on sys.path, so run it through a launcher that puts
+    # the stale module in front.
+    stale = work / "stale_ext"; stale.mkdir(exist_ok=True)
+    (stale / "_vulp.py").write_text("VERSION = 1\nfrom vulp_ref import tans_encode, tans_decode, filter_fwd, filter_inv, cost\n")
+    (stale / "launch.py").write_text("import sys, runpy\nsys.path[:0] = [%r, %r]\nsys.argv = sys.argv[1:]\n"
+                                     "runpy.run_path(sys.argv[0], run_name='__main__')\n" % (str(stale), str(HERE)))
+    def stale_vfa(*argv, cwd=None):
+        return subprocess.run([PY, str(stale / "launch.py"), str(HERE / "vfa.py"), *map(str, argv)], capture_output=True, text=True, cwd=cwd)
+    src = work / "stale_src"; (src / "z").mkdir(parents=True, exist_ok=True); (src / "z/a.txt").write_bytes(b"stale extension " * 400)
+    r = stale_vfa("c", work / "stale_new.vfa", "z", "--format", "vfa2", cwd=src)
+    check("vfa2: a stale _vulp extension (API 1) makes 'vfa c' say it is out of date, not crash",
+          r.returncode != 0 and "out of date" in (r.stdout + r.stderr) and "Traceback" not in r.stderr, (r.stdout + r.stderr)[-300:])
+    lzarc = build2(work / "stale_lz.vfa", [("z/a.txt", b"stale extension " * 400)], coder=3, filt=(0, b""))
+    out = work / "stale_out"; shutil.rmtree(out, ignore_errors=True)
+    r = stale_vfa("x", lzarc, "-o", out)
+    check("vfa2: with a stale extension, vulp-lz archives still extract (pure-Python fallback, with a warning)",
+          r.returncode == 0 and (out / "z/a.txt").read_bytes() == b"stale extension " * 400 and "out of date" in r.stdout + r.stderr,
+          (r.stdout + r.stderr)[-300:])
     # an older reader (M3: no vulp-lz) names what it lacks
     p = build2(work / "r_lz.vfa", [("z/a.txt", b"vulp-lz " * 2000)], coder=3, filt=(0, b""))
     saved = (V2.CODERS.pop(3), dict(V2.RESERVED_CODERS)); V2.RESERVED_CODERS[3] = "vulp-lz (M4)"

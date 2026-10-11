@@ -87,12 +87,20 @@ class Codec:
     def __init__(self, cid, name, encode=None, decode=None):
         self.id, self.name, self.encode, self.decode = cid, name, encode, decode
 
+NATIVE_API = 2                               # vulp.h VULP_VERSION this code needs (2: vulp-lz, cdc)
+NATIVE_PROBLEM = ""                          # why the C extension is not used, if it is not
 try:
     import _vulp as _native                  # C codec core (build_vulp.py)
+    if getattr(_native, "VERSION", 0) < NATIVE_API or not all(hasattr(_native, f) for f in ("lz_encode", "lz_decode", "cdc")):
+        # a module built from older sources (e.g. left over from M3): never call into it half-way
+        NATIVE_PROBLEM = (f"the _vulp extension at {getattr(_native, '__file__', '?')} is out of date (API "
+                          f"{getattr(_native, 'VERSION', 0)}, need {NATIVE_API}); rebuild it with: python build_vulp.py")
+        raise ImportError(NATIVE_PROBLEM)
     NATIVE = True
 except ImportError:                          # pure-Python reference: identical output, ~100x slower
     import vulp_ref as _native
     NATIVE = False
+    NATIVE_PROBLEM = NATIVE_PROBLEM or "the _vulp C extension is not built; build it with: python build_vulp.py"
 
 def _vulp_call(fn, *a):
     try: return fn(*a)
@@ -115,7 +123,7 @@ def _tans_decode(params, data, raw_size):
 
 def _lz_encode(raw, level=6):
     """None when vulp-lz would not make the data smaller (the writer then stores the chunk)."""
-    if not NATIVE: raise VFAError("vulp-lz encoding needs the _vulp C extension (python build_vulp.py)")
+    if not NATIVE: raise VFAError(f"vulp-lz encoding needs the C codec: {NATIVE_PROBLEM}")
     out = _native.lz_encode(raw, max(0, min(9, int(level))))
     return b"", out
 
@@ -708,6 +716,8 @@ class Archive2(vx.Extractable):
         if len(raw) != fh["raw_size"] or crc32(raw) != fh["raw_crc"]:
             raise VFAError("Index failed its CRC32 check (corrupted archive).")
         self._parse_index(raw)
+        if not NATIVE and any(c[3] != 0 or c[4] != 0 for c in self.chunks):
+            vx.LOGGER.warning(f"Decoding with the slow pure-Python reference codec: {NATIVE_PROBLEM}")
         return self.entries
 
     def _parse_index(self, raw: bytes):
