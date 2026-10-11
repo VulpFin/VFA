@@ -23,8 +23,10 @@ Every chunk frame is independently decodable and names the filter and coder that
 end maps files to extents (chunk, offset, length). Readers refuse - by name - any version, feature bit, frame
 flag, coder, filter, entry type or critical index record they do not know.
 
-Milestone M1: the only coder is 0 "stored" and the only filter is 0 "none". Real codecs (tANS, CM) and filters
-plug into CODERS / FILTERS without changing the container. Standard library only, plus 'cryptography' for
+Coders: 0 stored, 1 vulp-tans (M3). Filters: 0 none, 1 delta, 2 shuffle, 3 bcj-x86, 4 bcj-arm64 (M3). The codecs are
+the C extension _vulp (vulp/vulp.c, built by build_vulp.py); without it, decoding falls back to the pure-Python
+reference vulp_ref.py (slow, same results). The writer picks a filter per chunk with an integer cost estimate over a
+sample and records why in the index (ROUTING record). Standard library only otherwise, plus 'cryptography' for
 encrypted archives (exactly what VFA1 needs).
 """
 import hashlib, io, json, os, struct, zlib
@@ -37,7 +39,7 @@ from vfa_extract import VFAError, ET_FILE, ET_DIR, ET_SYMLINK, ET_HARDLINK, ET_N
 
 MAGIC = b"VFA2"
 END_MAGIC = b"/VFA2"
-SPEC_VERSION = 1            # the VFA2.md revision this code writes
+SPEC_VERSION = 2            # the VFA2.md revision this code writes (2 = M3: tANS + filters)
 READER_VERSION = 1          # archives whose min_reader_version is above this are refused
 
 HDR = struct.Struct("<4sHHHIIBBBBII16s")      # magic, header_size, spec_version, min_reader, required, optional,
@@ -83,6 +85,17 @@ class Codec:
     def __init__(self, cid, name, encode=None, decode=None):
         self.id, self.name, self.encode, self.decode = cid, name, encode, decode
 
+try:
+    import _vulp as _native                  # C codec core (build_vulp.py)
+    NATIVE = True
+except ImportError:                          # pure-Python reference: identical output, ~100x slower
+    import vulp_ref as _native
+    NATIVE = False
+
+def _vulp_call(fn, *a):
+    try: return fn(*a)
+    except ValueError as e: raise VFAError(str(e))
+
 def _stored_encode(raw, level=0):
     return b"", bytes(raw)
 
@@ -91,19 +104,177 @@ def _stored_decode(params, data, raw_size):
     if len(data) != raw_size: raise VFAError(f"stored chunk holds {len(data)} bytes, header says {raw_size}")
     return data
 
-def _none_fwd(raw, level=0):
-    return b"", raw
+def _tans_encode(raw, level=0):
+    return b"", _native.tans_encode(raw)
 
-def _none_inv(params, data, raw_size):
-    if params: raise VFAError("filter 'none' takes no parameters")
-    return data
+def _tans_decode(params, data, raw_size):
+    if params: raise VFAError("vulp-tans takes no parameters")
+    return _vulp_call(_native.tans_decode, data, raw_size)
 
-CODERS: Dict[int, Codec] = {0: Codec(0, "stored", _stored_encode, _stored_decode)}
-FILTERS: Dict[int, Codec] = {0: Codec(0, "none", _none_fwd, _none_inv)}
+def _filter_codec(fid, name):
+    """Filters in this revision are size-preserving bijections; params are the filter's own bytes (VFA2.md)."""
+    return Codec(fid, name, lambda raw, params=b"": (params, _vulp_call(_native.filter_fwd, fid, params, raw)),
+                 lambda params, data, raw_size: _vulp_call(_native.filter_inv, fid, params, data))
+
+CODERS: Dict[int, Codec] = {0: Codec(0, "stored", _stored_encode, _stored_decode),
+                            1: Codec(1, "vulp-tans", _tans_encode, _tans_decode)}
+FILTERS: Dict[int, Codec] = {0: _filter_codec(0, "none"), 1: _filter_codec(1, "delta"), 2: _filter_codec(2, "shuffle"),
+                             3: _filter_codec(3, "bcj-x86"), 4: _filter_codec(4, "bcj-arm64")}
+SEGMENTED = 6
+SEG = struct.Struct("<IBB")                  # segment: length, filter id, params length (then the params)
+
+def seg_pack(segs) -> bytes:
+    """segs: [(length, filter id, params)] -> params of filter 6 'segmented'."""
+    out = bytearray(struct.pack("<I", len(segs)))
+    for ln, fid, fp in segs: out += SEG.pack(ln, fid, len(fp)) + fp
+    return bytes(out)
+
+def seg_unpack(params: bytes, raw_size: int):
+    """Strict parse: every segment non-empty, a plain filter (0..4, never 6), lengths sum to the chunk size."""
+    if len(params) < 4: raise VFAError("segmented filter parameters truncated")
+    n, = struct.unpack_from("<I", params, 0); pos = 4; segs = []; total = 0
+    if n == 0 or n > (len(params) - 4) // SEG.size: raise VFAError("segmented filter: bad segment count")
+    for _ in range(n):
+        if pos + SEG.size > len(params): raise VFAError("segmented filter parameters truncated")
+        ln, fid, pl = SEG.unpack_from(params, pos); pos += SEG.size
+        if pos + pl > len(params): raise VFAError("segmented filter parameters truncated")
+        fp = bytes(params[pos:pos + pl]); pos += pl
+        if ln == 0 or fid not in FILTERS or fid == SEGMENTED:
+            raise VFAError(f"segmented filter: segment uses filter id {fid} ({FILTER_NAMES.get(fid, 'unknown')}), "
+                           "which is not allowed or not implemented here")
+        segs.append((ln, fid, fp)); total += ln
+    if pos != len(params): raise VFAError("segmented filter parameters have trailing bytes")
+    if total != raw_size: raise VFAError(f"segmented filter covers {total} bytes, chunk has {raw_size}")
+    return segs
+
+def _seg_apply(params, data, inverse):
+    segs = seg_unpack(params, len(data)); out = bytearray(); pos = 0
+    for ln, fid, fp in segs:
+        piece = data[pos:pos + ln]; pos += ln
+        out += _vulp_call(_native.filter_inv if inverse else _native.filter_fwd, fid, fp, piece)
+    return bytes(out)
+
+FILTERS[SEGMENTED] = Codec(SEGMENTED, "segmented", lambda raw, params=b"": (params, _seg_apply(params, raw, False)),
+                           lambda params, data, raw_size: _seg_apply(params, data, True))
 # ids reserved for later milestones - named so a reader can say exactly what it is missing
-RESERVED_CODERS = {1: "vulp-tans (M3)", 2: "vulp-cm (M5)"}
-RESERVED_FILTERS = {1: "delta (M3)", 2: "bitshuffle (M3)", 3: "bcj-x86 (M3)", 4: "bcj-arm64 (M3)", 5: "text (M3)"}
+RESERVED_CODERS = {2: "vulp-cm (M5)"}
+RESERVED_FILTERS = {5: "text (reserved)"}
 CODER_NAMES = {**{k: v.name for k, v in CODERS.items()}, **RESERVED_CODERS}
+FILTER_NAMES = {**{k: v.name for k, v in FILTERS.items()}, **RESERVED_FILTERS}
+
+def filter_label(fid: int, params: bytes) -> str:
+    name = FILTER_NAMES.get(fid, f"#{fid}")
+    if fid == 1 and len(params) == 1: return f"delta:{params[0]}"
+    if fid == 2 and len(params) == 2: return f"{'bitshuffle' if params[1] else 'shuffle'}:{params[0]}"
+    if fid == SEGMENTED:
+        return f"segmented({struct.unpack_from('<I', params)[0]})" if len(params) >= 4 else "segmented"
+    return name
+
+def parse_filter(spec: str):
+    """CLI filter spec -> None (auto) or (id, params). auto | none | delta:N | shuffle:K | bitshuffle:K | bcj-x86 | bcj-arm64"""
+    s = spec.strip().lower()
+    if s == "auto": return None
+    name, _, arg = s.partition(":")
+    try:
+        if name == "none" and not arg: return (0, b"")
+        if name == "delta" and 1 <= int(arg) <= 32: return (1, bytes([int(arg)]))
+        if name in ("shuffle", "bitshuffle") and int(arg) in (2, 4, 8, 16): return (2, bytes([int(arg), name == "bitshuffle"]))
+        if name == "bcj-x86" and not arg: return (3, b"")
+        if name == "bcj-arm64" and not arg: return (4, b"")
+    except ValueError: pass
+    raise ValueError(f"unknown filter {spec!r} (auto, none, delta:N, shuffle:K, bitshuffle:K, bcj-x86, bcj-arm64)")
+
+# ---------------------------------------------------------------- classifier (encoder only; integer arithmetic only)
+
+CANDIDATES = [(0, b""), (1, b"\x01"), (1, b"\x02"), (1, b"\x04"), (1, b"\x08"), (2, b"\x02\x00"), (2, b"\x04\x00"),
+              (2, b"\x08\x00"), (2, b"\x04\x01"), (2, b"\x08\x01"), (3, b""), (4, b"")]
+SAMPLE_PIECE, SAMPLE_PIECES = 1 << 16, 4
+MIN_GAIN_DIV = 64                            # a filter must beat 'none' by more than 1/64 (~1.6%) of the estimate
+
+def _sample(raw) -> List[bytes]:
+    n = len(raw)
+    if n <= SAMPLE_PIECE * SAMPLE_PIECES: return [bytes(raw)]
+    out = []
+    for i in range(SAMPLE_PIECES):           # evenly spread, 64-byte aligned so element strides stay aligned
+        off = (i * (n - SAMPLE_PIECE) // (SAMPLE_PIECES - 1)) & ~63
+        out.append(bytes(raw[off:off + SAMPLE_PIECE]))
+    return out
+
+def _hint(raw) -> str:
+    b = bytes(raw[:4])
+    if b[:2] == b"MZ": return "PE/MZ header"
+    if b == b"\x7fELF": return "ELF header"
+    if b in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe"): return "Mach-O header"
+    return ""
+
+UNIT_BIG = 1 << 18                           # a file piece this large is classified on its own
+UNIT_MAX = 1 << 23                           # ... in units of at most 8 MiB
+UNIT_RUN = 1 << 20                           # small files are pooled into runs of about 1 MiB
+
+def units(pieces: List[Tuple[int, int]], total: int) -> List[Tuple[int, int]]:
+    """Cut a chunk into classification units from its file pieces [(offset, length)] (file boundaries)."""
+    out: List[Tuple[int, int]] = []; run = None
+    def flush():
+        nonlocal run
+        if run: out.append(run); run = None
+    for off, ln in sorted(pieces):
+        if ln >= UNIT_BIG:
+            flush()
+            for o in range(off, off + ln, UNIT_MAX): out.append((o, min(UNIT_MAX, off + ln - o)))
+        else:
+            run = (run[0], off + ln - run[0]) if run else (off, ln)
+            if run[1] >= UNIT_RUN: flush()
+    flush()
+    # gaps (cannot happen with the writer's own extents, but never leave bytes uncovered)
+    cov = []; pos = 0
+    for off, ln in out:
+        if off > pos: cov.append((pos, off - pos))
+        cov.append((off, ln)); pos = off + ln
+    if pos < total: cov.append((pos, total - pos))
+    return [u for u in cov if u[1]]
+
+def route(raw, pieces=None) -> Tuple[int, bytes, dict]:
+    """Choose the filter for a whole chunk: classify each unit; one filter if they agree, else filter 6 'segmented'."""
+    us = units(pieces or [(0, len(raw))], len(raw))
+    segs = []; seginfo = []
+    mv = memoryview(raw)
+    for off, ln in us:
+        fid, fp, info = classify(mv[off:off + ln])
+        info = {"off": off, "len": ln, "filter": filter_label(fid, fp), **info}
+        if segs and segs[-1][1:] == (fid, fp):
+            segs[-1] = (segs[-1][0] + ln, fid, fp); seginfo[-1]["len"] += ln; seginfo[-1]["merged"] = seginfo[-1].get("merged", 1) + 1
+        else:
+            segs.append((ln, fid, fp)); seginfo.append(info)
+    if len(segs) == 1:
+        info = seginfo[0]; info.pop("off", None); info.pop("len", None); info.pop("filter", None)
+        return segs[0][1], segs[0][2], info
+    return SEGMENTED, seg_pack(segs), {"why": f"{len(segs)} segments with different filters", "segments": seginfo}
+
+def classify(raw) -> Tuple[int, bytes, dict]:
+    """Pick a filter for one chunk. Returns (filter id, params, routing info). Deterministic: integer costs, ties
+    go to the earlier candidate. The estimate is order-0 (what vulp-tans codes); M4's match finder changes the
+    cost model, so the classifier will be re-measured then."""
+    pieces = _sample(raw); est = {}
+    for fid, params in CANDIDATES:
+        c = 0
+        for pc in pieces:
+            c += _native.cost(_native.filter_fwd(fid, params, pc) if fid else pc)
+        est[filter_label(fid, params)] = (c + (8 << 16) - 1) >> 19          # Q16 bits -> bytes, rounded up
+    base = est["none"]; best = (0, b""); best_c = base
+    for fid, params in CANDIDATES[1:]:
+        c = est[filter_label(fid, params)]
+        if c < best_c: best, best_c = (fid, params), c
+    sampled = sum(len(p) for p in pieces)
+    if best != (0, b"") and (base - best_c) * MIN_GAIN_DIV <= base:
+        why = f"no filter beat 'none' by more than 1/{MIN_GAIN_DIV} (best {filter_label(*best)} {best_c} B vs {base} B)"
+        best = (0, b"")
+    elif best == (0, b""):
+        why = f"'none' had the lowest estimate ({base} B)"
+    else:
+        why = f"{filter_label(*best)} lowest estimate: {best_c} B vs none {base} B ({(base - best_c) * 100 // max(base, 1)}% smaller)"
+    hint = _hint(raw)
+    info = {"why": why + (f"; {hint}" if hint else ""), "sampled": sampled, "est": est}
+    return best[0], best[1], info
 
 def _codec(table, reserved, kind, cid, where):
     c = table.get(cid)
@@ -139,14 +310,19 @@ class Writer2:
             w.add_dir("app", 0o755, mtime); w.add_file("app/a.txt", 0o644, mtime, open("a.txt", "rb"))
             w.close()
     """
-    def __init__(self, f, *, chunk_size: int = 1 << 26, solid: bool = False, coder: int = 0, filt: int = 0,
+    def __init__(self, f, *, chunk_size: int = 1 << 26, solid: bool = False, coder: int = 0, filt=0,
                  level: int = 0, dedup: bool = True, password: Optional[bytes] = None,
                  kdf: Tuple[int, int, int] = (3, 256 * 1024, 4), use_scrypt: bool = False,
                  header_extra: bytes = b"", min_reader: int = 1, required_extra: int = 0):
-        """header_extra / min_reader / required_extra exist so tests can write what a future VFA would."""
+        """coder: 0 stored, 1 vulp-tans. filt: a filter id, an (id, params) tuple, or None = choose per chunk
+        (classify(); needs a real coder). A chunk the coder cannot shrink is stored instead.
+        header_extra / min_reader / required_extra exist so tests can write what a future VFA would."""
         if not (1 << 12) <= chunk_size <= MAX_CHUNK: raise ValueError("chunk_size must be 4 KiB .. 1 GiB")
         if coder not in CODERS or CODERS[coder].encode is None: raise ValueError(f"coder {coder} cannot encode")
-        if filt not in FILTERS or FILTERS[filt].encode is None: raise ValueError(f"filter {filt} cannot encode")
+        if isinstance(filt, int): filt = (filt, b"")
+        if filt is not None and (filt[0] not in FILTERS or FILTERS[filt[0]].encode is None):
+            raise ValueError(f"filter {filt[0]} cannot encode")
+        self.routing: List[dict] = []
         self.f, self.cs, self.solid, self.coder, self.filt, self.level, self.dedup = f, chunk_size, solid, coder, filt, level, dedup
         self.pos = 0; self.hasher = hashlib.sha256()
         self.chunks: List[tuple] = []               # (frame_offset, raw_size, raw_crc, coder, filter)
@@ -187,16 +363,28 @@ class Writer2:
     def _flush(self):
         if not self.buf and not self.pending: return
         raw = bytes(self.buf); self.buf = bytearray()
+        self.piece_bounds = [(ext[1], ext[2]) for ext in self.pending]     # file boundaries inside this chunk
         h = hashlib.sha256(raw).digest() if self.dedup else None
         if h is not None and h in self.by_hash:
             idx = self.by_hash[h]
         else:
-            fparams, fdata = FILTERS[self.filt].encode(raw, self.level)
-            cparams, payload = CODERS[self.coder].encode(fdata, self.level)
+            coder = self.coder; info = None
+            if self.filt is None and coder != 0: fid, fp, info = route(raw, self.piece_bounds)
+            elif self.filt is None: fid, fp = 0, b""
+            else: fid, fp = self.filt; info = {"why": "forced (--filter)"} if coder != 0 else None
+            fparams, fdata = FILTERS[fid].encode(raw, fp)
+            cparams, payload = CODERS[coder].encode(fdata, self.level)
+            if coder != 0 and len(payload) >= len(raw):              # the coder did not help: store the chunk as-is
+                info = dict(info or {}); info["why"] = (info.get("why", "") + f"; {CODERS[coder].name} gave {len(payload)} B "
+                                                        f">= {len(raw)} B raw, stored instead").lstrip("; ")
+                fid, fparams, coder, cparams, payload = 0, b"", 0, b"", raw
             params = struct.pack("<H", len(fparams)) + fparams + cparams if (fparams or cparams) else b""
             c = crc32(raw)
-            off = self._frame(CHUNK_MAGIC, self.coder, self.filt, params, payload, len(raw), c, self.data_key)
-            idx = len(self.chunks); self.chunks.append((off, len(raw), c, self.coder, self.filt))
+            off = self._frame(CHUNK_MAGIC, coder, fid, params, payload, len(raw), c, self.data_key)
+            idx = len(self.chunks); self.chunks.append((off, len(raw), c, coder, fid))
+            if info is not None:
+                self.routing.append({"chunk": idx, "filter": filter_label(fid, fparams), "coder": CODER_NAMES[coder],
+                                     "raw": len(raw), "stored": len(payload), **info})
             if h is not None: self.by_hash[h] = idx
         for ext in self.pending: ext[0] = idx
         self.pending = []
@@ -255,6 +443,9 @@ class Writer2:
         """Flush the last chunk, write index + footer. records: extra (type, flags, data) index records."""
         if self.closed: return
         self._flush()
+        if self.routing:                     # non-critical: readers that do not know it skip it
+            rt = json.dumps({"v": 1, "chunks": self.routing}, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            records = [(XR_ROUTING, 0, rt), *records]
         raw = self._index_bytes(records)
         off = self._frame(INDEX_MAGIC, 0, 0, b"", raw, len(raw), crc32(raw), self.index_key)
         idx_len = self.pos - off
@@ -333,6 +524,13 @@ class Archive2(vx.Extractable):
         self.has_tocx = True                   # every chunk carries a CRC32 (vfa.py prints this)
         self.hash_kind = vx.H_SHA256 if self.digest_kind == DIGEST_SHA256 else self.digest_kind
         self.header = {"format": "VFA2", "version": self.spec_version, "flags": req, "default_method": None, "default_level": None}
+
+    def routing(self) -> List[dict]:
+        """Why each chunk got its filter and coder (ROUTING index record), or [] if the archive has none."""
+        data = getattr(self, "records", {}).get(XR_ROUTING)
+        if not data: return []
+        try: return list(json.loads(data.decode("utf-8")).get("chunks", []))
+        except (ValueError, AttributeError): return []      # debug information only: never fail extraction on it
 
     def summary(self) -> str:
         coders = sorted({CODER_NAMES.get(c[3], f"#{c[3]}") for c in self.chunks}) if self.chunks else []
@@ -457,7 +655,7 @@ class Archive2(vx.Extractable):
             if 2 + fl > len(params): raise VFAError(f"Chunk {i} parameters are malformed.")
             fparams, cparams = params[2:2 + fl], params[2 + fl:]
         try:
-            data = cdc.decode(cparams, payload, raw_size)       # coder output is the filtered stream (same size for M1 filters)
+            data = cdc.decode(cparams, payload, raw_size)       # coder output is the filtered stream (filters keep the size)
             raw = flt.decode(fparams, data, raw_size)
         except VFAError as e:
             raise VFAError(f"Chunk {i}: {e}")

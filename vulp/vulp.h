@@ -1,0 +1,49 @@
+/* Copyright (C) 2025 TG11  -  AGPL-3.0-or-later (see LICENSE)
+ *
+ * vulp - the VFA2 codec core (VFA2.md, "Coders" and "Filters"). Plain C99, no dependencies beyond libc.
+ *
+ * RULE: integer arithmetic only. No float, no double, no <math.h>. The encoder and decoder must produce
+ * bit-identical results on every compiler, optimisation level and CPU; test_vfa.py lints this file for
+ * floating-point types and scans the compiled objects for floating-point instructions.
+ */
+#ifndef VULP_H
+#define VULP_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define VULP_VERSION 1               /* bump when the encoder's output for the same input changes */
+
+#define VULP_OK          0
+#define VULP_E_CORRUPT  -1           /* the encoded data is invalid; never "best effort" output */
+#define VULP_E_PARAM    -2           /* unknown filter id or malformed parameters */
+#define VULP_E_NOMEM    -3
+#define VULP_E_SPACE    -4           /* output buffer too small (encoder) */
+
+/* filter ids (VFA2.md, "Filters") */
+#define VULP_F_NONE       0
+#define VULP_F_DELTA      1          /* params: u8 stride (1..32) */
+#define VULP_F_SHUFFLE    2          /* params: u8 elem_size (2,4,8,16), u8 mode (0 byte planes, 1 bit planes) */
+#define VULP_F_BCJ_X86    3          /* params: none */
+#define VULP_F_BCJ_ARM64  4          /* params: none */
+
+#define VULP_TANS_BLOCK   (1u << 17) /* block size the encoder uses; the decoder accepts any size */
+#define VULP_TANS_MAXLOG  12
+#define VULP_TANS_MINLOG  5
+
+/* tANS ("vulp-tans", coder 1). The payload is a sequence of blocks (RAW / RLE / TANS) whose sizes add up to n. */
+size_t vulp_tans_bound(size_t n);
+int vulp_tans_encode(const uint8_t *in, size_t n, uint8_t *out, size_t cap, size_t *out_len);
+int vulp_tans_decode(const uint8_t *in, size_t in_len, uint8_t *out, size_t n);
+
+/* Estimated order-0 coded size of `in`, in 1/65536 bits (integer log2, Q16). Used by the encoder's classifier. */
+uint64_t vulp_cost_order0(const uint8_t *in, size_t n);
+uint32_t vulp_log2_q16(uint32_t x);
+
+/* Filters are size-preserving bijections: out has exactly n bytes. in and out must not overlap. */
+int vulp_filter_fwd(int id, const uint8_t *params, size_t plen, const uint8_t *in, uint8_t *out, size_t n);
+int vulp_filter_inv(int id, const uint8_t *params, size_t plen, const uint8_t *in, uint8_t *out, size_t n);
+
+const char *vulp_strerror(int err);
+
+#endif
