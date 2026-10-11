@@ -865,18 +865,16 @@ def compilers():
     """[(label, argv-builder)] for every C compiler available here. MSVC needs a developer environment (vcvars64)."""
     out = []
     if os.name == "nt":
-        env = None
-        if shutil.which("cl"): env = dict(os.environ)
-        else:
-            try:
-                import build_vulp; env = build_vulp._vcvars_env()
-            except Exception: env = None
-        if env:
+        try:
+            import build_vulp; env = build_vulp.msvc_env()      # a working toolchain only (see msvc_env)
+            cl = build_vulp.msvc_tool(env, "cl") if env else None
+        except Exception: env = cl = None
+        if env and cl:
             def msvc(srcs, exe, opt, env):
                 objdir = pathlib.Path(str(exe) + "_obj"); objdir.mkdir(parents=True, exist_ok=True)
                 if str(exe).endswith(".o"):           # object only (for the instruction scan)
-                    return ["cl", "/nologo", opt, "/W4", "/c", f"/Fo{exe}", *srcs], env
-                return ["cl", "/nologo", opt, "/W4", f"/Fe{exe}", f"/Fo{objdir}\\", *srcs], env
+                    return [cl, "/nologo", opt, "/W4", "/c", f"/Fo{exe}", *srcs], env
+                return [cl, "/nologo", opt, "/W4", f"/Fe{exe}", f"/Fo{objdir}\\", *srcs], env
             for opt in ("/Od", "/O2"):
                 out.append((f"msvc {opt}", lambda srcs, exe, opt=opt, env=env: msvc(srcs, exe, opt, env)))
     seen = set()
@@ -979,7 +977,10 @@ def t2_native(work, corpus):
         if r.returncode == 0: objs.append((label, obj, env))
     scanned = 0
     for label, obj, env in objs:
-        if label.startswith("msvc"): cmd = ["dumpbin", "/disasm", str(obj)]
+        if label.startswith("msvc"):
+            import build_vulp; db = build_vulp.msvc_tool(env, "dumpbin")
+            if not db: continue
+            cmd = [db, "/disasm", str(obj)]
         elif shutil.which("objdump"): cmd = ["objdump", "-d", "--no-show-raw-insn", str(obj)]
         else: continue
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -995,7 +996,9 @@ def t2_native(work, corpus):
         probe.write_text("double vfa_probe(double a, int b) { return a * 1.5 + (double)b; }\n")
         mk = dict(comps)[label]; argv, env = mk([str(probe)], pobj)
         subprocess.run(argv, capture_output=True, env=env, cwd=work)
-        cmd = ["dumpbin", "/disasm", str(pobj)] if label.startswith("msvc") else ["objdump", "-d", "--no-show-raw-insn", str(pobj)]
+        if label.startswith("msvc"):
+            import build_vulp; cmd = [build_vulp.msvc_tool(env, "dumpbin") or "dumpbin", "/disasm", str(pobj)]
+        else: cmd = ["objdump", "-d", "--no-show-raw-insn", str(pobj)]
         out = subprocess.run(cmd, capture_output=True, text=True, env=env).stdout if pobj.exists() else ""
         found = {m.group(0) for line in out.splitlines() for m in [FP_INSN.search(line.split("\t", 2)[-1] if "\t" in line else line)] if m}
         check(f"native: FP-instruction scan self-test flags real floating point ({label}: {sorted(found)[:4]})", bool(found))

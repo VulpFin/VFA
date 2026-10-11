@@ -32,22 +32,51 @@ def _vcvars_env():
             cands.append(pathlib.Path(pf) / "Microsoft Visual Studio/2022" / ed / "VC/Auxiliary/Build/vcvars64.bat")
     for bat in cands:
         if bat.exists():
-            r = subprocess.run(f'cmd /s /c ""{bat}" >nul 2>&1 && set"', capture_output=True, text=True, shell=True)
+            # one string, no shell=True: on Windows it is passed to cmd.exe verbatim (cmd /s strips the outer quotes)
+            r = subprocess.run(f'cmd.exe /s /c ""{bat}" >nul 2>&1 && set"', capture_output=True, text=True)
             env = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
             if env: print(f"[vulp] using {bat}"); return env
     return None
 
+def _env_get(env, key):
+    """Case-insensitive lookup (Windows environment names are, e.g. 'Path' vs 'PATH')."""
+    return next((v for k, v in env.items() if k.upper() == key), "")
+
+def _has_c_headers(env) -> bool:
+    return any((pathlib.Path(d) / "stddef.h").is_file() for d in _env_get(env, "INCLUDE").split(";") if d.strip())
+
+def msvc_env():
+    """Environment of a *working* MSVC x64 toolchain (cl.exe plus the CRT/SDK headers), or None.
+
+    A cl.exe that merely happens to be on PATH is trusted only inside a developer prompt (vcvars sets VSCMD_VER and
+    INCLUDE): a bare cl.exe without its INCLUDE/LIB environment cannot find <stddef.h>. Otherwise vcvars64.bat is
+    loaded, which puts its own cl.exe first on PATH."""
+    cur = dict(os.environ)
+    if _env_get(cur, "VSCMD_VER") and _has_c_headers(cur) and shutil.which("cl", path=_env_get(cur, "PATH")):
+        return cur
+    env = _vcvars_env()
+    if env and _has_c_headers(env) and shutil.which("cl", path=_env_get(env, "PATH")):
+        return env
+    return None
+
+def msvc_tool(env, name):
+    """Absolute path of an MSVC tool (cl, dumpbin) in env: child processes on Windows resolve a bare name through the
+    *parent's* PATH, which may hold a different, broken copy."""
+    return shutil.which(name, path=_env_get(env, "PATH"))
+
 def build():
     from setuptools import Extension, Distribution
-    env = None
-    if os.name == "nt" and not shutil.which("cl"):
-        env = _vcvars_env()
+    if os.name == "nt":
+        env = msvc_env()
         if env is None:
-            raise SystemExit("[vulp] MSVC not found. Install 'Desktop development with C++' (VS 2022 Build Tools), or run from "
-                             "an x64 Native Tools prompt (vcvars64.bat).")
-        os.environ.update(env)
-    if os.name == "nt": os.environ["DISTUTILS_USE_SDK"] = "1"; os.environ["MSSdk"] = "1"
-    flags = ["/O2", "/W4"] if os.name == "nt" else ["-O2", "-std=c99", "-Wall", "-Wextra"]
+            stray = shutil.which("cl")
+            raise SystemExit("[vulp] No working MSVC x64 toolchain found (cl.exe with the C headers). Install 'Desktop "
+                             "development with C++' (VS 2022), or run from an x64 Native Tools prompt (vcvars64.bat)."
+                             + (f"\n       Note: {stray} is on PATH but has no INCLUDE environment; it is ignored." if stray else ""))
+        os.environ.clear(); os.environ.update(env)
+        os.environ["DISTUTILS_USE_SDK"] = "1"; os.environ["MSSdk"] = "1"
+        print(f"[vulp] cl.exe: {msvc_tool(env, 'cl')}")
+    flags = ["/W4"] if os.name == "nt" else ["-O2", "-std=c99", "-Wall", "-Wextra"]      # setuptools already passes /O2
     ext = Extension("_vulp", [str(p.relative_to(ROOT)) for p in SRC], include_dirs=["vulp"], extra_compile_args=flags)
     dist = Distribution({"name": "vulp", "ext_modules": [ext], "script_name": "build_vulp.py"})
     cmd = dist.get_command_obj("build_ext"); cmd.inplace = True; cmd.build_temp = str(ROOT / "build" / "vulp")
