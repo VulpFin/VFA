@@ -309,7 +309,7 @@ def classify(raw, coder: int = 1) -> Tuple[int, bytes, dict]:
                 enc = _native.lz_encode(data, CLASSIFY_LZ_LEVEL)
                 size += len(enc) if enc is not None else len(pc)
             lz[filter_label(fid, params)] = size
-        est = {"order0": est, "lz": lz}
+        est = {"lz": lz}                          # the decision is made on these; order-0 numbers only chose the shortlist
         base = lz["none"]; best = (0, b""); best_c = base
         for fid, params in trial[1:]:
             c = lz[filter_label(fid, params)]

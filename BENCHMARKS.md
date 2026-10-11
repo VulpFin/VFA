@@ -341,3 +341,137 @@ LZ tool on compressible data and ties on already-compressed data. Windows-specif
   extraction appears on Windows only (Linux: ~0.15 s for both) and has not been investigated yet.
 - `zstd --ultra -22` did not run (CLI not installed); `zstd22-pylib` is the same library at level 22, labelled as a
   stand-in.
+
+## 2026-10-11 22:29 M4 (VFA2 = vulp-lz + dedup), Linux cloud container
+
+Machine: Linux-6.18.44-fc-v114-x86_64-with-glibc2.39, x86_64, 4 logical CPUs. Tools: python 3.13.16; xz xz (XZ Utils) 5.4.5; zstd *** Zstandard CLI (64-bit) v1.5.5, by Yann Collet ***; 7z 7-Zip 23.01 (x64) : Copyright (c) 1999-2023 Igor Pavlov : 2023-06-20; python-zstandard 0.25.0
+
+Ratio = compressed / original (lower is better). MB/s are of original data. RSS = peak resident memory of the process. Stub = size of the self-extractor the format needs ("-" = none exists for that tool).
+
+### sample (41,430,058 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa-default | 0.9600 | 39,774,832 | 144.3 | 140.3 | 45.6 MiB | 53.1 MiB | - | ok |
+| vfa-zstd19-solid | 0.8101 | 33,561,417 | 5.7 | 111.3 | 184.5 MiB | 118.8 MiB | - | ok |
+| vfa-xz9-solid | 0.3974 (best) | 16,465,674 | 4.3 | 72.0 | 522.2 MiB | 164.8 MiB | - | ok |
+| vfa-lzma9-solid | 0.4003 | 16,585,458 | 4.4 | 28.4 | 522.5 MiB | 164.9 MiB | - | ok |
+| vfa-brotli11-solid | 0.8153 | 33,778,173 | 0.5 | 77.8 | 197.6 MiB | 146.1 MiB | - | ok |
+| vfa2-stored-solid | 0.4587 | 19,003,385 | 150.8 | 270.9 | 73.0 MiB | 70.7 MiB | - | ok |
+| vfa2-tans-solid | 0.4508 | 18,678,012 | 58.6 | 114.8 | 119.0 MiB | 122.8 MiB | - | ok |
+| vfa2-lz | 0.4159 | 17,230,428 | 35.4 | 206.7 | 91.8 MiB | 83.1 MiB | - | ok |
+| vfa2-lz-solid | 0.3988 | 16,524,337 | 35.4 | 128.4 | 102.1 MiB | 120.8 MiB | - | ok |
+| vfa2-lz9-solid | 0.3983 | 16,500,020 | 18.0 | 100.1 | 102.0 MiB | 120.8 MiB | - | ok |
+| xz-9e | 0.3975 | 16,466,920 | 3.5 | 118.8 | 422.7 MiB | 41.5 MiB | - | ok |
+| zstd-ultra22 | 0.3975 | 16,469,958 | 12.1 | 983.3 | 707.9 MiB | 43.6 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.4488 | 18,595,617 | 9.6 | 119.3 | 390.0 MiB | 56.6 MiB | - | ok |
+
+### SfiDemoSetup.exe (18,046,052 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa-default | 0.9835 | 17,747,839 | 96.6 | 83.7 | 45.4 MiB | 53.0 MiB | - | ok |
+| vfa-zstd19-solid | 0.9748 | 17,591,085 | 4.9 | 84.4 | 147.1 MiB | 81.0 MiB | - | ok |
+| vfa-xz9-solid | 0.8839 | 15,950,778 | 2.8 | 34.8 | 298.3 MiB | 97.2 MiB | - | ok |
+| vfa-lzma9-solid | 0.8902 | 16,065,012 | 2.8 | 13.5 | 298.5 MiB | 97.3 MiB | - | ok |
+| vfa-brotli11-solid | 0.9733 | 17,565,106 | 0.4 | 48.3 | 140.6 MiB | 85.8 MiB | - | ok |
+| vfa2-stored-solid | 0.9684 | 17,476,277 | 72.6 | 103.2 | 66.2 MiB | 67.7 MiB | - | ok |
+| vfa2-tans-solid | 0.9644 | 17,404,416 | 30.8 | 94.4 | 80.7 MiB | 84.2 MiB | - | ok |
+| vfa2-lz | 0.8871 | 16,009,199 | 18.5 | 64.0 | 91.7 MiB | 82.9 MiB | - | ok |
+| vfa2-lz-solid | 0.8871 | 16,009,199 | 16.5 | 98.2 | 90.9 MiB | 82.9 MiB | - | ok |
+| vfa2-lz9-solid | 0.8858 | 15,984,793 | 7.6 | 75.7 | 90.9 MiB | 82.9 MiB | - | ok |
+| xz-9e | 0.8840 | 15,952,108 | 2.8 | 63.0 | 221.5 MiB | 19.3 MiB | - | ok |
+| zstd-ultra22 | 0.8843 | 15,957,802 | 5.6 | 869.8 | 685.0 MiB | 20.6 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.8833 (best) | 15,939,476 | 14.1 | 69.3 | 235.0 MiB | 39.0 MiB | - | ok |
+
+### blob.bin (1,048,576 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa-default | 0.0006 | 606 | 10.2 | 10.6 | 34.3 MiB | 32.4 MiB | - | ok |
+| vfa-zstd19-solid | 0.0006 | 592 | 9.6 | 10.2 | 49.3 MiB | 32.4 MiB | - | ok |
+| vfa-xz9-solid | 0.0007 | 746 | 5.0 | 11.1 | 105.7 MiB | 33.4 MiB | - | ok |
+| vfa-lzma9-solid | 0.0007 | 702 | 6.5 | 11.1 | 105.7 MiB | 33.3 MiB | - | ok |
+| vfa-brotli11-solid | 0.0004 | 452 | 9.0 | 11.0 | 42.0 MiB | 33.4 MiB | - | ok |
+| vfa2-stored-solid | 0.2503 | 262,482 | 10.5 | 7.9 | 31.8 MiB | 31.0 MiB | - | ok |
+| vfa2-tans-solid | 0.0008 | 808 | 8.4 | 8.0 | 31.9 MiB | 30.9 MiB | - | ok |
+| vfa2-lz | 0.0009 | 899 | 9.6 | 7.9 | 34.7 MiB | 30.8 MiB | - | ok |
+| vfa2-lz-solid | 0.0009 | 899 | 6.7 | 7.8 | 34.5 MiB | 30.9 MiB | - | ok |
+| vfa2-lz9-solid | 0.0009 | 899 | 8.8 | 11.6 | 34.4 MiB | 30.8 MiB | - | ok |
+| xz-9e | 0.0005 | 512 | 24.2 | 223.5 | 12.3 MiB | 3.0 MiB | - | ok |
+| zstd-ultra22 | 0.0003 (best) | 359 | 3.0 | 224.0 | 652.8 MiB | 3.5 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.0006 | 578 | 48.0 | 113.0 | 21.9 MiB | 6.4 MiB | - | ok |
+
+### random.bin (500,000 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa-default | 1.0005 | 500,266 | 3.9 | 4.9 | 34.4 MiB | 32.2 MiB | - | ok |
+| vfa-zstd19-solid | 1.0005 | 500,257 | 3.7 | 5.2 | 40.9 MiB | 32.2 MiB | - | ok |
+| vfa-xz9-solid | 1.0006 | 500,320 | 2.0 | 4.7 | 100.8 MiB | 32.2 MiB | - | ok |
+| vfa-lzma9-solid | 1.0142 | 507,095 | 1.9 | 4.0 | 100.8 MiB | 32.3 MiB | - | ok |
+| vfa-brotli11-solid | 1.0005 | 500,241 | 1.9 | 5.1 | 43.9 MiB | 32.1 MiB | - | ok |
+| vfa2-stored-solid | 1.0006 | 500,280 | 3.8 | 5.1 | 31.3 MiB | 31.5 MiB | - | ok |
+| vfa2-tans-solid | 1.0016 | 500,803 | 3.7 | 5.3 | 32.2 MiB | 31.4 MiB | - | ok |
+| vfa2-lz | 1.0017 | 500,850 | 3.2 | 3.6 | 36.1 MiB | 31.5 MiB | - | ok |
+| vfa2-lz-solid | 1.0017 | 500,850 | 3.3 | 5.3 | 35.8 MiB | 31.5 MiB | - | ok |
+| vfa2-lz9-solid | 1.0017 | 500,850 | 3.1 | 5.3 | 35.9 MiB | 31.5 MiB | - | ok |
+| xz-9e | 1.0002 | 500,084 | 2.9 | 154.7 | 70.8 MiB | 2.7 MiB | - | ok |
+| zstd-ultra22 | 1.0000 (best) | 500,022 | 1.2 | 126.9 | 653.0 MiB | 3.2 MiB | - | ok |
+| 7z-lzma2-mx9 | 1.0003 | 500,164 | 14.3 | 68.4 | 14.2 MiB | 6.4 MiB | - | ok |
+
+### app.ico (1,630,489 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa-default | 1.0002 | 1,630,779 | 15.9 | 16.3 | 36.5 MiB | 37.6 MiB | - | ok |
+| vfa-zstd19-solid | 1.0002 | 1,630,770 | 5.3 | 15.6 | 67.1 MiB | 37.6 MiB | - | ok |
+| vfa-xz9-solid | 1.0002 | 1,630,861 | 2.9 | 13.9 | 115.3 MiB | 36.6 MiB | - | ok |
+| vfa-lzma9-solid | 1.0110 | 1,648,440 | 2.8 | 7.4 | 115.3 MiB | 36.6 MiB | - | ok |
+| vfa-brotli11-solid | 1.0001 | 1,630,730 | 1.3 | 15.6 | 63.4 MiB | 36.5 MiB | - | ok |
+| vfa2-stored-solid | 1.0002 | 1,630,766 | 14.2 | 14.8 | 33.6 MiB | 33.6 MiB | - | ok |
+| vfa2-tans-solid | 1.0005 | 1,631,254 | 10.9 | 14.0 | 35.4 MiB | 33.5 MiB | - | ok |
+| vfa2-lz | 1.0005 | 1,631,375 | 8.7 | 11.7 | 39.9 MiB | 33.6 MiB | - | ok |
+| vfa2-lz-solid | 1.0005 | 1,631,375 | 7.7 | 16.5 | 39.8 MiB | 33.6 MiB | - | ok |
+| vfa2-lz9-solid | 1.0002 | 1,630,755 | 5.8 | 15.9 | 39.8 MiB | 35.0 MiB | - | ok |
+| xz-9e | 1.0001 | 1,630,628 | 3.4 | 307.9 | 80.5 MiB | 3.5 MiB | - | ok |
+| zstd-ultra22 | 1.0000 (best) | 1,630,538 | 3.0 | 327.8 | 655.5 MiB | 4.7 MiB | - | ok |
+| 7z-lzma2-mx9 | 1.0001 | 1,630,714 | 15.8 | 196.0 | 28.9 MiB | 8.5 MiB | - | ok |
+
+### payload.vfa (2,135,012 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa-default | 1.0001 | 2,135,319 | 21.4 | 19.3 | 37.6 MiB | 39.5 MiB | - | ok |
+| vfa-zstd19-solid | 0.9986 | 2,131,918 | 7.2 | 20.1 | 83.5 MiB | 39.6 MiB | - | ok |
+| vfa-xz9-solid | 0.9989 | 2,132,609 | 2.8 | 13.3 | 120.6 MiB | 38.4 MiB | - | ok |
+| vfa-lzma9-solid | 1.0099 | 2,156,220 | 2.9 | 8.4 | 120.5 MiB | 38.6 MiB | - | ok |
+| vfa-brotli11-solid | 1.0001 | 2,135,257 | 1.2 | 18.7 | 68.8 MiB | 38.4 MiB | - | ok |
+| vfa2-stored-solid | 1.0001 | 2,135,293 | 19.9 | 21.1 | 34.7 MiB | 34.6 MiB | - | ok |
+| vfa2-tans-solid | 1.0004 | 2,135,781 | 12.5 | 15.1 | 36.8 MiB | 34.5 MiB | - | ok |
+| vfa2-lz | 0.9989 | 2,132,636 | 10.4 | 20.2 | 41.9 MiB | 37.4 MiB | - | ok |
+| vfa2-lz-solid | 0.9989 | 2,132,636 | 10.0 | 19.1 | 41.7 MiB | 37.3 MiB | - | ok |
+| vfa2-lz9-solid | 0.9985 | 2,131,858 | 6.0 | 21.8 | 41.7 MiB | 37.4 MiB | - | ok |
+| xz-9e | 0.9988 | 2,132,368 | 3.5 | 145.4 | 84.8 MiB | 4.0 MiB | - | ok |
+| zstd-ultra22 | 0.9984 (best) | 2,131,682 | 3.4 | 403.1 | 656.6 MiB | 5.2 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.9990 | 2,132,888 | 18.4 | 143.1 | 37.2 MiB | 9.6 MiB | - | ok |
+
+### vfa.py (61,025 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa-default | 0.3019 | 18,422 | 0.6 | 0.5 | 31.6 MiB | 30.8 MiB | - | ok |
+| vfa-zstd19-solid | 0.2793 | 17,046 | 0.4 | 0.6 | 32.4 MiB | 30.8 MiB | - | ok |
+| vfa-xz9-solid | 0.2755 | 16,812 | 0.4 | 0.6 | 95.4 MiB | 30.6 MiB | - | ok |
+| vfa-lzma9-solid | 0.2748 | 16,768 | 0.4 | 0.6 | 95.4 MiB | 30.6 MiB | - | ok |
+| vfa-brotli11-solid | 0.2606 (best) | 15,905 | 0.3 | 0.6 | 34.2 MiB | 30.7 MiB | - | ok |
+| vfa2-stored-solid | 1.0045 | 61,301 | 0.6 | 0.5 | 30.5 MiB | 30.5 MiB | - | ok |
+| vfa2-tans-solid | 0.6364 | 38,835 | 0.6 | 0.6 | 30.7 MiB | 30.5 MiB | - | ok |
+| vfa2-lz | 0.3046 | 18,591 | 0.5 | 0.5 | 33.7 MiB | 30.5 MiB | - | ok |
+| vfa2-lz-solid | 0.3046 | 18,591 | 0.5 | 0.6 | 33.5 MiB | 30.6 MiB | - | ok |
+| vfa2-lz9-solid | 0.3038 | 18,538 | 0.5 | 0.6 | 33.5 MiB | 30.5 MiB | - | ok |
+| xz-9e | 0.2719 | 16,592 | 1.3 | 12.6 | 30.7 MiB | 2.1 MiB | - | ok |
+| zstd-ultra22 | 0.2756 | 16,819 | 0.2 | 17.9 | 651.3 MiB | 2.8 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.2729 | 16,653 | 4.3 | 10.6 | 7.6 MiB | 5.6 MiB | - | ok |
+
+VFA rows include Python interpreter start-up (~0.3-1 s per run); on small inputs that dominates MB/s.
