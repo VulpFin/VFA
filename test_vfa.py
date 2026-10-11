@@ -9,7 +9,7 @@ VFA correctness harness (VFA1 and VFA2). No pytest needed:
     python test_vfa.py --big            # also the >4 GiB single-file tests (needs ~13 GB free, slow)
     python test_vfa.py --fuzz 5000      # more fuzz cases per archive (default 600)
     python test_vfa.py --only fuzz,ra   # groups: roundtrip,sample,encrypt,append,ra,refuse,paths,fuzz,determinism,sfx,signed,
-                                        #         codec,native,big
+                                        #         codec,native,lz,dedup,big
 
 What "pass" means:
   roundtrip     every file comes back byte-identical (all methods x solid/non-solid, multi-block, edge-case files)
@@ -712,8 +712,20 @@ def t2_fuzz(work, n_cases, quick):
         check("fuzz target really uses the segmented filter + tANS", any(ch[3] == 1 and ch[4] == V2.SEGMENTED for ch in c.chunks), str(c.chunks))
     run_fuzz([("vfa2 tANS + auto filter", build2(work / "fz2_t.vfa", tfiles, coder=1, filt=None), None, (True, False)),
               ("vfa2 tANS, solid, segmented filter", seg, None, (True, False)),
-              ("vfa2 tANS + bitshuffle:4", build2(work / "fz2_b.vfa", tfiles, coder=1, filt=(2, b"\x04\x01")), None, (True, False))],
+              ("vfa2 tANS + bitshuffle:4", build2(work / "fz2_b.vfa", tfiles, coder=1, filt=(2, b"\x04\x01")), None, (True, False)),
+              ("vfa2 vulp-lz + auto filter", build2(work / "fz2_l.vfa", tfiles, coder=3, filt=None), None, (True, False))],
              twant, n_cases, quick, rnd)
+    # dedup: a second copy of the ramp makes the writer reference earlier segments instead of storing them
+    dfiles = tfiles + [("z/ramp2.bin", tfiles[-1][1])]
+    dd = build2(work / "fz2_d.vfa", dfiles, coder=3, filt=None, solid=True, chunk_size=1 << 17, cdc=True)
+    with vx.open_container(str(dd)) as c:
+        c.unlock(None); ents = {e["path"]: e for e in c.entries}
+        inside = lambda x, y: x[0] == y[0] and y[1] <= x[1] and x[1] + x[2] <= y[1] + y[2]
+        check("fuzz target really uses dedup (part of ramp2.bin points into ramp.bin's stored bytes)",
+              any(inside(x, y) for x in ents["z/ramp2.bin"]["extents"] for y in ents["z/ramp.bin"]["extents"]),
+              str(ents["z/ramp2.bin"]["extents"])[:200])
+    run_fuzz([("vfa2 vulp-lz, solid, dedup", dd, None, (True, False))],
+             {p: hashlib.sha256(d).hexdigest() for p, d in dfiles}, n_cases, quick, rnd)
     # the oracle must be able to fail: an intact archive judged against the wrong expectation must read as WRONG
     bogus = dict(want); bogus["z/a.txt"] = "0" * 64
     check("fuzz oracle self-test: a wrong expectation is reported as WRONG",
@@ -863,7 +875,7 @@ def t2_codec(work, corpus):
 
 # ---- native builds
 
-NATIVE_SRC = ["vulp/vulp.c", "vulp/vulpcli.c"]
+NATIVE_SRC = ["vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulpcli.c"]
 FP_TYPES = re.compile(r"\b(float|double|_Float\d+|__fp16|_Complex|fenv_t)\b|#\s*include\s*<(math|fenv|tgmath|complex)\.h>|\b(fabs|sqrt|pow|exp|log|log2|floor|ceil|round)\s*\(")
 # x86 floating-point arithmetic/conversion (SSE/AVX scalar+packed, x87). Plain moves/bitwise (movaps, pxor) are integer-safe.
 FP_INSN = re.compile(r"\b(v?(add|sub|mul|div|sqrt|min|max|rcp|rsqrt|round|cmp|comi|ucomi|h?addsub|hadd|hsub|dp)(ss|sd|ps|pd)|"
@@ -905,7 +917,7 @@ def t2_native(work, corpus):
     srcs = [str(HERE / s) for s in NATIVE_SRC]
     # 1. source lint: no floating-point types or math in the codec (C) ...
     hits = []
-    for f in ["vulp/vulp.c", "vulp/vulp.h", "vulp/vulpcli.c", "vulp/vulpmodule.c"]:
+    for f in ["vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulp.h", "vulp/vulpcli.c", "vulp/vulpmodule.c"]:
         for ln, line in enumerate(strip_c_comments((HERE / f).read_text()).splitlines(), 1):
             if FP_TYPES.search(line): hits.append(f"{f}:{ln}: {line.strip()}")
     check("native: no float/double/<math.h> in the C codec sources", not hits, str(hits[:5]))
@@ -916,7 +928,9 @@ def t2_native(work, corpus):
     import ast
     targets = {"vulp_ref.py": None, "vfa2.py": {"classify", "route", "units", "_sample", "_hint", "seg_pack", "seg_unpack",
                                                 "_seg_apply", "_tans_encode", "_tans_decode", "_filter_codec", "_stored_encode",
-                                                "_stored_decode", "_flush", "chunk_data", "filter_label", "parse_filter"}}
+                                                "_stored_decode", "_flush", "chunk_data", "filter_label", "parse_filter",
+                                                "_lz_encode", "_lz_decode", "_code_hints", "_segment", "_reference",
+                                                "_append", "add_file"}}
     hits = []
     for fname, funcs in targets.items():
         tree = ast.parse((HERE / fname).read_text())
@@ -975,7 +989,12 @@ def t2_native(work, corpus):
                     fl = C.filter_fwd(fid, p, d); e = C.tans_encode(fl)
                     if i == 0: tl = len(e)
                     h = zlib.crc32(struct.pack("<Q", C.cost(fl)), h); h = zlib.crc32(fl, h); h = zlib.crc32(e, h)
-                lines.append(f"size={len(d)} tans={tl} digest={h:08x}")
+                lz = C.lz_encode(d, 6)                 # None: did not fit in len+4096 -> the CLI uses the full bound
+                if lz is None: lz = b""
+                h = zlib.crc32(lz, h)
+                cuts = C.cdc(d, 2048, 13, 65536)
+                h = zlib.crc32(b"".join(struct.pack("<Q", c) for c in cuts), h)
+                lines.append(f"size={len(d)} tans={tl} lz={len(lz)} cdc={len(cuts)} digest={h:08x}")
             check("native: the _vulp extension (as bundled into the stubs) matches the standalone builds", "\n".join(lines) + "\n" == ref[1],
                   f"{lines[:2]} vs {ref[1].splitlines()[:2]}")
         except ImportError:
@@ -984,12 +1003,14 @@ def t2_native(work, corpus):
     objs = []
     for label, mk in comps:
         if "O0" in label or "Od" in label: continue
-        obj = work / ("vulp_" + re.sub(r"\W+", "_", label) + ".o")
-        argv, env = mk([str(HERE / "vulp/vulp.c")], obj)
-        r = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=work)
-        if r.returncode == 0: objs.append((label, obj, env))
+        for src in ("vulp/vulp.c", "vulp/vulp_lz.c"):
+            obj = work / ("obj_" + re.sub(r"\W+", "_", label + "_" + src) + ".o")
+            argv, env = mk([str(HERE / src)], obj)
+            r = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=work)
+            if r.returncode == 0: objs.append((label, obj, env, src))
+            else: check(f"native: {src} compiles with {label}", False, (r.stdout + r.stderr)[-300:])
     scanned = 0
-    for label, obj, env in objs:
+    for label, obj, env, src in objs:
         if label.startswith("msvc"):
             import build_vulp; db = build_vulp.msvc_tool(env, "dumpbin")
             if not db: continue
@@ -1001,11 +1022,11 @@ def t2_native(work, corpus):
         found = sorted({m.group(0) for line in r.stdout.splitlines() if "\t" in line or label.startswith("msvc")
                         for m in [FP_INSN.search(line.split("\t", 2)[-1] if "\t" in line else line)] if m})
         scanned += 1
-        check(f"native: no floating-point instructions in vulp.c compiled by {label}", not found, str(found[:10]))
+        check(f"native: no floating-point instructions in {src} compiled by {label}", not found, str(found[:10]))
     if not scanned: skip("native: floating-point instruction scan", "no disassembler (objdump / dumpbin) found")
     elif objs:
         # oracle self-test: the same scan must flag a function that really uses floating point
-        label, _, env = objs[0]; probe = work / "fp_probe.c"; pobj = work / "fp_probe.o"
+        label, _, env, _src = objs[0]; probe = work / "fp_probe.c"; pobj = work / "fp_probe.o"
         probe.write_text("double vfa_probe(double a, int b) { return a * 1.5 + (double)b; }\n")
         mk = dict(comps)[label]; argv, env = mk([str(probe)], pobj)
         subprocess.run(argv, capture_output=True, env=env, cwd=work)
@@ -1039,6 +1060,97 @@ def t2_native(work, corpus):
               f"decodes, no sanitizer report ({summary} ...)", ok, "".join(l.stderr[-600:] for l in logs if l.returncode or l.stderr))
 
 
+# ================================================================ VFA2 M4: vulp-lz + cross-chunk dedup
+
+def t2_lz(work, corpus):
+    import vfa2 as V2, vulp_ref as R
+    try:
+        import _vulp as C
+    except ImportError:
+        check("vfa2 lz: the _vulp C extension is built", False, "not importable"); return
+    cases = codec_cases(corpus); rnd = random.Random(4242)
+    a = rnd.randbytes(5 << 20)
+    cases["long-range: 5 MiB, 1 MiB other, same 5 MiB again"] = a + rnd.randbytes(1 << 20) + a
+    cases["3 MiB of zeros (one huge match)"] = bytes(3 << 20)
+    mism = []; n = 0; ratios = {}
+    for name, d in cases.items():
+        for lvl in (0, 6, 9):
+            e = C.lz_encode(d, lvl)
+            if e is None: continue
+            n += 1
+            if C.lz_decode(e, len(d)) != d: mism.append(f"C decode L{lvl} {name}")
+            if len(d) <= 300_000 and R.lz_decode(e, len(d)) != d: mism.append(f"reference decode L{lvl} {name}")
+            if lvl == 6: ratios[name] = len(e) / max(1, len(d))
+    check(f"vfa2 lz: {n} encodings decode byte-identically (C), and with the pure-Python reference where small", not mism, str(mism[:5]))
+    lr = ratios.get("long-range: 5 MiB, 1 MiB other, same 5 MiB again", 9)      # 6 of 11 MiB are unique random bytes
+    check(f"vfa2 lz: long-range match across a 1 MiB gap found (ratio {lr:.4f}; optimum 6/11 = 0.5455)", lr < 6 / 11 + 0.002)
+    check(f"vfa2 lz: 3 MiB of zeros -> {ratios.get('3 MiB of zeros (one huge match)', 9) * 3145728:.0f} bytes",
+          ratios.get("3 MiB of zeros (one huge match)", 9) * 3145728 < 200)
+    check("vfa2 lz: empty input encodes to an empty payload that decodes", C.lz_encode(b"", 6) == b"" and C.lz_decode(b"", 0) == b""
+          and R.lz_decode(b"", 0) == b"")
+    cd = [(nm, d[:120_000]) for nm, d in list(cases.items())[:10]]
+    check("vfa2 lz: content-defined cut points, C == reference", all(C.cdc(d, 512, 11, 8192) == R.cdc(d, 512, 11, 8192) for _, d in cd))
+    # corrupted vulp-lz payloads: no crash in either decoder, and both agree
+    src = cases["corpus/data.csv (64 KiB)"] if "corpus/data.csv (64 KiB)" in cases else cases["random 5000"]
+    enc = C.lz_encode(src, 6); stats = {"refused": 0, "identical": 0, "different": 0}; crash = []; disagree = []
+    for k in range(3000):
+        m, _ = mutate(enc, rnd); size = len(src) if k % 5 else rnd.randrange(len(src) + 2)
+        res = []
+        for impl in ((C,) if k % 10 else (C, R)):
+            try: out = impl.lz_decode(m, size); res.append(out); stats["identical" if out == src else "different"] += 1
+            except ValueError: res.append("refused"); stats["refused"] += 1
+            except Exception as e: crash.append(f"{impl.__name__}: {e!r}")
+        if len(res) == 2 and res[0] != res[1]: disagree.append(k)
+    check(f"vfa2 lz: corrupted payloads never crash either decoder {stats}", not crash, str(crash[:3]))
+    check("vfa2 lz: C and reference decoders agree on corrupted payloads (accept/refuse and bytes)", not disagree, str(disagree[:5]))
+    # an older reader (M3: no vulp-lz) names what it lacks
+    p = build2(work / "r_lz.vfa", [("z/a.txt", b"vulp-lz " * 2000)], coder=3, filt=(0, b""))
+    saved = (V2.CODERS.pop(3), dict(V2.RESERVED_CODERS)); V2.RESERVED_CODERS[3] = "vulp-lz (M4)"
+    try:
+        try: open_extract(p, work / "r_lz_out"); check("vfa2 refuse: a reader without vulp-lz names it", False, "accepted")
+        except vx.VFAError as e: check("vfa2 refuse: a reader without vulp-lz names it (simulated M3 reader)", "coder id 3 (vulp-lz" in str(e), str(e))
+    finally:
+        V2.CODERS[3] = saved[0]; V2.RESERVED_CODERS.clear(); V2.RESERVED_CODERS.update(saved[1])
+
+def t2_dedup(work, corpus):
+    import vfa2 as V2
+    if not V2.NATIVE: skip("vfa2 dedup", "needs the _vulp extension"); return
+    rnd = random.Random(77)
+    base = rnd.randbytes(3 << 20)
+    shifted = b"a different header " * 50 + base[:1 << 20] + rnd.randbytes(70_000) + base[1 << 20:]   # inserts move offsets
+    d = work / "dd"; shutil.rmtree(d, ignore_errors=True); (d / "s").mkdir(parents=True)
+    (d / "s/v100.bin").write_bytes(base); (d / "s/v110.bin").write_bytes(shifted)
+    sizes = {}
+    for flags in ([], ["--no-dedup"], ["--solid"]):
+        arc = work / f"dd_{'_'.join(f.strip('-') for f in flags) or 'default'}.vfa"
+        vfa("c", arc, "s", "--format", "vfa2", *flags, cwd=d)
+        ok, why = extract_cmp(arc, d / "s", work); sizes[" ".join(flags) or "non-solid"] = arc.stat().st_size
+        check(f"vfa2 dedup: shifted near-duplicate files round-trip ({' '.join(flags) or 'non-solid'})", ok, why)
+    check(f"vfa2 dedup: non-solid archive of two near-duplicates {sizes['non-solid']:,} B vs {sizes['--no-dedup']:,} B without dedup",
+          sizes["non-solid"] < 0.6 * sizes["--no-dedup"])
+    with vx.open_container(str(work / "dd_default.vfa")) as c:
+        c.unlock(None)
+        v110 = next(e for e in c.entries if e["path"].endswith("v110.bin")); v100 = next(e for e in c.entries if e["path"].endswith("v100.bin"))
+        own = {ch for ch, _, _ in v100["extents"]}
+        check(f"vfa2 dedup: v110.bin borrows extents from v100.bin's chunk ({len(v110['extents'])} extents)",
+              any(ch in own for ch, _, _ in v110["extents"]))
+        seen = []; orig = c.chunk_data
+        c.chunk_data = lambda i: (seen.append(i), orig(i))[1]
+        out = work / "dd_ra"; shutil.rmtree(out, ignore_errors=True)
+        c.extract(str(out), members=["s/v110.bin"])
+        check(f"vfa2 dedup: random access to the deduplicated member decodes {len(set(seen))} chunk(s), "
+              f"({len(seen)} chunk requests, cache hits included)", (out / "s/v110.bin").read_bytes() == shifted and len(set(seen)) <= 2)
+    p = build2(work / "dd_enc.vfa", [("z/a", base[:1 << 20]), ("z/b", base[:1 << 20])], password=b"pw", kdf=(1, 1024, 1), cdc=True)
+    with vx.open_container(str(p)) as c:
+        c.unlock("pw")
+        check("vfa2 dedup is off when encrypting (identical files get separate chunks)", len(c.chunks) == 2)
+    # a chunk-boundary case: dedup references into the unflushed buffer and across flushes, small chunks
+    files = [("z/a", base[:600_000]), ("z/b", base[:600_000]), ("z/c", base[100_000:700_000])]
+    p = build2(work / "dd_small.vfa", files, cdc=True, solid=True, chunk_size=1 << 18, coder=3, filt=None)
+    out = work / "dd_small_out"; shutil.rmtree(out, ignore_errors=True); open_extract(p, out)
+    check("vfa2 dedup: solid, 256 KiB chunks, references into the current buffer and earlier chunks round-trip",
+          all((out / pth).read_bytes() == dat for pth, dat in files))
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -1048,7 +1160,7 @@ def main():
     ap.add_argument("--fuzz", type=int, default=None); ap.add_argument("--only"); ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
     groups = set(a.only.split(",")) if a.only else {"roundtrip", "sample", "encrypt", "append", "ra", "refuse", "paths",
-                                                     "fuzz", "determinism", "sfx", "signed", "codec", "native"}
+                                                     "fuzz", "determinism", "sfx", "signed", "codec", "native", "lz", "dedup"}
     if a.big: groups.add("big")
     n = a.fuzz if a.fuzz is not None else (150 if a.quick else 600)
     work = pathlib.Path(tempfile.mkdtemp(prefix="vfa-test-"))
@@ -1065,7 +1177,8 @@ def main():
                  ("refuse", lambda c: t2_refuse(work)), ("paths", lambda c: t2_paths(work)),
                  ("determinism", lambda c: t2_determinism(work, c)), ("sfx", lambda c: t2_sfx(work, c)),
                  ("signed", lambda c: t_signed(work, c, "vfa2")), ("codec", lambda c: t2_codec(work, c)),
-                 ("native", lambda c: t2_native(work, c)), ("fuzz", lambda c: t2_fuzz(work, n, a.quick)),
+                 ("native", lambda c: t2_native(work, c)), ("lz", lambda c: t2_lz(work, c)),
+                 ("dedup", lambda c: t2_dedup(work, c)), ("fuzz", lambda c: t2_fuzz(work, n, a.quick)),
                  ("big", lambda c: t_big(work, "vfa2"))],
     }
     try:

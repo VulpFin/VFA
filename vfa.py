@@ -764,11 +764,14 @@ def _collect_items(args, solid: bool):
 
 # ---------- Commands ----------
 def cmd_create_v2(args):
-    """VFA2 (see VFA2.md). Coders: tans (default) or stored; filter per chunk: auto (default) or forced with --filter."""
+    """VFA2 (see VFA2.md). Coders: lz (default), tans or stored; filter per chunk: auto (default) or forced with
+    --filter; content-defined dedup across chunks unless --no-dedup or encrypting."""
     import vfa2
-    if args.method not in (None, "tans", "none", "stored"):
-        raise SystemExit(f"VFA2 has the coders 'tans' (default) and 'stored'/'none'; --method {args.method} is a VFA1 method")
-    coder = 0 if args.method in ("none", "stored") else 1
+    if args.method not in (None, "lz", "tans", "none", "stored"):
+        raise SystemExit(f"VFA2 has the coders 'lz' (default), 'tans' and 'stored'/'none'; --method {args.method} is a VFA1 method")
+    coder = {"none": 0, "stored": 0, "tans": 1}.get(args.method, vfa2.CODER_LZ)
+    if coder == vfa2.CODER_LZ and not vfa2.NATIVE:
+        raise SystemExit("--method lz needs the _vulp C extension (python build_vulp.py); --method tans works without it, slowly")
     try: filt = vfa2.parse_filter(args.filter)
     except ValueError as e: raise SystemExit(str(e))
     if coder == 0 and filt is None: filt = (0, b"")
@@ -780,6 +783,7 @@ def cmd_create_v2(args):
     nfiles = 0; total = 0; t0 = time.time()
     with open(args.output, "wb") as f:
         w = vfa2.Writer2(f, chunk_size=1 << args.chunk_exp, solid=args.solid, password=pw, coder=coder, filt=filt,
+                         level=args.level, cdc=not args.no_dedup,
                          kdf=(args.kdf_time or 3, args.kdf_mem_kib or 256 * 1024, args.kdf_parallel or 4))
         for et, rel, st, meta in _scan_inputs(items, args):
             mode = st.st_mode & 0o7777; ns = st.st_mtime_ns
@@ -790,13 +794,14 @@ def cmd_create_v2(args):
                 if n != st.st_size: LOGGER.warning(f"{rel} changed size while being archived ({st.st_size} -> {n} bytes)")
                 nfiles += 1; total += n
         w.close()
-    LOGGER.info(f"Done in {time.time() - t0:.2f}s | files {nfiles} | src {human_bytes(total)} | chunks {len(w.chunks)} | arch {human_bytes(w.pos)}")
+    LOGGER.info(f"Done in {time.time() - t0:.2f}s | files {nfiles} | src {human_bytes(total)} | chunks {len(w.chunks)} | arch {human_bytes(w.pos)}"
+                + (f" | dedup {w.dedup_segments} segments, {human_bytes(w.dedup_bytes)}" if w.cdc else ""))
     print(f"Created {args.output} (VFA2) with {len(w.entries)} entry(s), {len(w.chunks)} chunk(s). Solid={bool(args.solid)}")
 
 def cmd_create(args):
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd create")
     if args.format == "vfa2": return cmd_create_v2(args)
-    if args.method == "tans": raise SystemExit("--method tans is a VFA2 coder; add --format vfa2")
+    if args.method in ("tans", "lz"): raise SystemExit(f"--method {args.method} is a VFA2 coder; add --format vfa2")
     if args.filter != "auto": raise SystemExit("--filter applies to --format vfa2 only")
     if args.method is None: args.method = "zstd" if HAVE_ZSTD else "zlib"
     if args.method == "stored": args.method = "none"
@@ -1106,11 +1111,13 @@ def build_argparser():
     ap_c.add_argument(
         "--method",
         default=None,
-        choices=list(NAME_TO_METHOD.keys()) + ["stored", "tans"],
-        help="Compression method, default zstd (VFA1) / tans (VFA2: tans or stored/none)",
+        choices=list(NAME_TO_METHOD.keys()) + ["stored", "tans", "lz"],
+        help="Compression method, default zstd (VFA1) / lz (VFA2: lz, tans or stored/none; --level 0-9 for lz)",
     )
     ap_c.add_argument("--format", choices=["vfa1", "vfa2"], default="vfa1",
                       help="Container format (default vfa1; vfa2 is the new chunked format, see VFA2.md)")
+    ap_c.add_argument("--no-dedup", action="store_true", dest="no_dedup",
+                      help="VFA2: do not deduplicate repeated content across chunks")
     ap_c.add_argument("--filter", default="auto",
                       help="VFA2: filter per chunk: auto (default; classifier, reasons kept in the index) | none | delta:N | "
                            "shuffle:K | bitshuffle:K | bcj-x86 | bcj-arm64")

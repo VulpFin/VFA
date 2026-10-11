@@ -178,8 +178,10 @@ def all_tools():
         vfa_tool("vfa-lzma9-solid", "lzma", 9, True),
         vfa_tool("vfa-brotli11-solid", "brotli", 11, True),
         vfa_tool("vfa2-stored-solid", "none", 0, True, ("--format", "vfa2")),     # VFA2 M1: container only, no compression
-        vfa_tool("vfa2-tans", "tans", 0, False, ("--format", "vfa2")),             # VFA2 M3: auto filter + order-0 tANS
-        vfa_tool("vfa2-tans-solid", "tans", 0, True, ("--format", "vfa2")),
+        vfa_tool("vfa2-tans-solid", "tans", 0, True, ("--format", "vfa2")),       # VFA2 M3: auto filter + order-0 tANS
+        vfa_tool("vfa2-lz", "lz", 6, False, ("--format", "vfa2")),                 # VFA2 M4: vulp-lz + dedup (default)
+        vfa_tool("vfa2-lz-solid", "lz", 6, True, ("--format", "vfa2")),
+        vfa_tool("vfa2-lz9-solid", "lz", 9, True, ("--format", "vfa2")),
         stream_tool("xz-9e", "xz -9e -T1", XZ, ["-9e", "-T1", "-c"], ["-d", "-c"], ".xz", "xz not found on PATH"),
         stream_tool("zstd-ultra22", "zstd --ultra -22", ZSTD, ["--ultra", "-22", "-c", "-q"], ["-d", "-c", "-q"], ".zst",
                     "zstd CLI not found (install it, e.g. `winget install Facebook.zstd` or `choco install zstandard`)"),
@@ -196,7 +198,7 @@ def all_tools():
             pass
     return tools
 
-QUICK = {"vfa-default", "vfa2-stored-solid", "vfa2-tans-solid", "vfa-zstd19-solid", "vfa-xz9-solid", "xz-9e", "zstd-ultra22", "zstd22-pylib", "7z-lzma2-mx9"}
+QUICK = {"vfa-default", "vfa2-lz", "vfa2-lz-solid", "vfa-zstd19-solid", "vfa-xz9-solid", "xz-9e", "zstd-ultra22", "zstd22-pylib", "7z-lzma2-mx9"}
 
 # ---------------------------------------------------------------- run
 
