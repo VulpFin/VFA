@@ -334,7 +334,8 @@ LZ tool on compressible data and ties on already-compressed data. Windows-specif
   been broken down further.
 - **vfa2-tans-solid on sample: 40,263,936 here vs 40,243,815 on Linux.** The cause is file order, not the codec:
   `os.walk` lists files alphabetically on NTFS and in hash order on ext4, so the solid stream was packed in a different
-  order. Fixed after this run: VFA now sorts directory entries, so the same tree gives the same archive on every machine.
+  order. Fixed after this run: VFA now sorts directory entries, so files are packed in the same order on every machine.
+  (Archives can still differ by the metadata they preserve, such as permission bits and timestamps.)
 - **Small inputs:** every VFA row shows ~0.65 s to compress and ~1.34 s to extract regardless of size, which is
   interpreter and import start-up, so small-file MB/s figures say nothing about the codec. The ~0.7 s extra on
   extraction appears on Windows only (Linux: ~0.15 s for both) and has not been investigated yet.
