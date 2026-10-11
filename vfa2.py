@@ -529,8 +529,10 @@ class Archive2(vx.Extractable):
         """Why each chunk got its filter and coder (ROUTING index record), or [] if the archive has none."""
         data = getattr(self, "records", {}).get(XR_ROUTING)
         if not data: return []
-        try: return list(json.loads(data.decode("utf-8")).get("chunks", []))
-        except (ValueError, AttributeError): return []      # debug information only: never fail extraction on it
+        try: doc = json.loads(data.decode("utf-8"))
+        except ValueError: return []                        # debug information only: never fail on it
+        chunks = doc.get("chunks") if isinstance(doc, dict) else None
+        return [c for c in chunks if isinstance(c, dict)] if isinstance(chunks, list) else []
 
     def summary(self) -> str:
         coders = sorted({CODER_NAMES.get(c[3], f"#{c[3]}") for c in self.chunks}) if self.chunks else []
