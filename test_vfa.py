@@ -1071,6 +1071,23 @@ def t2_native(work, corpus):
         check(f"native: {cc} ASan+UBSan build: encoder on {min(12, len(inputs))} inputs + {4000 * (len(logs) - 1)} corrupted "
               f"decodes, no sanitizer report ({summary} ...)", ok, "".join(l.stderr[-600:] for l in logs if l.returncode or l.stderr))
 
+    # 5. clang UBSan in trap mode: needs no sanitizer runtime and catches what gcc's UBSan lets through
+    #    (e.g. arithmetic on a NULL pointer, NULL + 0, which clang checks and gcc does not)
+    if os.name != "nt" and shutil.which("clang"):
+        exe = work / "vulpcli_ubtrap"
+        r = subprocess.run(["clang", "-std=c99", "-O1", "-g", "-fsanitize=undefined", "-fsanitize-trap=undefined",
+                            "-o", str(exe), *srcs], capture_output=True, text=True)
+        if r.returncode:
+            check("native: clang UBSan (trap mode) build", False, r.stderr[-600:])
+        else:
+            logs = [subprocess.run([str(exe), "digest", *map(str, inputs[:12])], capture_output=True, text=True)]
+            for i, f in enumerate([x for x in inputs if x.stat().st_size > 1000][:6]):
+                logs.append(subprocess.run([str(exe), "fuzz", str(f), "2000", str(i + 1)], capture_output=True, text=True))
+            check(f"native: clang UBSan (trap mode): encoder on {min(12, len(inputs))} inputs + {2000 * (len(logs) - 1)} "
+                  f"corrupted decodes, no trap", all(l.returncode == 0 for l in logs),
+                  "; ".join(f"rc={l.returncode} {l.stderr[-200:]}" for l in logs if l.returncode))
+    else:
+        skip("native: clang UBSan (trap mode)", "no clang (Windows: run on Linux/WSL)")
 
 # ================================================================ VFA2 M4: vulp-lz + cross-chunk dedup
 
@@ -1216,6 +1233,17 @@ def t2_dedup(work, corpus):
             check(f"vfa2: case-alias paths (case-{'in' if ci else ''}sensitive)", False, repr(e))
         finally:
             vx._case_insensitive = real
+    # a final name equal to another entry's temporary name: "a" reuses "a.vfapart"'s first chunk, so both are open at once
+    p = build2(work / "dd_tmp.vfa", [("z/a.vfapart", first[:70_000]), ("z/a", second)], coder=3, filt=None,
+               solid=True, chunk_size=1 << 16, cdc=True)
+    out = work / "dd_tmp_out"; shutil.rmtree(out, ignore_errors=True)
+    try:
+        open_extract(p, out)
+        check("vfa2: an entry named like another's temporary file (a, a.vfapart) extracts both intact",
+              (out / "z/a").read_bytes() == second and (out / "z/a.vfapart").read_bytes() == first[:70_000]
+              and sorted(q.name for q in (out / "z").iterdir()) == ["a", "a.vfapart"])
+    except Exception as e:
+        check("vfa2: an entry named like another's temporary file (a, a.vfapart) extracts both intact", False, repr(e))
     # a chunk-boundary case: dedup references into the unflushed buffer and across flushes, small chunks
     files = [("z/a", base[:600_000]), ("z/b", base[:600_000]), ("z/c", base[100_000:700_000])]
     p = build2(work / "dd_small.vfa", files, cdc=True, solid=True, chunk_size=1 << 18, coder=3, filt=None)

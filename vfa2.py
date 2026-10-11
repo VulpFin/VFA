@@ -827,9 +827,9 @@ class Archive2(vx.Extractable):
         def handle(e):
             k = id(e); st = state.get(k)
             if st is None:
-                out, fw = start(e); st = state[k] = [out, fw]; active.append((e, out, fw))
+                out, fw = start(e); st = state[k] = [out, fw, fw.name]; active.append((e, out, fw))
             elif st[1] is None:                       # reopen a file closed to stay under MAX_OPEN
-                st[1] = open(st[0] + ".vfapart", "r+b"); active.append((e, st[0], st[1]))
+                st[1] = open(st[2], "r+b"); active.append((e, st[0], st[1]))
             lru[k] = e; lru.move_to_end(k)
             while len(lru) > self.MAX_OPEN:
                 ok, oe = lru.popitem(last=False); ost = state[ok]
@@ -837,8 +837,8 @@ class Archive2(vx.Extractable):
             return st[1]
 
         def done(e):
-            k = id(e); out, fw = state[k]
-            if fw is None: fw = open(out + ".vfapart", "r+b")
+            k = id(e); out, fw, tmp = state[k]
+            if fw is None: fw = open(tmp, "r+b")
             else: lru.pop(k, None)
             active[:] = [a for a in active if a[2] is not fw]
             commit(out, fw); finish(e, out)

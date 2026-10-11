@@ -535,10 +535,10 @@ class Extractable:
         partial: Set[str] = set()     # files being written live under NAME.vfapart until fully checked
         def start(e):
             out = targets[id(e)]; os.makedirs(os.path.dirname(out), exist_ok=True)
-            tmp = out + ".vfapart"; partial.add(tmp)
+            tmp = tmps[out]; partial.add(tmp)
             return out, open(tmp, "wb")
         def commit(out, fw):
-            fw.close(); os.replace(out + ".vfapart", out); partial.discard(out + ".vfapart")
+            fw.close(); os.replace(tmps[out], out); partial.discard(tmps[out])
         def finish(e, out_path):
             ns = e["mtime"] * 1_000_000_000 + e.get("mtime_ns", 0)     # VFA2 stores nanoseconds
             try: os.utime(out_path, ns=(ns, ns))
@@ -570,6 +570,14 @@ class Extractable:
             LOGGER.warning(f"{len(dups)} duplicate path(s) in the archive (e.g. {dups[0]['path']!r}): the last entry wins")
             keep = set(last.values()); sel_files = [e for e in sel_files if id(e) in keep]
             total_files = len(sel_files); total_bytes = sum(e["size"] for e in sel_files)
+        # temporary names (NAME.vfapart) must not alias a final target or each other: an archive holding both
+        # "a" and "a.vfapart" would otherwise have one entry's commit rename the other's half-written file
+        taken = {alias_key(targets[id(e)]) for e in sel_files}; tmps = {}
+        for e in sel_files:
+            out = targets[id(e)]; tmp = out + ".vfapart"; n = 0
+            while alias_key(tmp) in taken:
+                n += 1; tmp = f"{out}.{n}.vfapart"
+            taken.add(alias_key(tmp)); tmps[out] = tmp
 
         active: list = []            # (entry, out, handle) currently open - closed + cleaned up on any failure
         try:

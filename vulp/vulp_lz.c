@@ -376,8 +376,8 @@ int vulp_lz_decode(const uint8_t *in, size_t in_len, uint8_t *out, size_t n)
         if (get_u32(in, in_len, &ip, &raw) || get_u32(in, in_len, &ip, &nseq) || get_u32(in, in_len, &ip, &nlit)) goto out;
         if (raw == 0 || raw > n - op || nlit > raw || nseq > raw / VULP_LZ_MINMATCH) goto out;
         bend = op + raw;
-        if (nlit > litcap) { free(lits); litcap = nlit; lits = (uint8_t *)malloc(litcap ? litcap : 1); if (!lits) { rc = VULP_E_NOMEM; goto out; } }
-        if ((size_t)nseq * 3 > codecap) { free(codes); codecap = (size_t)nseq * 3; codes = (uint8_t *)malloc(codecap ? codecap : 1); if (!codes) { rc = VULP_E_NOMEM; goto out; } }
+        if (!lits || nlit > litcap) { free(lits); litcap = nlit; lits = (uint8_t *)malloc(litcap ? litcap : 1); if (!lits) { rc = VULP_E_NOMEM; goto out; } }
+        if (!codes || (size_t)nseq * 3 > codecap) { free(codes); codecap = (size_t)nseq * 3; codes = (uint8_t *)malloc(codecap ? codecap : 1); if (!codes) { rc = VULP_E_NOMEM; goto out; } }
         if (get_stream(in, in_len, &ip, lits, nlit) || get_stream(in, in_len, &ip, codes, nseq) ||
             get_stream(in, in_len, &ip, codes + nseq, nseq) || get_stream(in, in_len, &ip, codes + 2 * (size_t)nseq, nseq)) goto out;
         if (get_u32(in, in_len, &ip, &nbits)) goto out;
