@@ -635,6 +635,18 @@ def t2_determinism(work, corpus):
         a1, a2 = work / "d2a.vfa", work / "d2b.vfa"
         vfa("c", a1, corpus.name, "--format", "vfa2", *flags, cwd=corpus.parent); vfa("c", a2, corpus.name, "--format", "vfa2", *flags, cwd=corpus.parent)
         check(f"vfa2 determinism: same input -> identical archive ({' '.join(flags) or 'non-solid'})", a1.read_bytes() == a2.read_bytes())
+    # the archive must not depend on the order the filesystem lists directory entries in (NTFS sorts, ext4 does not)
+    import vfa as V
+    real_walk = os.walk
+    def listing(walk):
+        os.walk = walk
+        try: return [(str(p), et) for p, _st, et in V.iter_tree([str(corpus)])]
+        finally: os.walk = real_walk
+    def reversed_walk(top, *a, **k):
+        for r, d, f in real_walk(top, *a, **k):
+            d.reverse(); f.reverse(); yield r, d, f
+    check("vfa2 determinism: file order does not depend on directory listing order",
+          listing(real_walk) == listing(reversed_walk))
     # the -O0/-O3 and cross-compiler check is the 'native' group (t2_native)
 
 def t2_sfx(work, corpus):

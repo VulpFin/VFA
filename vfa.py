@@ -419,6 +419,9 @@ def iter_tree(paths: List[str]):
         pth = pathlib.Path(p)
         if pth.is_dir():
             for root, dirs, files in os.walk(pth):
+                # os.walk lists entries in filesystem order (NTFS: alphabetical, ext4: hash order). Sort them, so the
+                # same tree always becomes the same archive on every machine (solid streams depend on file order).
+                dirs.sort(); files.sort()
                 rp = pathlib.Path(root)
                 st = rp.lstat()
                 yield rp, st, ET_DIR
