@@ -1245,6 +1245,21 @@ def t2_dedup(work, corpus):
                   (out / "z/d1/a").read_bytes() == second and not list(out.rglob("*.vfapart")))
         except Exception as e:
             check("vfa2: two paths through a symlinked directory already at dest are one file (last entry wins)", False, repr(e))
+    # ...but a case-insensitive volume off macOS (NTFS, FAT) keeps "ss"/"\u00df" and composed/decomposed accents
+    # apart, so folding must not merge them and drop a file
+    if not vx._case_insensitive(str(work)) and sys.platform != "darwin":
+        names = ["ss", "\u00df", "\u00e9", "e\u0301"]
+        p = build2(work / "dd_fold.vfa", [(f"z/{n}", first[:1000 + i]) for i, n in enumerate(names)], coder=3, filt=None)
+        out = work / "dd_fold_out"; shutil.rmtree(out, ignore_errors=True); out.mkdir()
+        real = vx._case_insensitive; vx._case_insensitive = lambda d: True
+        try:
+            open_extract(p, out)
+            check("vfa2: a case-insensitive volume off macOS keeps ss/\u00df and NFC/NFD names apart (no file dropped)",
+                  all((out / "z" / n).read_bytes() == first[:1000 + i] for i, n in enumerate(names)))
+        except Exception as e:
+            check("vfa2: a case-insensitive volume off macOS keeps ss/\u00df and NFC/NFD names apart", False, repr(e))
+        finally:
+            vx._case_insensitive = real
     # a final name equal to another entry's temporary name: "a" reuses "a.vfapart"'s first chunk, so both are open at once
     p = build2(work / "dd_tmp.vfa", [("z/a.vfapart", first[:70_000]), ("z/a", second)], coder=3, filt=None,
                solid=True, chunk_size=1 << 16, cdc=True)

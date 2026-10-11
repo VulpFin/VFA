@@ -479,8 +479,14 @@ def _alias_key_for(dest: str):
     """Key under which two target paths name the same file at dest. Parents are resolved first: a directory that
     already exists at dest may be a symlink (safe_join allows ones that stay inside dest), so d1/a and d2/a can be
     one file. Then the volume's case rule applies."""
+    # Fold no further than the volume does: merging two names it keeps apart would silently drop a file, while
+    # missing an alias only fails loudly. Hence simple lower() (NTFS/FAT keep ss and \u00df apart, casefold does
+    # not), and NFC only on macOS, where APFS/HFS+ treat composed and decomposed accents as one name.
     if _case_insensitive(dest):
-        fold = lambda p: unicodedata.normalize("NFC", os.path.normcase(p)).casefold()   # APFS also folds NFC/NFD
+        if sys.platform == "darwin":
+            fold = lambda p: unicodedata.normalize("NFC", p).lower()
+        else:
+            fold = lambda p: os.path.normcase(p).lower()
     else:
         fold = os.path.normcase
     real: Dict[str, str] = {}                 # one realpath per directory, not per file
