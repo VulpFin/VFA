@@ -920,8 +920,8 @@ def cmd_list(args):
                 print("Chunks (filter / coder / raw -> stored / why):")
                 for i, (off, raw, _crc, coder, filt) in enumerate(c.chunks):
                     r = rt.get(i, {})
-                    print(f"  #{i:<5d} {r.get('filter', vfa2_filter_name(filt)):<14s} {vfa2_coder_name(coder):<10s} "
-                          f"{raw:>12d} -> {r.get('stored', '?'):>12}  {r.get('why', '(no routing record)')}")
+                    print(f"  #{i:<5d} {str(r.get('filter', vfa2_filter_name(filt))):<14s} {vfa2_coder_name(coder):<10s} "
+                          f"{raw:>12d} -> {str(r.get('stored', '?')):>12}  {str(r.get('why', '(no routing record)'))}")
             for e in c.entries:
                 info = f"{len(e['extents'])} extent(s)" if e["entry_type"]==ET_FILE else "-"
                 print(f"{e['size']:12d}  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e['mtime']))}  [{vx.ET_NAMES[e['entry_type']]}]  {e['path']}  ({info})")

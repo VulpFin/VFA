@@ -827,6 +827,11 @@ def t2_codec(work, corpus):
         segs = rt[0].get("segments", []) if rt else []
         check(f"vfa2 auto routing: mixed solid chunk -> {rt[0]['filter'] if rt else '?'} "
               f"[{', '.join(sg['filter'] for sg in segs)}], round-trip", ok and len(segs) >= 2 and all(sg.get("why") for sg in segs), why)
+    # a malformed (but checksummed) ROUTING record is ignored, never a crash: it is debug information only
+    for i, bad in enumerate((b'{"chunks":1}', b'[1,2]', b'{"chunks":[1,"x",{"chunk":"0","filter":7,"stored":[1]}]}', b'{"chunks":[{"chunk":[]},{"chunk":{}},{"chunk":true}]}', b"\xff\xfe", b"null")):
+        p = build2(work / f"v2badrt{i}.vfa", [("z/a.txt", b"routing " * 500)], records=[(V2.XR_ROUTING, 0, bad)])
+        r = vfa("l", p, "--routing", expect=None)
+        check(f"vfa2 malformed ROUTING record {bad[:40]!r} is ignored by 'vfa l --routing'", r.returncode == 0 and "Traceback" not in r.stderr, r.stderr[-300:])
     r = vfa("l", arc, "--routing")
     check("vfa2 'vfa l --routing' prints each chunk's filter and reason", r.returncode == 0 and "segments with different filters" in r.stdout, r.stdout[-300:])
     # incompressible data: tANS output would be larger -> stored, and the reason says so
@@ -849,7 +854,7 @@ def t2_codec(work, corpus):
 NATIVE_SRC = ["vulp/vulp.c", "vulp/vulpcli.c"]
 FP_TYPES = re.compile(r"\b(float|double|_Float\d+|__fp16|_Complex|fenv_t)\b|#\s*include\s*<(math|fenv|tgmath|complex)\.h>|\b(fabs|sqrt|pow|exp|log|log2|floor|ceil|round)\s*\(")
 # x86 floating-point arithmetic/conversion (SSE/AVX scalar+packed, x87). Plain moves/bitwise (movaps, pxor) are integer-safe.
-FP_INSN = re.compile(r"\b(v?(add|sub|mul|div|sqrt|min|max|rcp|rsqrt|round|cmp|comi|ucomi|andn?|x?or|h?addsub|dp|blendv?)(ss|sd|ps|pd)|"
+FP_INSN = re.compile(r"\b(v?(add|sub|mul|div|sqrt|min|max|rcp|rsqrt|round|cmp|comi|ucomi|h?addsub|hadd|hsub|dp)(ss|sd|ps|pd)|"
                      r"v?cvt\w+|vfn?m(add|sub)\w+|f(ld|st|stp|add|addp|sub|subp|subr|mul|mulp|div|divp|divr|ild|ist|istp|isttp|"
                      r"com|comp|ucom|ucomi|comi|sqrt|abs|chs|xch|init|ninit|ldz|ld1|rndint|scale|prem|sin|cos|patan|yl2x)\w*)\b")
 
@@ -894,6 +899,9 @@ def t2_native(work, corpus):
         for ln, line in enumerate(strip_c_comments((HERE / f).read_text()).splitlines(), 1):
             if FP_TYPES.search(line): hits.append(f"{f}:{ln}: {line.strip()}")
     check("native: no float/double/<math.h> in the C codec sources", not hits, str(hits[:5]))
+    # the instruction scan must not count bitwise/move SSE ops (compilers zero registers with xorps etc.)
+    check("native: FP-instruction scan ignores bitwise SSE ops (xorps, vxorps, andps, andnps, orps, blendvps, movaps)",
+          not any(FP_INSN.search(f"\t{i} %xmm0,%xmm0") for i in ("xorps", "vxorps", "andps", "andnps", "orps", "vorpd", "blendvps", "movaps", "pxor")))
     # ... and none in the Python compress/decompress path (AST: no float literals, no true division, no float()/math)
     import ast
     targets = {"vulp_ref.py": None, "vfa2.py": {"classify", "route", "units", "_sample", "_hint", "seg_pack", "seg_unpack",
