@@ -1233,6 +1233,18 @@ def t2_dedup(work, corpus):
             check(f"vfa2: case-alias paths (case-{'in' if ci else ''}sensitive)", False, repr(e))
         finally:
             vx._case_insensitive = real
+    # a directory already at dest that links to another one: d1/a and d2/a are one file (last entry wins)
+    if os.name != "nt":
+        p = build2(work / "dd_link.vfa", [("z/d1/a", first), ("z/d2/a", second)], dirs=(), coder=3, filt=None,
+                   solid=True, chunk_size=1 << 16, cdc=True)
+        out = work / "dd_link_out"; shutil.rmtree(out, ignore_errors=True)
+        (out / "z/d1").mkdir(parents=True); os.symlink("d1", out / "z/d2")
+        try:
+            open_extract(p, out)
+            check("vfa2: two paths through a symlinked directory already at dest are one file (last entry wins)",
+                  (out / "z/d1/a").read_bytes() == second and not list(out.rglob("*.vfapart")))
+        except Exception as e:
+            check("vfa2: two paths through a symlinked directory already at dest are one file (last entry wins)", False, repr(e))
     # a final name equal to another entry's temporary name: "a" reuses "a.vfapart"'s first chunk, so both are open at once
     p = build2(work / "dd_tmp.vfa", [("z/a.vfapart", first[:70_000]), ("z/a", second)], coder=3, filt=None,
                solid=True, chunk_size=1 << 16, cdc=True)
