@@ -930,15 +930,16 @@ def t2_native(work, corpus):
         r = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=work)
         if r.returncode == 0 and exe.exists(): builds.append((label, exe, env))
         else: print(f"      build failed: {label}: {(r.stdout + r.stderr)[-300:]}")
-    inputs = []
+    # inputs get plain ASCII names: vulpcli uses fopen(), which on Windows cannot open non-ASCII paths
+    inputs = []; ind = work / "native_in"; ind.mkdir(parents=True, exist_ok=True)
+    def add_input(data):
+        dst = ind / f"in{len(inputs):03d}.bin"; dst.write_bytes(data); inputs.append(dst)
     for f in sorted(p for p in corpus.rglob("*") if p.is_file()):
-        dst = work / "native_in" / f.relative_to(corpus); dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_bytes(f.read_bytes()[:1 << 20]); inputs.append(dst)
+        add_input(f.read_bytes()[:1 << 20])
     smp = HERE / "sample"
     if smp.is_dir():
         for f in sorted(p for p in smp.rglob("*") if p.is_file()):
-            dst = work / "native_in" / "sample" / f.relative_to(smp); dst.parent.mkdir(parents=True, exist_ok=True)
-            data = f.read_bytes(); dst.write_bytes(data[:1 << 20] + data[len(data) // 2:len(data) // 2 + (1 << 20)]); inputs.append(dst)
+            data = f.read_bytes(); add_input(data[:1 << 20] + data[len(data) // 2:len(data) // 2 + (1 << 20)])
     outs = {}
     for label, exe, env in builds:
         r = subprocess.run([str(exe), "digest", *map(str, inputs)], capture_output=True, text=True, env=env)
