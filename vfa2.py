@@ -398,6 +398,11 @@ class Writer2:
         self.buf_file_starts: List[int] = []                        # buffer offsets where a file's bytes begin
         self._last_appended = None
         self.seg_index: Dict[bytes, list] = {}                      # segment SHA-256 -> [chunk, offset, length]
+        # segments must fit a chunk: below 256 KiB chunks they shrink with it (a quarter of a chunk on average, at
+        # least 1 KiB, where an extent's 12 bytes are still worth it). Default chunk sizes keep the constants.
+        smax = min(CDC_MAX, chunk_size); smin = max(1 << 10, min(CDC_MIN, smax >> 3))
+        self.cdc_params = (smin, min(CDC_AVG_LOG, smax.bit_length() - 3), smax)
+        self.dedup_min = min(DEDUP_MIN, smin)
         self.dedup_segments = self.dedup_bytes = 0
         self.data_key = self.index_key = None
         req = 0; kdf_id = aead = kp = kt = km = 0; salt = b"\0" * 16
@@ -510,13 +515,14 @@ class Writer2:
     def _segment(self, e, seg: memoryview):
         """One content-defined segment: reference an identical earlier one, or store it (and remember where)."""
         n = len(seg)
-        if n >= DEDUP_MIN:
+        if n >= self.dedup_min:
             h = hashlib.sha256(seg).digest()
             loc = self.seg_index.get(h)
             if loc is not None:
                 self._reference(e, loc); self.dedup_segments += 1; self.dedup_bytes += n
                 return
-            if len(self.buf) + n <= self.cs and len(self.seg_index) < DEDUP_MAX_SEGMENTS:
+            if n <= self.cs and len(self.seg_index) < DEDUP_MAX_SEGMENTS:
+                if len(self.buf) + n > self.cs: self._flush()   # a segment is never split: start the next chunk
                 loc = [None, len(self.buf), n]              # registered before the append: a flush patches it
                 self.pending_refs.append(loc); self.seg_index[h] = loc
         self._append(e, seg)
@@ -539,7 +545,7 @@ class Writer2:
                 b = src.read(CDC_READ)
                 data = carry + b if carry else b
                 if not data: break
-                cuts = _native.cdc(data, CDC_MIN, CDC_AVG_LOG, CDC_MAX)
+                cuts = _native.cdc(data, *self.cdc_params)
                 mv = memoryview(data); start = 0
                 last = len(cuts) if not b else len(cuts) - 1
                 for end in cuts[:last]:

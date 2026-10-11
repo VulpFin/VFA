@@ -1119,6 +1119,13 @@ def t2_lz(work, corpus):
           and R.lz_decode(b"", 0) == b"")
     cd = [(nm, d[:120_000]) for nm, d in list(cases.items())[:10]]
     check("vfa2 lz: content-defined cut points, C == reference", all(C.cdc(d, 512, 11, 8192) == R.cdc(d, 512, 11, 8192) for _, d in cd))
+    # block counts that cannot fit (every match is >= 4 bytes, so nlit + 4*nseq <= raw) are refused up front
+    raw = 1 << 20; m = struct.pack("<III", raw, raw // 4, raw)
+    refused = []
+    for impl in (C, R):
+        try: impl.lz_decode(m, raw); refused.append(False)
+        except Exception: refused.append(True)
+    check("vfa2 lz: a block claiming nlit = raw and nseq = raw/4 is refused by both decoders", all(refused))
     # corrupted vulp-lz payloads: no crash in either decoder, and both agree
     src = cases["corpus/data.csv (64 KiB)"] if "corpus/data.csv (64 KiB)" in cases else cases["random 5000"]
     enc = C.lz_encode(src, 6); stats = {"refused": 0, "identical": 0, "different": 0}; crash = []; disagree = []
@@ -1283,6 +1290,17 @@ def t2_dedup(work, corpus):
         V2._native, V2.NATIVE = saved
     check(f"vfa2 dedup without the C extension: same archive as with it ({pr.stat().st_size:,} B, stored coder)",
           pn.read_bytes() == pr.read_bytes() and pr.stat().st_size < 2_500_000, f"{pn.stat().st_size} vs {pr.stat().st_size}")
+    # chunks smaller than a default segment (4-32 KiB): segments shrink to fit, so shifted copies still dedup
+    for cexp in (12, 15):
+        sz = {}
+        for cdc in (True, False):
+            q = build2(work / f"dd_small_cs_{cexp}_{cdc}.vfa", [("z/v100.bin", base[:400_000]), ("z/v110.bin", shifted[:400_000])],
+                       coder=0, filt=0, solid=True, chunk_size=1 << cexp, cdc=cdc)
+            sz[cdc] = q.stat().st_size
+            out = work / "dd_small_cs_out"; shutil.rmtree(out, ignore_errors=True); open_extract(q, out)
+            ok_rt = (out / "z/v100.bin").read_bytes() == base[:400_000] and (out / "z/v110.bin").read_bytes() == shifted[:400_000]
+        check(f"vfa2 dedup with {1 << cexp >> 10} KiB chunks: {sz[True]:,} B vs {sz[False]:,} B without CDC, round-trips",
+              ok_rt and sz[True] < sz[False] * 0.7)
     # a chunk-boundary case: dedup references into the unflushed buffer and across flushes, small chunks
     files = [("z/a", base[:600_000]), ("z/b", base[:600_000]), ("z/c", base[100_000:700_000])]
     p = build2(work / "dd_small.vfa", files, cdc=True, solid=True, chunk_size=1 << 18, coder=3, filt=None)

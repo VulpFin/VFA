@@ -264,7 +264,7 @@ def lz_decode(payload, n: int) -> bytes:
         d = tans_decode(p[ip:ip + sz], count); ip += sz; return d
     while len(out) < n:
         raw, nseq, nlit = u32(), u32(), u32()
-        if raw == 0 or raw > n - len(out) or nlit > raw or nseq > raw // LZ_MINMATCH: bad()
+        if raw == 0 or raw > n - len(out) or nlit > raw or nseq > (raw - nlit) // LZ_MINMATCH: bad()
         bend = len(out) + raw
         lits = stream(nlit); llc = stream(nseq); mlc = stream(nseq); ofc = stream(nseq)
         nbits = u32(); nbytes = (nbits + 7) >> 3
