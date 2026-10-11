@@ -1,0 +1,9 @@
+when,label,input,orig,tool,desc,status,arc,tc,td,rss_c,rss_d,stub,note
+2026-10-11 01:44,"M1 (VFA2 = stored only), sample\",sample,41430058,vfa-default,vfa zstd -5,ok,39774832,0.7750889000017196,1.43405239994172,40656896,47841280,12511526,
+2026-10-11 01:44,"M1 (VFA2 = stored only), sample\",sample,41430058,vfa-zstd19-solid,vfa zstd -19 solid,ok,33563543,7.887562399962917,1.516015199944377,189644800,153108480,12511526,
+2026-10-11 01:44,"M1 (VFA2 = stored only), sample\",sample,41430058,vfa-xz9-solid,vfa xz -9 solid,ok,16465070,7.89285199996084,1.6235678000375628,544624640,170205184,12511526,
+2026-10-11 01:44,"M1 (VFA2 = stored only), sample\",sample,41430058,vfa2-stored-solid,vfa none -0 solid --format vfa2,ok,41432330,0.7959163000341505,1.4498623000690714,112320512,70930432,12511526,
+2026-10-11 01:44,"M1 (VFA2 = stored only), sample\",sample,41430058,xz-9e,xz -9e -T1,ok,16467036,10.011202199966647,0.2959492999361828,446914560,47271936,,
+2026-10-11 01:44,"M1 (VFA2 = stored only), sample\",sample,41430058,zstd-ultra22,zstd --ultra -22,not run,,,,,,,"zstd CLI not found (install it, e.g. `winget install Facebook.zstd` or `choco install zstandard`)"
+2026-10-11 01:44,"M1 (VFA2 = stored only), sample\",sample,41430058,7z-lzma2-mx9,7z a -t7z -m0=lzma2 -mx=9,ok,18594852,3.2875231999205425,0.23576349997892976,411140096,61100032,213504,
+2026-10-11 01:44,"M1 (VFA2 = stored only), sample\",sample,41430058,zstd22-pylib,python-zstandard level 22 (stand-in: zstd CLI missing),ok,16472634,3.1025378999765962,1.1659925000276417,743383040,63021056,,

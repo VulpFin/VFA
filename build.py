@@ -89,6 +89,9 @@ def base_pyinstaller_args(debug=False):
         "--hidden-import", "vfa_extract",
         "--hidden-import", "vfa2",
         "--hidden-import", "xxhash",
+        # VFA2 codecs: the C extension (built by build_vulp.py) and the pure-Python reference it falls back to
+        "--hidden-import", "_vulp",
+        "--hidden-import", "vulp_ref",
     ]
     return args
 
@@ -154,6 +157,7 @@ def build_sfi(debug=False, name_suffix="", icon_path=None, noconsole=False):
         "-n", name,
         "--paths", str(ROOT),
         "--hidden-import", "vfa_extract",
+        "--hidden-import", "vfa2",
         "--hidden-import", "sfi_gui",
         "--hidden-import", "tkinter",
         "--hidden-import", "xxhash",
@@ -227,10 +231,19 @@ def main():
     ap.add_argument("--noconsole-sfi", action="store_true", help="Build the SFI installer stub without a console window on Windows")
     ap.add_argument("--no-sfi", action="store_true", help="Skip building the SFI installer stub")
     ap.add_argument("--noconsole-viewer", action="store_true", help="Build SFX without console on Windows")
+    ap.add_argument("--no-vulp", action="store_true",
+                    help="Do not (re)build the _vulp C extension (VFA2 then decodes with the slow pure-Python reference)")
     args = ap.parse_args()
 
     check_build_deps()
     ensure_pyinstaller()
+
+    # VFA2 codec core (C). Built before PyInstaller so every stub bundles it; see build_vulp.py.
+    if not args.no_vulp:
+        import build_vulp
+        built = build_vulp.build()
+        build_vulp.check()
+        print(f"[build] _vulp: {', '.join(f'{b.name} ({b.stat().st_size // 1024} KiB)' for b in built)}")
 
     if not args.no_clean:
         clean()

@@ -760,16 +760,22 @@ def _collect_items(args, solid: bool):
 
 # ---------- Commands ----------
 def cmd_create_v2(args):
-    """VFA2 (see VFA2.md). M1: the 'stored' coder only - this milestone proves the container, not compression."""
+    """VFA2 (see VFA2.md). Coders: tans (default) or stored; filter per chunk: auto (default) or forced with --filter."""
     import vfa2
-    if args.method not in (None, "none", "stored"):
-        raise SystemExit("VFA2 currently has only the 'stored' coder (--method none); compression arrives in milestone M3")
+    if args.method not in (None, "tans", "none", "stored"):
+        raise SystemExit(f"VFA2 has the coders 'tans' (default) and 'stored'/'none'; --method {args.method} is a VFA1 method")
+    coder = 0 if args.method in ("none", "stored") else 1
+    try: filt = vfa2.parse_filter(args.filter)
+    except ValueError as e: raise SystemExit(str(e))
+    if coder == 0 and filt is None: filt = (0, b"")
+    if coder == 1 and not vfa2.NATIVE:
+        LOGGER.warning("The _vulp C extension is not built (python build_vulp.py); using the pure-Python reference coder, which is very slow")
     _check_exp("--chunk-exp", args.chunk_exp, 12)
     pw = get_password(args) if _wants_password(args) else None
     items = _collect_items(args, args.solid)
     nfiles = 0; total = 0; t0 = time.time()
     with open(args.output, "wb") as f:
-        w = vfa2.Writer2(f, chunk_size=1 << args.chunk_exp, solid=args.solid, password=pw,
+        w = vfa2.Writer2(f, chunk_size=1 << args.chunk_exp, solid=args.solid, password=pw, coder=coder, filt=filt,
                          kdf=(args.kdf_time or 3, args.kdf_mem_kib or 256 * 1024, args.kdf_parallel or 4))
         for et, rel, st, meta in _scan_inputs(items, args):
             mode = st.st_mode & 0o7777; ns = st.st_mtime_ns
@@ -786,6 +792,8 @@ def cmd_create_v2(args):
 def cmd_create(args):
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd create")
     if args.format == "vfa2": return cmd_create_v2(args)
+    if args.method == "tans": raise SystemExit("--method tans is a VFA2 coder; add --format vfa2")
+    if args.filter != "auto": raise SystemExit("--filter applies to --format vfa2 only")
     if args.method is None: args.method = "zstd" if HAVE_ZSTD else "zlib"
     if args.method == "stored": args.method = "none"
     _check_exp("--block-exp", args.block_exp, 12); _check_exp("--solid-chunk-exp", args.solid_chunk_exp, 16)
@@ -892,6 +900,12 @@ def cmd_create(args):
     )
     print(f"Created {args.output} with {len(toc.entries)} entry(s). Solid={bool(header.flags & F_SOLID)}")
 
+def vfa2_filter_name(fid):
+    import vfa2; return vfa2.FILTER_NAMES.get(fid, f"#{fid}")
+
+def vfa2_coder_name(cid):
+    import vfa2; return vfa2.CODER_NAMES.get(cid, f"#{cid}")
+
 def cmd_list(args):
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd list")
     with vx.open_container(args.archive) as c:
@@ -901,6 +915,13 @@ def cmd_list(args):
             print(f"Archive: {args.archive}\nFormat: {c.summary()}\nEncrypted: {c.encrypted}")
             print("Integrity: digest sha256, chunk + header + index CRC32s")
             print(f"Entries: {len(c.entries)}, Files total: {total} bytes")
+            if getattr(args, "routing", False):
+                rt = {r.get("chunk"): r for r in c.routing()}
+                print("Chunks (filter / coder / raw -> stored / why):")
+                for i, (off, raw, _crc, coder, filt) in enumerate(c.chunks):
+                    r = rt.get(i, {})
+                    print(f"  #{i:<5d} {r.get('filter', vfa2_filter_name(filt)):<14s} {vfa2_coder_name(coder):<10s} "
+                          f"{raw:>12d} -> {r.get('stored', '?'):>12}  {r.get('why', '(no routing record)')}")
             for e in c.entries:
                 info = f"{len(e['extents'])} extent(s)" if e["entry_type"]==ET_FILE else "-"
                 print(f"{e['size']:12d}  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e['mtime']))}  [{vx.ET_NAMES[e['entry_type']]}]  {e['path']}  ({info})")
@@ -1081,11 +1102,14 @@ def build_argparser():
     ap_c.add_argument(
         "--method",
         default=None,
-        choices=list(NAME_TO_METHOD.keys()) + ["stored"],
-        help="Compression method, default zstd (VFA2 for now: stored/none only)",
+        choices=list(NAME_TO_METHOD.keys()) + ["stored", "tans"],
+        help="Compression method, default zstd (VFA1) / tans (VFA2: tans or stored/none)",
     )
     ap_c.add_argument("--format", choices=["vfa1", "vfa2"], default="vfa1",
                       help="Container format (default vfa1; vfa2 is the new chunked format, see VFA2.md)")
+    ap_c.add_argument("--filter", default="auto",
+                      help="VFA2: filter per chunk: auto (default; classifier, reasons kept in the index) | none | delta:N | "
+                           "shuffle:K | bitshuffle:K | bcj-x86 | bcj-arm64")
     ap_c.add_argument("--chunk-exp", type=int, default=26, dest="chunk_exp",
                       help="VFA2: chunk size as power of two (default 2^26 = 64 MiB, max 2^30)")
     ap_c.add_argument(
@@ -1184,6 +1208,7 @@ def build_argparser():
     # --- List ---
     ap_l = sub.add_parser("l", help="List archive")
     ap_l.add_argument("archive")
+    ap_l.add_argument("--routing", action="store_true", help="VFA2: show each chunk's filter/coder and why it was chosen")
     ap_l.add_argument(
         "--password", action="store_true", help="Prompt for password if encrypted"
     )
