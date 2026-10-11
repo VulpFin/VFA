@@ -43,6 +43,25 @@ def run_measured(cmd, cwd=None, stdin=None, stdout=None):
     rss = ru.ru_maxrss * (1 if sys.platform == "darwin" else 1024)
     return dt, rss, p.returncode, err.decode(errors="replace")[-300:]
 
+# Linux: a child's ru_maxrss includes the high-water mark of the memory it was forked from (this Python process,
+# ~50+ MiB), recorded at exec. GNU time forks the measured command from its own tiny process, so its %M is the
+# command's real peak. Without it, RSS figures below that floor are not meaningful (the report says so).
+GNU_TIME = "/usr/bin/time" if sys.platform.startswith("linux") and os.path.isfile("/usr/bin/time") else None
+RSS_NOTE = ("" if os.name == "nt" or GNU_TIME or sys.platform == "darwin" else
+            "RSS on this Linux run includes the benchmark's own forked Python image (~50 MiB floor): install GNU time "
+            "(`apt install time`) for exact figures.")
+
+if GNU_TIME:
+    _run_measured_raw = run_measured
+    def run_measured(cmd, cwd=None, stdin=None, stdout=None):
+        fd, rf = tempfile.mkstemp(prefix="vfa-rss-"); os.close(fd)
+        try:
+            dt, _, rc, err = _run_measured_raw([GNU_TIME, "-q", "-f", "VFA_RSS_KB=%M", "-o", rf, *cmd], cwd, stdin, stdout)
+            kb = [ln.split("=", 1)[1] for ln in pathlib.Path(rf).read_text().splitlines() if ln.startswith("VFA_RSS_KB=")]
+            return dt, int(kb[-1]) * 1024 if kb else 0, rc, err
+        finally:
+            os.unlink(rf)
+
 def _peak_rss_win(p):
     import ctypes, ctypes.wintypes as w
     class PMC(ctypes.Structure):
@@ -274,6 +293,7 @@ def main():
                       f"{orig/1e6/max(r['td'],1e-9):.1f} | {fmt_mb(r['rss_c'])} | {fmt_mb(r['rss_d'])} | {fmt_mb(r['stub'])} | ok |")
         md.append("")
     md.append("VFA rows include Python interpreter start-up (~0.3-1 s per run); on small inputs that dominates MB/s.\n")
+    if RSS_NOTE: md.append(RSS_NOTE + "\n")
     outp = pathlib.Path(a.out)
     if not outp.exists(): outp.write_text("# VFA benchmarks\n\nMeasured by `bench.py` on the owner's data. Each section is one run.\n", encoding="utf-8")
     with open(outp, "a", encoding="utf-8") as f: f.write("\n".join(md))
