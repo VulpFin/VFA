@@ -541,6 +541,15 @@ class Extractable:
                 dirs.append(_norm(e["path"]))
         # validate every target before writing anything
         targets = {id(e): safe_join(dest, e["path"]) for e in sel_files}
+        # several entries may name the same file (an archive made from "a a", or a crafted one): the last one wins,
+        # as with sequential extraction, and only it is written (two writers on one .vfapart would collide)
+        last = {}
+        for e in sel_files: last[os.path.normcase(targets[id(e)])] = id(e)
+        dups = [e for e in sel_files if last[os.path.normcase(targets[id(e)])] != id(e)]
+        if dups:
+            LOGGER.warning(f"{len(dups)} duplicate path(s) in the archive (e.g. {dups[0]['path']!r}): the last entry wins")
+            keep = set(last.values()); sel_files = [e for e in sel_files if id(e) in keep]
+            total_files = len(sel_files); total_bytes = sum(e["size"] for e in sel_files)
 
         active: list = []            # (entry, out, handle) currently open - closed + cleaned up on any failure
         try:

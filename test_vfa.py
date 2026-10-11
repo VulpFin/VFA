@@ -1181,6 +1181,19 @@ def t2_dedup(work, corpus):
     with vx.open_container(str(p)) as c:
         c.unlock("pw")
         check("vfa2 dedup is off when encrypting (identical files get separate chunks)", len(c.chunks) == 2)
+    # duplicate paths whose extents span chunks (chunk-major extraction must not open one target twice)
+    # the second entry shares the first one's bytes (dedup references back into its chunks) plus a new tail
+    first = base[:300_000]; second = first + base[900_000:1_000_000]
+    for solid in (False, True):
+        p = build2(work / f"dd_dup_{solid}.vfa", [("z/a", first), ("z/a", second)], coder=3, filt=None,
+                   solid=solid, chunk_size=1 << 16, cdc=True)
+        out = work / "dd_dup_out"; shutil.rmtree(out, ignore_errors=True)
+        try:
+            open_extract(p, out)
+            check(f"vfa2: duplicate paths spanning chunks extract, last entry wins ({'solid' if solid else 'non-solid'})",
+                  (out / "z/a").read_bytes() == second and not list(out.rglob("*.vfapart")))
+        except Exception as e:
+            check(f"vfa2: duplicate paths spanning chunks extract, last entry wins ({'solid' if solid else 'non-solid'})", False, repr(e))
     # a chunk-boundary case: dedup references into the unflushed buffer and across flushes, small chunks
     files = [("z/a", base[:600_000]), ("z/b", base[:600_000]), ("z/c", base[100_000:700_000])]
     p = build2(work / "dd_small.vfa", files, cdc=True, solid=True, chunk_size=1 << 18, coder=3, filt=None)
