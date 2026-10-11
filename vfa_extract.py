@@ -31,7 +31,7 @@ Rules this reader enforces (see VFA1.md):
   - nothing is written outside the destination directory (safe_join()).
 """
 
-import sys, os, io, struct, getpass, hashlib, zlib, lzma, bz2, json, stat
+import sys, os, io, struct, getpass, hashlib, zlib, lzma, bz2, json, stat, tempfile, unicodedata
 from datetime import datetime
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -463,6 +463,24 @@ def open_container(path: str):
         return vfa2.Archive2(path)
     return Container(path)
 
+def _case_insensitive(dest: str) -> bool:
+    """Does the filesystem at dest treat names case-insensitively? Probed with a temporary file."""
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".vfacase-", dir=dest); os.close(fd)
+    except OSError:
+        return os.name == "nt" or sys.platform == "darwin"     # cannot probe: assume the platform default
+    try:
+        return os.path.exists(os.path.join(os.path.dirname(probe), os.path.basename(probe).upper()))
+    finally:
+        try: os.remove(probe)
+        except OSError: pass
+
+def _alias_key_for(dest: str):
+    """Key under which two target paths name the same file at dest."""
+    if _case_insensitive(dest):
+        return lambda p: unicodedata.normalize("NFC", os.path.normcase(p)).casefold()   # APFS also folds NFC/NFD
+    return os.path.normcase
+
 class Extractable:
     """Selection + safe extraction shared by every container format. A subclass provides entries (dicts with path,
     mode, mtime, size, entry_type, meta) and _write_files(), which writes the selected regular files."""
@@ -542,10 +560,12 @@ class Extractable:
         # validate every target before writing anything
         targets = {id(e): safe_join(dest, e["path"]) for e in sel_files}
         # several entries may name the same file (an archive made from "a a", or a crafted one): the last one wins,
-        # as with sequential extraction, and only it is written (two writers on one .vfapart would collide)
+        # as with sequential extraction, and only it is written (two writers on one .vfapart would collide).
+        # "Same file" follows the destination: case-insensitive volumes (Windows, default macOS) alias A and a.
+        alias_key = _alias_key_for(dest)
         last = {}
-        for e in sel_files: last[os.path.normcase(targets[id(e)])] = id(e)
-        dups = [e for e in sel_files if last[os.path.normcase(targets[id(e)])] != id(e)]
+        for e in sel_files: last[alias_key(targets[id(e)])] = id(e)
+        dups = [e for e in sel_files if last[alias_key(targets[id(e)])] != id(e)]
         if dups:
             LOGGER.warning(f"{len(dups)} duplicate path(s) in the archive (e.g. {dups[0]['path']!r}): the last entry wins")
             keep = set(last.values()); sel_files = [e for e in sel_files if id(e) in keep]

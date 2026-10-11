@@ -1194,6 +1194,28 @@ def t2_dedup(work, corpus):
                   (out / "z/a").read_bytes() == second and not list(out.rglob("*.vfapart")))
         except Exception as e:
             check(f"vfa2: duplicate paths spanning chunks extract, last entry wins ({'solid' if solid else 'non-solid'})", False, repr(e))
+    # case aliases ("z/A" then "z/a"): kept apart on a case-sensitive destination, coalesced (last wins) on a
+    # case-insensitive one such as default macOS - simulated by forcing the probe
+    p = build2(work / "dd_case.vfa", [("z/A", first), ("z/a", second)], coder=3, filt=None,
+               solid=True, chunk_size=1 << 16, cdc=True)
+    real = vx._case_insensitive
+    for forced in (None, True):
+        out = work / "dd_case_out"; shutil.rmtree(out, ignore_errors=True); out.mkdir()
+        ci = real(str(out)) if forced is None else forced
+        vx._case_insensitive = (lambda d, v=ci: v)
+        try:
+            open_extract(p, out)
+            names = sorted(q.name for q in (out / "z").iterdir())
+            if ci:   # one file survives, holding the last entry's bytes (its name is the volume's business)
+                ok = len(names) == 1 and (out / "z" / names[0]).read_bytes() == second
+            else:
+                ok = names == ["A", "a"] and (out / "z/A").read_bytes() == first and (out / "z/a").read_bytes() == second
+            check(f"vfa2: case-alias paths on a case-{'in' if ci else ''}sensitive destination "
+                  f"({'coalesced, last wins' if ci else 'kept apart'})", ok, repr(names))
+        except Exception as e:
+            check(f"vfa2: case-alias paths (case-{'in' if ci else ''}sensitive)", False, repr(e))
+        finally:
+            vx._case_insensitive = real
     # a chunk-boundary case: dedup references into the unflushed buffer and across flushes, small chunks
     files = [("z/a", base[:600_000]), ("z/b", base[:600_000]), ("z/c", base[100_000:700_000])]
     p = build2(work / "dd_small.vfa", files, cdc=True, solid=True, chunk_size=1 << 18, coder=3, filt=None)
