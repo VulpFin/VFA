@@ -783,7 +783,7 @@ def cmd_create_v2(args):
     nfiles = 0; total = 0; t0 = time.time()
     with open(args.output, "wb") as f:
         w = vfa2.Writer2(f, chunk_size=1 << args.chunk_exp, solid=args.solid, password=pw, coder=coder, filt=filt,
-                         level=args.level, cdc=not args.no_dedup,
+                         level=args.level, dedup=not args.no_dedup, cdc=not args.no_dedup,
                          kdf=(args.kdf_time or 3, args.kdf_mem_kib or 256 * 1024, args.kdf_parallel or 4))
         for et, rel, st, meta in _scan_inputs(items, args):
             mode = st.st_mode & 0o7777; ns = st.st_mtime_ns

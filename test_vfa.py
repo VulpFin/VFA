@@ -1126,6 +1126,12 @@ def t2_dedup(work, corpus):
         vfa("c", arc, "s", "--format", "vfa2", *flags, cwd=d)
         ok, why = extract_cmp(arc, d / "s", work); sizes[" ".join(flags) or "non-solid"] = arc.stat().st_size
         check(f"vfa2 dedup: shifted near-duplicate files round-trip ({' '.join(flags) or 'non-solid'})", ok, why)
+    (d / "same").mkdir(exist_ok=True); (d / "same/a.bin").write_bytes(base[:1 << 20]); (d / "same/b.bin").write_bytes(base[:1 << 20])
+    for flags, want in (([], 1), (["--no-dedup"], 2)):
+        arc = work / f"dd_same_{len(flags)}.vfa"; vfa("c", arc, "same", "--format", "vfa2", *flags, cwd=d)
+        with vx.open_container(str(arc)) as c:
+            c.unlock(None)
+            check(f"vfa2 dedup: two identical files -> {len(c.chunks)} chunk(s) {' '.join(flags) or '(default)'}", len(c.chunks) == want)
     check(f"vfa2 dedup: non-solid archive of two near-duplicates {sizes['non-solid']:,} B vs {sizes['--no-dedup']:,} B without dedup",
           sizes["non-solid"] < 0.6 * sizes["--no-dedup"])
     with vx.open_container(str(work / "dd_default.vfa")) as c:
