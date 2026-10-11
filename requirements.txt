@@ -4,6 +4,8 @@ brotli>=1.1.0
 cryptography>=42.0.0
 argon2-cffi>=23.1.0
 colorama>=0.4.6
+lz4>=4.0.0
+xxhash>=3.0.0          # verifies archives written by VFA <= 1.0 (xxh64 digests)
 
 # === SFX build tool ===
 pyinstaller>=6.0

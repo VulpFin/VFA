@@ -1,0 +1,21 @@
+{
+  "name": "MyApp",
+  "version": "1.2.0",
+  "publisher": "TG11",
+  "description": "Short blurb shown on the welcome page.",
+  "url": "https://example.com/myapp",
+  "default_location": "user",
+  "allow_locations": ["user", "public", "system", "system86", "custom"],
+  "license": "Paste license text here (shown with an accept checkbox / --accept-license). Remove the key for no license page.",
+  "icon": "bin/myapp.ico",
+  "shortcuts": [
+    {"type": "startmenu", "name": "MyApp", "target": "bin/myapp.exe", "comment": "Launch MyApp"},
+    {"type": "desktop",   "name": "MyApp", "target": "bin/myapp.exe"},
+    {"type": "startmenu", "name": "MyApp (console)", "target": "bin/myapp", "terminal": true, "categories": "Utility;"}
+  ],
+  "bin_links": [{"name": "myapp", "target": "bin/myapp"}],
+  "path_add": ["bin"],
+  "run_after": "bin/myapp.exe",
+  "defaults": {"desktop": false, "startmenu": true, "path": false, "launch": false},
+  "uninstaller": true
+}

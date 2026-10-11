@@ -83,7 +83,12 @@ def base_pyinstaller_args(debug=False):
         "--collect-all", "zstandard",
         "--collect-all", "brotli",
         "--collect-all", "argon2",
-        "--collect-all", "lz4"
+        "--collect-all", "lz4",
+        # one shared reader for every tool; xxhash so archives written by older builds (xxh64 digest) still verify
+        "--paths", str(ROOT),
+        "--hidden-import", "vfa_extract",
+        "--hidden-import", "vfa2",
+        "--hidden-import", "xxhash",
     ]
     return args
 
@@ -137,6 +142,37 @@ def build_sfx(debug=False, name_suffix="", icon_path=None, noconsole=False):
     shutil.move(str(src), str(dst))
     print(f"[build] SFX  => {dst}")
 
+def build_sfi(debug=False, name_suffix="", icon_path=None, noconsole=False):
+    """SFI = self-finishing installer stub (GUI + CLI + silent in one executable).
+    Built as a console app: double-clicked it hides its own console and shows the wizard."""
+    entry = ROOT / "sfi_stub.py"
+    if not exists(entry):
+        raise SystemExit("sfi_stub.py not found next to build.py")
+
+    name = f"vfa_sfi{name_suffix}"
+    args = PYI + base_pyinstaller_args(debug=debug) + [
+        "-n", name,
+        "--paths", str(ROOT),
+        "--hidden-import", "vfa_extract",
+        "--hidden-import", "sfi_gui",
+        "--hidden-import", "tkinter",
+        "--hidden-import", "xxhash",
+        str(entry),
+    ]
+    if noconsole and is_windows():
+        args += ["--noconsole"]
+    if icon_path and is_windows() and exists(icon_path):
+        args += ["--icon", str(icon_path)]
+
+    run(args)
+
+    out_dir = ROOT / "bin" / ("windows" if is_windows() else "linux" if is_linux() else "macos")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = ROOT / "dist" / (name + (".exe" if is_windows() else ""))
+    dst = out_dir / (name + (".exe" if is_windows() else ""))
+    shutil.move(str(src), str(dst))
+    print(f"[build] SFI  => {dst}")
+
 def build_viewer(debug=False, name_suffix="", icon_path=None, noconsole=False):
     entry = ROOT / "vfa_viewer.py"
     if not exists(entry):
@@ -164,6 +200,23 @@ def build_viewer(debug=False, name_suffix="", icon_path=None, noconsole=False):
     shutil.move(str(src), str(dst))
     print(f"[build] Viewer  => {dst}")
 
+def check_build_deps():
+    """PyInstaller silently skips packages it cannot import, producing a vfa.exe that dies at runtime
+    ("zstandard not installed"). Fail early instead - usually this means the venv is not being used."""
+    import importlib
+    need = {"zstandard": "zstandard", "brotli": "brotli", "cryptography": "cryptography", "argon2": "argon2-cffi", "lz4": "lz4",
+            "xxhash": "xxhash"}
+    missing = []
+    for mod, pipname in need.items():
+        try: importlib.import_module(mod)
+        except Exception: missing.append(pipname)
+    if missing:
+        raise SystemExit(
+            "[build] Missing packages for the Python running build.py: " + ", ".join(missing) + "\n"
+            f"        Python in use: {sys.executable}\n"
+            "        Use your venv (e.g. venv\\Scripts\\python build.py) or: pip install -r requirements.txt\n"
+            "        Building anyway would produce executables that fail at runtime.")
+
 def main():
     ap = argparse.ArgumentParser(description="Build VFA and SFX with PyInstaller")
     ap.add_argument("--no-clean", action="store_true", help="Do not clean build/dist before building")
@@ -171,9 +224,12 @@ def main():
     ap.add_argument("--name-suffix", default="", help="Append suffix to output binary names")
     ap.add_argument("--icon", default="VFA.ico", help="Windows icon (.ico). If missing, skip.")
     ap.add_argument("--noconsole-sfx", action="store_true", help="Build SFX without console on Windows")
+    ap.add_argument("--noconsole-sfi", action="store_true", help="Build the SFI installer stub without a console window on Windows")
+    ap.add_argument("--no-sfi", action="store_true", help="Skip building the SFI installer stub")
     ap.add_argument("--noconsole-viewer", action="store_true", help="Build SFX without console on Windows")
     args = ap.parse_args()
 
+    check_build_deps()
     ensure_pyinstaller()
 
     if not args.no_clean:
@@ -186,6 +242,10 @@ def main():
 
     # Build SFX stub
     build_sfx(debug=args.debug, name_suffix=args.name_suffix, icon_path=icon_path, noconsole=args.noconsole_sfx)
+
+    # Build SFI installer stub
+    if not args.no_sfi:
+        build_sfi(debug=args.debug, name_suffix=args.name_suffix, icon_path=icon_path, noconsole=args.noconsole_sfi)
 
     # Build Viewer
     build_viewer(debug=args.debug, name_suffix=args.name_suffix, icon_path=icon_path, noconsole=args.noconsole_viewer)

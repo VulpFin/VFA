@@ -7,274 +7,47 @@ import os, io, sys, struct, time, json, stat, hashlib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# Optional deps (align with vfa.py)
-try:
-    import zstandard as zstd
-    HAVE_ZSTD = True
-except Exception:
-    HAVE_ZSTD = False
-try:
-    import brotli
-    HAVE_BROTLI = True
-except Exception:
-    HAVE_BROTLI = False
-import zlib, lzma
-
-# Crypto (for encrypted archives)
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-    HAVE_AESGCM = True
-except Exception:
-    AESGCM = None
-    Scrypt = None
-    HAVE_AESGCM = False
-try:
-    import argon2.low_level as argon2ll
-    HAVE_ARGON2 = True
-except Exception:
-    argon2ll = None
-    HAVE_ARGON2 = False
-
-MAGIC = b"VFA1"
-END_MAGIC = b"/VFA1"
-VERSION = 1
-
-AEAD_NONE=0; AEAD_AESGCM=1
-KDF_NONE=0; KDF_ARGON2ID=1; KDF_SCRYPT=2
-
-M_NONE=0; M_ZLIB=1; M_LZMA=2; M_BROTLI=3; M_ZSTD=4
-METHOD_NAMES={M_NONE:"none",M_ZLIB:"zlib",M_LZMA:"lzma",M_BROTLI:"brotli",M_ZSTD:"zstd"}
-
-F_ENCRYPTED=1<<0
-F_SOLID=1<<1
-
-FOOTER_LEN = 8+4+1+32+5  # toc_off, toc_sz, hash_kind, digest[32], END_MAGIC
-
-def _nonce_from(prefix12:bytes, index:int)->bytes:
-    m=hashlib.sha256(); m.update(prefix12); m.update(struct.pack("<Q", index)); m.update(b"vfa-nonce"); return m.digest()[:12]
-
-def _kdf(password:bytes, header):
-    kid = header["kdf_id"]
-    if kid == KDF_ARGON2ID:
-        if not HAVE_ARGON2: raise RuntimeError("argon2-cffi not installed")
-        return argon2ll.hash_secret_raw(
-            secret=password, salt=header["salt"],
-            time_cost=header["kdf_t"] or 3, memory_cost=header["kdf_m"] or (256*1024),
-            parallelism=header["kdf_p"] or 4, hash_len=32,
-            type=argon2ll.Type.ID, version=argon2ll.ARGON2_VERSION
-        )
-    if kid == KDF_SCRYPT:
-        if Scrypt is None: raise RuntimeError("cryptography.scrypt not available")
-        return Scrypt(salt=header["salt"], length=32, n=header["kdf_t"] or (1<<15),
-                      r=header["kdf_m"] or 8, p=header["kdf_p"] or 1).derive(password)
-    raise RuntimeError("Archive indicates no KDF (not password-protected)")
-
-def _aead_decrypt(key:bytes, header, index:int, ciphertext:bytes, aad:bytes=b""):
-    if header["aead_id"] != AEAD_AESGCM or not HAVE_AESGCM:
-        raise RuntimeError("AES-GCM not available")
-    return AESGCM(key).decrypt(_nonce_from(header["nonce_prefix"], index), ciphertext, aad)
-
-def _decompress(m, data:bytes)->bytes:
-    if m==M_NONE: return data
-    if m==M_ZLIB: return zlib.decompress(data)
-    if m==M_LZMA: return lzma.decompress(data)
-    if m==M_BROTLI:
-        if not HAVE_BROTLI: raise RuntimeError("brotli not installed")
-        return brotli.decompress(data)
-    if m==M_ZSTD:
-        if not HAVE_ZSTD: raise RuntimeError("zstandard not installed")
-        return zstd.ZstdDecompressor().decompress(data)
-    raise RuntimeError(f"Unknown method {m}")
-
-def read_footer(fp:io.BufferedReader):
-    fp.seek(-(FOOTER_LEN), os.SEEK_END)
-    toc_off = struct.unpack("<Q", fp.read(8))[0]
-    toc_sz  = struct.unpack("<I", fp.read(4))[0]
-    hk      = struct.unpack("<B", fp.read(1))[0]
-    digest  = fp.read(32)
-    if fp.read(5) != END_MAGIC:
-        raise ValueError("Bad end magic")
-    return toc_off, toc_sz, hk, digest
-
-def parse_header(fp:io.BufferedReader):
-    if fp.read(4)!=MAGIC: raise ValueError("Not a VFA archive")
-    version,=struct.unpack("<H", fp.read(2))
-    flags,  =struct.unpack("<I", fp.read(4))
-    dm      =fp.read(1)[0]
-    dl      =fp.read(1)[0]
-    be      =fp.read(1)[0]
-    th,     =struct.unpack("<H", fp.read(2))
-    rm,     =struct.unpack("<I", fp.read(4))
-    kid     =fp.read(1)[0]
-    kt,     =struct.unpack("<I", fp.read(4))
-    km,     =struct.unpack("<I", fp.read(4))
-    kp      =fp.read(1)[0]
-    salt    =fp.read(16)
-    aid     =fp.read(1)[0]
-    np      =fp.read(12)
-    res     =fp.read(16)
-    header_len = 4+2+4 + 1+1+1 + 2 + 4 + 1 + 4 + 4 + 1 + 16 + 1 + 12 + 16
-    return {
-        "version":version,"flags":flags,"default_method":dm,"default_level":dl,"block_exp":be,
-        "threads":th,"ram_mib":rm,"kdf_id":kid,"kdf_t":kt,"kdf_m":km,"kdf_p":kp,
-        "salt":salt,"aead_id":aid,"nonce_prefix":np,"reserved":res,"header_len":header_len
-    }
-
-def parse_toc(data:bytes, solid:bool):
-    bio=io.BytesIO(data)
-    n, = struct.unpack("<I", bio.read(4))
-    entries=[]
-    for _ in range(n):
-        plen, = struct.unpack("<H", bio.read(2))
-        path = bio.read(plen).decode("utf-8","replace")
-        mode, = struct.unpack("<I", bio.read(4))
-        mtime,= struct.unpack("<Q", bio.read(8))
-        size, = struct.unpack("<Q", bio.read(8))
-        nb,   = struct.unpack("<I", bio.read(4))
-        entry_type = 0; meta=b""
-        # newer format with entry_type + meta
-        pos = bio.tell()
-        try:
-            entry_type = bio.read(1)[0]
-            mlen, = struct.unpack("<I", bio.read(4))
-            meta = bio.read(mlen) if mlen>0 else b""
-        except Exception:
-            bio.seek(pos)
-        blocks=[]; start_off=0
-        if solid:
-            start_off, = struct.unpack("<Q", bio.read(8))
-        else:
-            for _ in range(nb):
-                idx, = struct.unpack("<Q", bio.read(8))
-                usz, = struct.unpack("<I", bio.read(4))
-                csz, = struct.unpack("<I", bio.read(4))
-                meth = bio.read(1)[0]
-                blocks.append((idx, usz, csz, meth))
-        entries.append({"path":path,"mode":mode,"mtime":mtime,"size":size,
-                        "entry_type":entry_type,"blocks":blocks,"start_off":start_off,"meta":meta})
-    return entries
+import vfa_extract as vx                      # the shared, validated reader (also used by vfa.py and the stubs)
+from vfa_extract import METHOD_NAMES, VFAError
 
 class VFAArchive:
+    """GUI-facing wrapper around vfa_extract.Container."""
     def __init__(self, path:str):
         self.path = path
         self.header=None
         self.entries=[]
-        self.toc_off=0; self.toc_sz=0
         self.encrypted=False; self.solid=False
-        self.key=None
+        self._c=None
 
     def open(self, password:str|None=None):
-        with open(self.path, "rb") as f:
-            toc_off,toc_sz,hk,dig = read_footer(f)
-            f.seek(0)
-            header = parse_header(f)
-            self.header = header
-            self.encrypted = bool(header["flags"] & F_ENCRYPTED)
-            self.solid     = bool(header["flags"] & F_SOLID)
+        c = vx.open_container(self.path)     # VFA1 or VFA2
+        try:
+            self.header, self.encrypted, self.solid = c.header, c.encrypted, c.solid
+            if self.encrypted and password is None:
+                raise RuntimeError("Password required")
+            self.entries = c.unlock(password)
+        except Exception:
+            c.close(); raise
+        if self._c: self._c.close()
+        self._c = c
 
-            # Read TOC block
-            f.seek(toc_off)
-            toc_data = f.read(toc_sz)
-            if self.encrypted:
-                if password is None:
-                    raise RuntimeError("Password required")
-                key=_kdf(password.encode("utf-8"), header)
-                self.key = key
-                toc_data = _aead_decrypt(key, header, 0xFFFFFFFFFFFFFFFF, toc_data, aad=b"vfa-toc")
-
-            self.entries = parse_toc(toc_data, solid=self.solid)
-            self.toc_off, self.toc_sz = toc_off, toc_sz
+    def describe(self)->str:
+        if hasattr(self._c, "summary"): return self._c.summary()          # VFA2
+        return f"method={METHOD_NAMES.get(self.header['default_method'])} lvl={self.header['default_level']}"
 
     def test(self)->str:
-        """Lightweight integrity run: for non-solid, walk blocks; for solid, reassemble len."""
-        with open(self.path,"rb") as f:
-            f.seek(0)
-            header = parse_header(f)
-            f.seek(header["header_len"])
-            if self.solid:
-                # decode all blocks to get total size and match expected sum
-                expected = sum(e["size"] for e in self.entries if e["entry_type"]==0)
-                pos = header["header_len"]; parts_len=0; solid_idx=0
-                # arc range up to toc_off
-                while pos < self.toc_off:
-                    blen = struct.unpack("<I", f.read(4))[0]
-                    meth = f.read(1)[0]
-                    payload = f.read(blen)
-                    if self.encrypted:
-                        payload = _aead_decrypt(self.key, header, solid_idx, payload, aad=b"vfa-data")
-                    chunk = _decompress(header["default_method"], payload)
-                    parts_len += len(chunk); solid_idx += 1
-                return f"Solid OK. Data={parts_len} bytes, expected={expected}."
-            else:
-                pos = header["header_len"]
-                ok_blocks=0
-                for e in self.entries:
-                    if e["entry_type"]!=0: continue
-                    for (idx, usz, csz, meth) in e["blocks"]:
-                        blen = struct.unpack("<I", f.read(4))[0]
-                        mb = f.read(1)[0]
-                        payload = f.read(blen)
-                        if self.encrypted:
-                            payload = _aead_decrypt(self.key, header, idx, payload, aad=b"vfa-data")
-                        data = _decompress(meth, payload)
-                        if len(data)!=usz: raise RuntimeError("Size mismatch")
-                        ok_blocks += 1
-                return f"Non-solid OK. Blocks checked={ok_blocks}"
+        """Full check: footer digest, then every block (size, and CRC32 when the archive has them)."""
+        ok = self._c.verify_digest()
+        if ok is False:
+            raise RuntimeError("Integrity check FAILED: the archive is corrupted or was modified.")
+        st = self._c.test()
+        crc = "CRC32 verified" if self._c.has_tocx else "no block CRCs (VFA 1.0 archive)"
+        return (f"{'Solid' if self.solid else 'Non-solid'} OK. Blocks checked={st['blocks']}, data={st['bytes']} bytes, "
+                f"digest={'OK' if ok else 'none stored'}, {crc}.")
 
     def extract_selected(self, outdir:str, selected_paths:list[str]):
-        with open(self.path,"rb") as f:
-            header = parse_header(f)
-            # Get a decompressed solid buffer if needed
-            solid_buf = None
-            if self.solid:
-                f.seek(header["header_len"])
-                parts=[]; pos=header["header_len"]; solid_idx=0
-                while pos < self.toc_off:
-                    blen = struct.unpack("<I", f.read(4))[0]
-                    meth = f.read(1)[0]
-                    payload = f.read(blen)
-                    if self.encrypted:
-                        payload = _aead_decrypt(self.key, header, solid_idx, payload, aad=b"vfa-data")
-                    parts.append(_decompress(header["default_method"], payload))
-                    solid_idx+=1
-                    pos = f.tell()
-                solid_buf = b"".join(parts)
-
-            for e in self.entries:
-                if e["entry_type"]==1:
-                    # ensure directories exist if selected parent folders are chosen
-                    if any(p.startswith(e["path"]+"/") or p==e["path"] for p in selected_paths):
-                        dest = os.path.join(outdir, e["path"])
-                        os.makedirs(dest, exist_ok=True)
-                    continue
-                if e["entry_type"]!=0:
-                    continue
-                if e["path"] not in selected_paths:
-                    # Also include if a parent dir was selected
-                    if not any(e["path"].startswith(p.rstrip("/")+"/") for p in selected_paths if p.endswith("/")):
-                        continue
-
-                dest = os.path.join(outdir, e["path"])
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                if self.solid:
-                    seg = solid_buf[e["start_off"]: e["start_off"]+e["size"]]
-                    with open(dest,"wb") as fw: fw.write(seg)
-                else:
-                    # stream blocks
-                    with open(dest,"wb") as fw:
-                        for (idx, usz, csz, meth) in e["blocks"]:
-                            blen = struct.unpack("<I", f.read(4))[0]
-                            mb = f.read(1)[0]
-                            payload = f.read(blen)
-                            if self.encrypted:
-                                payload = _aead_decrypt(self.key, header, idx, payload, aad=b"vfa-data")
-                            data = _decompress(meth, payload)
-                            if len(data)!=usz: raise RuntimeError("Size mismatch")
-                            fw.write(data)
-                # times best-effort
-                try: os.utime(dest, (e["mtime"], e["mtime"]))
-                except Exception: pass
+        # a selected directory brings everything below it; every path is validated before writing
+        self._c.extract(outdir, members=selected_paths)
 
 class Viewer(ttk.Frame):
     def __init__(self, master):
@@ -341,8 +114,7 @@ class Viewer(ttk.Frame):
         self.populate_table()
         total_files = sum(1 for e in arc.entries if e["entry_type"]==0)
         total_bytes = sum(e["size"] for e in arc.entries if e["entry_type"]==0)
-        self.info.set(f"Archive: {os.path.basename(path)} | method={METHOD_NAMES.get(arc.header['default_method'])} "
-                      f"lvl={arc.header['default_level']} | solid={arc.solid} | enc={arc.encrypted} "
+        self.info.set(f"Archive: {os.path.basename(path)} | {arc.describe()} | solid={arc.solid} | enc={arc.encrypted} "
                       f"| files={total_files} | size={self.hbytes(total_bytes)}")
         self.btn_test.config(state="normal")
         self.btn_ex_all.config(state="normal")
@@ -475,8 +247,7 @@ def main():
                 total_bytes = sum(e["size"] for e in arc.entries if e["entry_type"]==0)
                 app.info.set(
                     f"Archive: {os.path.basename(candidate)} | "
-                    f"method={METHOD_NAMES.get(arc.header['default_method'])} "
-                    f"lvl={arc.header['default_level']} | "
+                    f"{arc.describe()} | "
                     f"solid={arc.solid} | enc={arc.encrypted} | "
                     f"files={total_files} | size={app.hbytes(total_bytes)}"
                 )

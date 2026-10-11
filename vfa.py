@@ -58,6 +58,9 @@ try:
 except Exception:
     HAVE_LZ4=False
 
+import vfa_extract as vx   # the shared reader (also used by the SFX/SFI stubs and the viewer)
+from vfa_extract import VFAError
+
 WIN = (platform.system() == "Windows")
 LIN = (sys.platform.startswith("linux"))
 
@@ -225,13 +228,17 @@ register_method(
 # Flags
 F_ENCRYPTED=1<<0
 F_SOLID=1<<1
+F_TOCX=vx.F_TOCX        # TOC carries a block table (offsets, sizes, CRC32) - VFA 1.1
 
 # Hash kind
 H_NONE=0; H_SHA256=1; H_BLAKE3=2; H_XXH64=3
 
+DEFAULT_SOLID_CHUNK_EXP = 26    # solid streams are cut into 64 MiB blocks (= the xz/lzma -9 dictionary) unless --solid-chunk-exp says otherwise
+MAX_BLOCK_EXP = 30              # vx.MAX_BLOCK: keeps every block's compressed size well inside u32
+
 def default_hash_kind():
-    if HAVE_XXH: return H_XXH64
-    if HAVE_BLAKE3: return H_BLAKE3
+    # Always SHA-256: it is in every Python's stdlib, so every reader can verify it.
+    # (xxh64/blake3 archives from older builds are still read when the library is present.)
     return H_SHA256
 
 def make_hasher(kind:int):
@@ -274,15 +281,6 @@ class HeaderV1:
             struct.pack("<I", self.kdf_m), struct.pack("<B", self.kdf_p),
             self.salt, struct.pack("<B", self.aead_id), self.aead_nonce_prefix, self.reserved
         ])
-    @classmethod
-    def unpack(cls, bio: io.BufferedReader)->"HeaderV1":
-        if bio.read(4)!=MAGIC: raise ValueError("Not a VFA archive")
-        version,=struct.unpack("<H", bio.read(2)); flags,=struct.unpack("<I", bio.read(4))
-        dm,=struct.unpack("<B", bio.read(1)); dl,=struct.unpack("<B", bio.read(1))
-        be,=struct.unpack("<B", bio.read(1)); th,=struct.unpack("<H", bio.read(2)); rm,=struct.unpack("<I", bio.read(4))
-        kid,=struct.unpack("<B", bio.read(1)); kt,=struct.unpack("<I", bio.read(4)); km,=struct.unpack("<I", bio.read(4)); kp,=struct.unpack("<B", bio.read(1))
-        salt=bio.read(16); aid,=struct.unpack("<B", bio.read(1)); np=bio.read(12); res=bio.read(16)
-        return cls(version,flags,dm,dl,be,th,rm,kid,kt,km,kp,salt,aid,np,res)
 
 # Entry types
 ET_FILE=0; ET_DIR=1; ET_SYMLINK=2; ET_HARDLINK=3
@@ -301,8 +299,13 @@ class FileEntry:
 @dataclass
 class TOC:
     entries:List[FileEntry]=field(default_factory=list)
-    def pack(self, solid: bool=False)->bytes:
+    def pack(self, solid: bool=False, block_recs=None)->bytes:
+        """block_recs (frame_off, csz, usz, method, crc32) -> appended as the VTX1 extension (needs F_TOCX).
+        Older readers stop after the entries and ignore it."""
         if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("dataclass TOC function pack")
+        if block_recs is not None:
+            body = self.pack(solid)
+            return body + vx.pack_tocx(block_recs, body)
         out=io.BytesIO(); out.write(struct.pack("<I", len(self.entries)))
         for e in self.entries:
             p=e.path.encode("utf-8")
@@ -324,34 +327,6 @@ class TOC:
                     out.write(struct.pack("<I", csz))
                     out.write(struct.pack("<B", meth))
         return out.getvalue()
-    @classmethod
-    def unpack(cls, data:bytes, solid: bool=False)->"TOC":
-        if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("dataclass TOC classmethod function unpack")
-        bio=io.BytesIO(data); (n,) = struct.unpack("<I", bio.read(4)); entries=[]
-        for _ in range(n):
-            (plen,) = struct.unpack("<H", bio.read(2)); path=bio.read(plen).decode("utf-8")
-            (mode,) = struct.unpack("<I", bio.read(4)); (mtime,) = struct.unpack("<Q", bio.read(8))
-            (size,) = struct.unpack("<Q", bio.read(8)); (nb,) = struct.unpack("<I", bio.read(4))
-            entry_type=ET_FILE; meta=b""
-            pos_before = bio.tell()
-            try:
-                (entry_type,) = struct.unpack("<B", bio.read(1))
-                (mlen,) = struct.unpack("<I", bio.read(4))
-                meta = bio.read(mlen) if mlen>0 else b""
-            except Exception:
-                bio.seek(pos_before)
-            blocks=[]; start_off=0
-            if solid:
-                (start_off,) = struct.unpack("<Q", bio.read(8))
-            else:
-                for _ in range(nb):
-                    (idx,) = struct.unpack("<Q", bio.read(8))
-                    (usz,) = struct.unpack("<I", bio.read(4))
-                    (csz,) = struct.unpack("<I", bio.read(4))
-                    (meth,) = struct.unpack("<B", bio.read(1))
-                    blocks.append((idx, usz, csz, meth))
-            entries.append(FileEntry(path, mode, mtime, size, blocks, start_off, entry_type, meta or None))
-        return cls(entries)
 
 # ---------- Crypto ----------
 def kdf_derive_key(password:bytes, header:HeaderV1)->bytes:
@@ -434,15 +409,7 @@ def write_footer(bw:io.BufferedWriter, toc_offset:int, toc_size:int, hash_kind:i
     else: bw.write(digest[:32].ljust(32,b"\x00"))
     bw.write(END_MAGIC)
 
-def read_footer(br:io.BufferedReader):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("footer func read footer")
-    br.seek(-(8+4+1+32+5), os.SEEK_END)
-    toc_off=struct.unpack("<Q", br.read(8))[0]
-    toc_sz=struct.unpack("<I", br.read(4))[0]
-    hk=struct.unpack("<B", br.read(1))[0]
-    dig=br.read(32)
-    if br.read(5)!=END_MAGIC: raise ValueError("Bad end magic")
-    return toc_off, toc_sz, hk, dig
+# (reading lives in vfa_extract.Container)
 
 # ---------- Walkers & Metadata ----------
 def iter_tree(paths: List[str]):
@@ -613,9 +580,17 @@ def win_capture_meta(path:str)->dict:
     except Exception: pass
     return meta
 
-def win_apply_meta(path:str, meta:dict, is_dir:bool):
+def _safe_ads_name(name) -> bool:
+    # ":stream:$DATA" - anything with a path separator could write outside the file it belongs to
+    return isinstance(name, str) and name.startswith(":") and not any(c in name for c in "\\/\x00") and ".." not in name
+
+def win_apply_meta(path:str, meta:dict, is_dir:bool, full:bool=False):
+    """Attributes and timestamps always; owner/DACL (sddl) and alternate data streams only with full=True
+    (vfa x --winmeta), because they let an archive decide who may write the extracted files."""
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func win apply meta")
     if not (WIN and HAVE_WIN32): return
+    if not full:
+        meta = {k: v for k, v in meta.items() if k not in ("sddl", "ads")}
     try:
         if "attrs" in meta:
             win32file.SetFileAttributesW(path, int(meta["attrs"]))
@@ -645,22 +620,40 @@ def win_apply_meta(path:str, meta:dict, is_dir:bool):
     if "ads" in meta:
         for s in meta["ads"]:
             try:
+                if not _safe_ads_name(s.get("name")):
+                    LOGGER.warning(f"Skipping unsafe alternate data stream name {s.get('name')!r} on {path}")
+                    continue
                 if s.get("hex") is not None:
                     data = bytes.fromhex(s["hex"])
                     with open(path + s["name"], "wb") as sf: sf.write(data)
             except Exception: pass
 
 # ---------- Core helpers ----------
-def _load_header_toc_and_key(br, need_password:bool):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func load header toc and key")
-    header=HeaderV1.unpack(br); toc_off,toc_sz,hk,dig=read_footer(br); br.seek(toc_off)
-    toc_data=br.read(toc_sz); key=None
-    if header.flags & F_ENCRYPTED:
-        if not need_password: raise SystemExit("Archive is encrypted; use --password")
-        pw=getpass.getpass("Password: ").encode(); key=kdf_derive_key(pw, header)
-        toc_data=aead_decrypt(key, header, 0xFFFFFFFFFFFFFFFF, toc_data, aad=b"vfa-toc")
-    toc=TOC.unpack(toc_data, solid=bool(header.flags & F_SOLID))
-    return header,toc,key,toc_off,toc_sz,hk,dig
+def _set_mtime(path, e):
+    ns = e["mtime"] * 1_000_000_000 + e.get("mtime_ns", 0)
+    try: os.utime(path, ns=(ns, ns))
+    except Exception: pass
+
+def _wants_password(args) -> bool:
+    return bool(getattr(args, "password", False) or getattr(args, "password_env", None) or getattr(args, "password_file", None))
+
+def get_password(args) -> bytes:
+    """--password-env VAR / --password-file FILE for scripts and tests, otherwise an interactive prompt."""
+    if getattr(args, "password_env", None):
+        v = os.environ.get(args.password_env)
+        if v is None: raise SystemExit(f"Environment variable {args.password_env} is not set")
+        return v.encode("utf-8")
+    if getattr(args, "password_file", None):
+        with open(args.password_file, "r", encoding="utf-8") as pf:
+            return pf.read().rstrip("\r\n").encode("utf-8")
+    return getpass.getpass("Password: ").encode("utf-8")
+
+def _unlock(c: "vx.Container", args):
+    pw = None
+    if c.encrypted:
+        if not _wants_password(args): raise SystemExit("Archive is encrypted; use --password (or --password-env/--password-file)")
+        pw = get_password(args).decode("utf-8")
+    c.unlock(pw)
 
 def _recompute_hash_until(bf, upto:int, hash_kind:int)->bytes:
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func recompute hash util")
@@ -671,16 +664,139 @@ def _recompute_hash_until(bf, upto:int, hash_kind:int)->bytes:
         hasher_update(h, chunk, hash_kind); done += len(chunk)
     return hasher_digest(h, hash_kind)
 
+def _read_pieces(path:str, piece:int=1<<20):
+    """Yield a file's bytes in pieces until EOF (never trusts the size from stat)."""
+    with open(path, "rb") as fr:
+        while True:
+            b = fr.read(piece)
+            if not b: return
+            yield b
+
+class _BlockSink:
+    """Writes [u32 len][u8 method][payload] frames and records the VTX1 block table
+    (frame offset, compressed size, uncompressed size, method, CRC32 of the uncompressed data)."""
+    def __init__(self, f, header, key, hasher=None, index=0, recs=None):
+        self.f=f; self.header=header; self.key=key; self.hasher=hasher; self.index=index
+        self.recs = recs if recs is not None else []
+    def put(self, method:int, level:int, chunk:bytes):
+        off = self.f.tell()
+        comp = compress_block(method, level, chunk)
+        payload = comp if self.key is None else aead_encrypt(self.key, self.header, self.index, comp, aad=b"vfa-data")
+        if len(payload) > 0xFFFFFFFF: raise SystemExit("A compressed block exceeded 4 GiB; use a smaller --block-exp")
+        frame = struct.pack("<IB", len(payload), method)
+        self.f.write(frame); self.f.write(payload)
+        if self.hasher is not None:
+            hasher_update(self.hasher, frame, default_hash_kind()); hasher_update(self.hasher, payload, default_hash_kind())
+        self.recs.append((off, len(payload), len(chunk), method, vx.crc32(chunk)))
+        idx = self.index; self.index += 1
+        return (idx, len(chunk), len(payload), method)
+
+class _SolidStream:
+    """Buffers the solid byte stream and emits a block every chunk_size bytes, so memory stays at about one block."""
+    def __init__(self, sink:_BlockSink, method:int, level:int, chunk_size:int):
+        self.sink=sink; self.method=method; self.level=level; self.cs=chunk_size; self.buf=bytearray(); self.pos=0
+    def write(self, data:bytes):
+        self.pos += len(data); mv = memoryview(data)
+        while len(mv):
+            take = min(self.cs - len(self.buf), len(mv))
+            self.buf += mv[:take]; mv = mv[take:]
+            if len(self.buf) == self.cs:
+                chunk = bytes(self.buf); self.buf = bytearray()    # release the buffer before compressing
+                self.sink.put(self.method, self.level, chunk); del chunk
+    def flush(self):
+        if self.buf:
+            chunk = bytes(self.buf); self.buf = bytearray()
+            self.sink.put(self.method, self.level, chunk)
+
+def _check_exp(name:str, v, lo:int):
+    if v is not None and not (lo <= int(v) <= MAX_BLOCK_EXP):
+        raise SystemExit(f"{name} must be between {lo} and {MAX_BLOCK_EXP}")
+
+def _scan_inputs(items, args):
+    """Yield (entry_type, path, stat, meta_json_bytes|None) for the archive, capturing the metadata the flags ask
+    for. Symlinks are recorded (Linux), and later links to an already-seen inode become hardlink entries."""
+    hardlinks: Dict[Tuple[int,int], str] = {}
+    for fp, st, et in items:
+        rel = str(fp)
+        meta_obj = {}
+        if LIN and args.posixmeta:
+            meta_obj.update(posix_capture_meta(rel, st))
+        if WIN and args.winmeta:
+            meta_obj["win"] = win_capture_meta(rel)
+        if LIN and args.xattrs:
+            x = list_xattrs(rel, follow_symlinks=False)
+            if x:
+                meta_obj["xattrs"] = {k: v.hex() for k,v in x.items()}
+        if LIN and args.selinux:
+            sctx = selinux_get(rel, follow_symlinks=False)
+            if sctx is not None:
+                meta_obj.setdefault("xattrs", {})["security.selinux"] = sctx.hex()
+                meta_obj["selinux"] = sctx.decode("utf-8","ignore")
+        enc = lambda: json.dumps(meta_obj, ensure_ascii=False).encode("utf-8") if meta_obj else None
+        if et == ET_DIR:
+            LOGGER.trace(f"Discovered directory {rel}")
+            yield ET_DIR, rel, st, enc(); continue
+        if et == ET_SYMLINK and LIN:            # elsewhere a symlink is archived as the file it points to (as before)
+            meta_obj["link_target"] = os.readlink(rel)
+            LOGGER.trace(f"Recorded symlink {rel} -> {meta_obj['link_target']}")
+            yield ET_SYMLINK, rel, st, enc(); continue
+        if LIN and getattr(st, "st_nlink", 1) > 1:
+            key_hl = hl_key(st)
+            if key_hl in hardlinks:
+                meta_obj["hardlink_to"] = hardlinks[key_hl]
+                LOGGER.trace(f"Recorded hardlink {rel} -> {hardlinks[key_hl]}")
+                yield ET_HARDLINK, rel, st, enc(); continue
+            hardlinks[key_hl] = rel
+        if LIN and args.sparse and stat.S_ISREG(st.st_mode):
+            holes = detect_sparse(rel)
+            if holes: meta_obj["holes"] = holes
+        yield ET_FILE, rel, st, enc()
+
+def _collect_items(args, solid: bool):
+    items = list(iter_tree(args.inputs))
+    if solid and args.solid_by == "ext":
+        items.sort(key=lambda it: (it[0].suffix.lower(), str(it[0])))
+    return items
+
 # ---------- Commands ----------
+def cmd_create_v2(args):
+    """VFA2 (see VFA2.md). M1: the 'stored' coder only - this milestone proves the container, not compression."""
+    import vfa2
+    if args.method not in (None, "none", "stored"):
+        raise SystemExit("VFA2 currently has only the 'stored' coder (--method none); compression arrives in milestone M3")
+    _check_exp("--chunk-exp", args.chunk_exp, 12)
+    pw = get_password(args) if _wants_password(args) else None
+    items = _collect_items(args, args.solid)
+    nfiles = 0; total = 0; t0 = time.time()
+    with open(args.output, "wb") as f:
+        w = vfa2.Writer2(f, chunk_size=1 << args.chunk_exp, solid=args.solid, password=pw,
+                         kdf=(args.kdf_time or 3, args.kdf_mem_kib or 256 * 1024, args.kdf_parallel or 4))
+        for et, rel, st, meta in _scan_inputs(items, args):
+            mode = st.st_mode & 0o7777; ns = st.st_mtime_ns
+            if et == ET_DIR: w.add_dir(rel, mode, 0, meta, mtime_ns=ns)
+            elif et in (ET_SYMLINK, ET_HARDLINK): w.add_link(rel, et == ET_HARDLINK, mode, 0, meta, mtime_ns=ns)
+            else:
+                with open(rel, "rb") as fr: n = w.add_file(rel, mode, 0, fr, meta, mtime_ns=ns)
+                if n != st.st_size: LOGGER.warning(f"{rel} changed size while being archived ({st.st_size} -> {n} bytes)")
+                nfiles += 1; total += n
+        w.close()
+    LOGGER.info(f"Done in {time.time() - t0:.2f}s | files {nfiles} | src {human_bytes(total)} | chunks {len(w.chunks)} | arch {human_bytes(w.pos)}")
+    print(f"Created {args.output} (VFA2) with {len(w.entries)} entry(s), {len(w.chunks)} chunk(s). Solid={bool(args.solid)}")
+
 def cmd_create(args):
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd create")
+    if args.format == "vfa2": return cmd_create_v2(args)
+    if args.method is None: args.method = "zstd" if HAVE_ZSTD else "zlib"
+    if args.method == "stored": args.method = "none"
+    _check_exp("--block-exp", args.block_exp, 12); _check_exp("--solid-chunk-exp", args.solid_chunk_exp, 16)
     block_size=1<<args.block_exp; method=NAME_TO_METHOD.get(args.method)
     if method is None: raise SystemExit(f"Unknown method {args.method}")
     header=HeaderV1(); header.default_method=method; header.default_level=args.level
     header.block_exp=args.block_exp; header.threads_hint=args.threads; header.ram_mib_hint=args.max_ram_mib
+    header.flags |= F_TOCX
     if args.solid: header.flags |= F_SOLID
     key=None
-    if args.password:
+    if _wants_password(args):
         if not HAVE_AESGCM: raise SystemExit("cryptography not installed; cannot encrypt")
         if HAVE_ARGON2:
             header.kdf_id=KDF_ARGON2ID; header.kdf_t=args.kdf_time or 3; header.kdf_m=args.kdf_mem_kib or (256*1024); header.kdf_p=args.kdf_parallel or 4
@@ -688,26 +804,20 @@ def cmd_create(args):
             header.kdf_id=KDF_SCRYPT; header.kdf_t=args.scrypt_n or (1<<15); header.kdf_m=args.scrypt_r or 8; header.kdf_p=args.scrypt_p or 1
         header.salt=os.urandom(16); header.aead_id=AEAD_AESGCM; header.aead_nonce_prefix=os.urandom(12); header.flags |= F_ENCRYPTED
         LOGGER.info("Encryption enabled (AES-256-GCM).")
-        pw=getpass.getpass("Password: ").encode(); key=kdf_derive_key(pw, header)
+        key=kdf_derive_key(get_password(args), header)
 
-    toc=TOC(); block_index=0
-    hardlinks: Dict[Tuple[int,int], str] = {}
+    toc=TOC()
+    hk = default_hash_kind()
 
     with open(args.output,"wb") as f:
         bw=f
         header_bytes = header.pack()
         bw.write(header_bytes)
-        hasher=make_hasher(default_hash_kind())
-        hasher_update(hasher, header_bytes, default_hash_kind())
+        hasher=make_hasher(hk)
+        hasher_update(hasher, header_bytes, hk)
+        sink = _BlockSink(bw, header, key, hasher)
 
-        # Collect entries
-        items = list(iter_tree(args.inputs))
-        if (header.flags & F_SOLID) and (args.solid_by == "ext"):
-            def ext_key(item):
-                fp, st, et = item
-                e = fp.suffix.lower()
-                return (e if e else ""), str(fp)
-            items.sort(key=ext_key)
+        items = _collect_items(args, bool(header.flags & F_SOLID))
 
         # Progress setup
         file_items = [it for it in items if it[2] == ET_FILE]
@@ -715,176 +825,62 @@ def cmd_create(args):
         total_bytes = sum(int(getattr(st, "st_size", 0)) for _, st, _ in file_items)
         prog = Progress(total_files, total_bytes)
         LOGGER.info(f"Preparing to compress {total_files} files ({human_bytes(total_bytes)}). Solid={bool(args.solid)} method={args.method} lvl={args.level}")
-        if (header.flags & F_SOLID) and args.solid_chunk_exp is not None:
-            LOGGER.info(f"Solid chunk size ≈ {human_bytes(1<<int(args.solid_chunk_exp))}")
+        solid = None
+        if header.flags & F_SOLID:
+            chunk_exp = args.solid_chunk_exp if args.solid_chunk_exp is not None else DEFAULT_SOLID_CHUNK_EXP
+            LOGGER.info(f"Solid chunk size {human_bytes(1<<int(chunk_exp))}")
+            solid = _SolidStream(sink, method, args.level, 1 << int(chunk_exp))
 
-        # For solid mode we concatenate only regular file bytes
-        solid_buffer = io.BytesIO(); cur_off = 0
-        for fp, st, et in items:
-            rel = str(fp)
+        for et, rel, st, meta_bytes in _scan_inputs(items, args):
             st_mode = (st.st_mode & 0o7777)
             st_mtime = int(getattr(st, "st_mtime", time.time()))
-            meta_obj = {}
-
-            if LIN and args.posixmeta:
-                meta_obj.update(posix_capture_meta(rel, st))
-            if WIN and args.winmeta:
-                meta_obj["win"] = win_capture_meta(rel)
-
-            if LIN and args.xattrs:
-                x = list_xattrs(rel, follow_symlinks=False)
-                if x:
-                    meta_obj["xattrs"] = {k: v.hex() for k,v in x.items()}
-            if LIN and args.selinux:
-                sctx = selinux_get(rel, follow_symlinks=False)
-                if sctx is not None:
-                    meta_obj.setdefault("xattrs", {})["security.selinux"] = sctx.hex()
-                    meta_obj["selinux"] = sctx.decode("utf-8","ignore")
-
-            if et == ET_DIR:
-                entry = FileEntry(rel, st_mode, st_mtime, 0, [], 0, ET_DIR,
-                                  json.dumps(meta_obj, ensure_ascii=False).encode("utf-8") if meta_obj else None)
-                toc.entries.append(entry)
-                if LOGGER.level >= VLog.LEVELS["trace"]:
-                    LOGGER.trace(f"Discovered directory {rel}")
+            if et != ET_FILE:
+                toc.entries.append(FileEntry(rel, st_mode, st_mtime, 0, [], 0, et, meta_bytes))
                 continue
-
-            if et == ET_SYMLINK and LIN:
-                target = os.readlink(rel)
-                meta_obj["link_target"]=target
-                entry = FileEntry(rel, st_mode, st_mtime, 0, [], 0, ET_SYMLINK,
-                                  json.dumps(meta_obj, ensure_ascii=False).encode("utf-8"))
-                toc.entries.append(entry)
-                if LOGGER.level >= VLog.LEVELS["trace"]:
-                    LOGGER.trace(f"Recorded symlink {rel} -> {target}")
-                continue
-
-            # Handle hardlinks (Linux)
-            if LIN and et == ET_FILE and getattr(st, "st_nlink", 1) > 1:
-                key_hl = hl_key(st)
-                if key_hl in hardlinks:
-                    meta_obj["hardlink_to"] = hardlinks[key_hl]
-                    entry = FileEntry(rel, st_mode, st_mtime, 0, [], 0, ET_HARDLINK,
-                                      json.dumps(meta_obj, ensure_ascii=False).encode("utf-8"))
-                    toc.entries.append(entry)
-                    if LOGGER.level >= VLog.LEVELS["trace"]:
-                        LOGGER.trace(f"Recorded hardlink {rel} -> {hardlinks[key_hl]}")
-                    continue
-                else:
-                    hardlinks[key_hl] = rel
-
-            # regular file
             size = int(st.st_size)
-            if LIN and args.sparse and stat.S_ISREG(st.st_mode):
-                holes = detect_sparse(rel)
-                if holes:
-                    meta_obj["holes"]=holes
-
-            meta_bytes = json.dumps(meta_obj, ensure_ascii=False).encode("utf-8") if meta_obj else None
-
-            if header.flags & F_SOLID:
-                LOGGER.debug(f"Queuing file {rel} ({human_bytes(size)}) for solid stream")
-                t0 = time.time()
-                with open(rel, "rb") as fr:
-                    data = fr.read()
-                    solid_buffer.write(data)
-                duration = time.time() - t0
-                prog.add_file(size, duration)
-                elapsed, eta, rate, ratio = prog.estimate()
-                if LOGGER.level >= VLog.LEVELS["debug"]:
-                    arch_so_far = bw.tell()
-                    LOGGER.debug(
-                        f"Queued {rel} in {duration:.2f}s | "
-                        f"{prog.done_files}/{prog.total_files} files, "
-                        f"{human_bytes(prog.done_bytes)}/{human_bytes(prog.total_bytes)} | "
-                        f"arch {human_bytes(arch_so_far)} | "
-                        f"elapsed {elapsed:.1f}s | eta {('∞' if eta==float('inf') else f'{eta:.1f}s')}"
-                    )
-                entry = FileEntry(rel, st_mode, st_mtime, size, [], cur_off, ET_FILE, meta_bytes)
-                cur_off += size
-                toc.entries.append(entry)
+            t0 = time.time()
+            if solid is not None:
+                LOGGER.debug(f"Streaming file {rel} ({human_bytes(size)}) into solid stream")
+                entry = FileEntry(rel, st_mode, st_mtime, 0, [], solid.pos, ET_FILE, meta_bytes)
+                for piece in _read_pieces(rel):
+                    solid.write(piece); entry.size += len(piece)
             else:
                 LOGGER.debug(f"Compressing file {rel} ({human_bytes(size)})")
-                t0 = time.time()
-                entry = FileEntry(rel, st_mode, st_mtime, size, [], 0, ET_FILE, meta_bytes)
-                with open(rel, "rb") as fr:
-                    rem=size
-                    while rem>0:
-                        chunk=fr.read(min(block_size, rem)); rem -= len(chunk)
-                        comp=compress_block(method, args.level, chunk)
-                        payload=comp if key is None else aead_encrypt(key, header, block_index, comp, aad=b"vfa-data")
-                        bw.write(struct.pack("<I", len(payload))); bw.write(struct.pack("<B", method)); bw.write(payload)
-                        entry.blocks.append((block_index, len(chunk), len(payload), method))
-                        hasher_update(hasher, struct.pack("<I", len(payload))+struct.pack("<B", method)+payload, default_hash_kind())
-                        block_index += 1
-                duration = time.time() - t0
-                toc.entries.append(entry)
-                prog.add_file(size, duration)
+                entry = FileEntry(rel, st_mode, st_mtime, 0, [], 0, ET_FILE, meta_bytes)
+                for chunk in _read_pieces(rel, block_size):
+                    entry.blocks.append(sink.put(method, args.level, chunk)); entry.size += len(chunk)
+            if entry.size != size:
+                LOGGER.warning(f"{rel} changed size while being archived ({size} -> {entry.size} bytes); stored what was read")
+            toc.entries.append(entry)
+            duration = time.time() - t0
+            prog.add_file(entry.size, duration)
+            if LOGGER.level >= VLog.LEVELS["debug"]:
                 arch_so_far = bw.tell()
                 elapsed, eta, rate, ratio = prog.estimate()
-                if LOGGER.level >= VLog.LEVELS["debug"]:
-                    saved = max(0, prog.done_bytes - arch_so_far)
-                    ratio_now = (arch_so_far/prog.done_bytes) if prog.done_bytes else 0.0
-                    LOGGER.debug(
-                        f"Done {rel} in {duration:.2f}s | "
-                        f"{prog.done_files}/{prog.total_files} files, "
-                        f"{human_bytes(prog.done_bytes)}/{human_bytes(prog.total_bytes)} | "
-                        f"arch {human_bytes(arch_so_far)} | "
-                        f"saved {human_bytes(saved)} | ratio {ratio_now:.3f} | "
-                        f"elapsed {elapsed:.1f}s | eta {('∞' if eta==float('inf') else f'{eta:.1f}s')}"
-                    )
+                LOGGER.debug(
+                    f"Done {rel} in {duration:.2f}s | "
+                    f"{prog.done_files}/{prog.total_files} files, "
+                    f"{human_bytes(prog.done_bytes)}/{human_bytes(prog.total_bytes)} | "
+                    f"arch {human_bytes(arch_so_far)} | "
+                    f"elapsed {elapsed:.1f}s | eta {('∞' if eta==float('inf') else f'{eta:.1f}s')}"
+                )
 
-        # If solid: emit blocks from solid_buffer (single or chunked)
-        if header.flags & F_SOLID:
-            if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("solid_buffer")
-            whole = solid_buffer.getvalue()
-            if args.solid_chunk_exp is not None:
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"solid chunk exp = {int(args.solid_chunk_exp)}")
-                seg_size = 1 << int(args.solid_chunk_exp)
-                if LOGGER.level >= VLog.LEVELS["trace"]:
-                    LOGGER.trace(f"Emitting solid chunks of ~{human_bytes(seg_size)}")
-                pos = 0; total=len(whole)
-                while pos < total:
-                    seg = whole[pos:pos+seg_size]; pos += len(seg)
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"seg = {len(seg)}, pos = {pos}")
-                    comp=compress_block(method, args.level, seg)
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"comp = {len(comp)}")
-                    payload = comp if key is None else aead_encrypt(key, header, block_index, comp, aad=b"vfa-data")
-                    bw.write(struct.pack("<I", len(payload))); bw.write(struct.pack("<B", method)); bw.write(payload)
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("bw.write payload")
-                    hasher_update(hasher, struct.pack("<I", len(payload))+struct.pack("<B", method)+payload, default_hash_kind())
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("hasher_update")
-                    block_index += 1
-                    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("block index inc.")
-            else:
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("no solid chunk exp")
-                comp=compress_block(method, args.level, whole)
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"comp len = {len(comp)}")
-                payload = comp if key is None else aead_encrypt(key, header, block_index, comp, aad=b"vfa-data")
-                bw.write(struct.pack("<I", len(payload))); bw.write(struct.pack("<B", method)); bw.write(payload)
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("bw.write payload")
-                hasher_update(hasher, struct.pack("<I", len(payload))+struct.pack("<B", method)+payload, default_hash_kind())
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("hasher_update")
-                block_index += 1
-                if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("block index inc.")
+        if solid is not None:
+            solid.flush()
             arch_so_far = bw.tell()
-            if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"arch so far = {arch_so_far}")
             saved = max(0, prog.done_bytes - arch_so_far)
-            if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"saved = {saved}")
             ratio_now = (arch_so_far / prog.done_bytes) if prog.done_bytes else 0.0
-            if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"ratio = {ratio_now}")
             LOGGER.info(
-                f"Solid stream written | arch {human_bytes(arch_so_far)} | "
+                f"Solid stream written | {len(sink.recs)} block(s) | arch {human_bytes(arch_so_far)} | "
                 f"src {human_bytes(prog.done_bytes)} | saved {human_bytes(saved)} | ratio {ratio_now:.3f}"
             )
 
-        toc_data = toc.pack(solid=bool(header.flags & F_SOLID))
+        toc_data = toc.pack(solid=bool(header.flags & F_SOLID), block_recs=sink.recs)
         LOGGER.trace("Writing TOC...")
-        if key is not None: toc_data = aead_encrypt(key, header, 0xFFFFFFFFFFFFFFFF, toc_data, aad=b"vfa-toc")
-        toc_off = bw.tell(); bw.write(toc_data); toc_sz=len(toc_data); hasher_update(hasher, toc_data, default_hash_kind())
-        digest=hasher_digest(hasher, default_hash_kind()); write_footer(bw, toc_off, toc_sz, default_hash_kind(), digest)
+        if key is not None: toc_data = aead_encrypt(key, header, vx.toc_nonce_index(0), toc_data, aad=b"vfa-toc")
+        toc_off = bw.tell(); bw.write(toc_data); toc_sz=len(toc_data); hasher_update(hasher, toc_data, hk)
+        digest=hasher_digest(hasher, hk); write_footer(bw, toc_off, toc_sz, hk, digest)
         arch_final = bw.tell()
-        if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"arch final = {arch_final}")
 
     elapsed, eta, rate, ratio = prog.estimate()
     saved = max(0, prog.done_bytes - arch_final)
@@ -898,283 +894,177 @@ def cmd_create(args):
 
 def cmd_list(args):
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd list")
-    with open(args.archive,"rb") as f:
-        br=f; header=HeaderV1.unpack(br); toc_off,toc_sz,hk,digest=read_footer(br)
-        br.seek(toc_off); toc_data=br.read(toc_sz)
-        if header.flags & F_ENCRYPTED:
-            if not args.password: raise SystemExit("Archive is encrypted; use --password")
-            pw=getpass.getpass("Password: ").encode(); key=kdf_derive_key(pw, header)
-            toc_data=aead_decrypt(key, header, 0xFFFFFFFFFFFFFFFF, toc_data, aad=b"vfa-toc")
-        toc=TOC.unpack(toc_data, solid=bool(header.flags & F_SOLID))
-        total=sum(e.size for e in toc.entries if e.entry_type==ET_FILE)
-        print(f"Archive: {args.archive}\nVersion: {header.version}, Method: {METHOD_NAMES.get(header.default_method)} lvl {header.default_level}, Block: {1<<header.block_exp}B")
-        print(f"Encrypted: {bool(header.flags & F_ENCRYPTED)}, Solid: {bool(header.flags & F_SOLID)}")
-        print(f"Entries: {len(toc.entries)}, Files total: {total} bytes")
-        for e in toc.entries:
-            kind = ["file","dir","symlink","hardlink"][e.entry_type]
-            blocks_info = "solid" if (header.flags & F_SOLID and e.entry_type==ET_FILE) else (f"{len(e.blocks)} blocks" if e.entry_type==ET_FILE else "-")
-            print(f"{e.size:12d}  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.mtime))}  [{kind}]  {e.path}  ({blocks_info})")
+    with vx.open_container(args.archive) as c:
+        _unlock(c, args)
+        if getattr(c, "format", "VFA1") == "VFA2":
+            total=sum(e["size"] for e in c.entries if e["entry_type"]==ET_FILE)
+            print(f"Archive: {args.archive}\nFormat: {c.summary()}\nEncrypted: {c.encrypted}")
+            print("Integrity: digest sha256, chunk + header + index CRC32s")
+            print(f"Entries: {len(c.entries)}, Files total: {total} bytes")
+            for e in c.entries:
+                info = f"{len(e['extents'])} extent(s)" if e["entry_type"]==ET_FILE else "-"
+                print(f"{e['size']:12d}  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e['mtime']))}  [{vx.ET_NAMES[e['entry_type']]}]  {e['path']}  ({info})")
+            return
+        h = c.header
+        total=sum(e["size"] for e in c.entries if e["entry_type"]==ET_FILE)
+        print(f"Archive: {args.archive}\nVersion: {h['version']}, Method: {METHOD_NAMES.get(h['default_method'])} lvl {h['default_level']}, Block: {1<<h['block_exp']}B")
+        print(f"Encrypted: {c.encrypted}, Solid: {c.solid}")
+        print(f"Integrity: digest {vx.HASH_NAMES.get(c.hash_kind, c.hash_kind)}, block CRC32s {'yes' if c.has_tocx else 'no (VFA 1.0 archive)'}")
+        print(f"Entries: {len(c.entries)}, Files total: {total} bytes")
+        for e in c.entries:
+            kind = vx.ET_NAMES[e["entry_type"]]
+            blocks_info = "solid" if (c.solid and e["entry_type"]==ET_FILE) else (f"{len(e['blocks'])} blocks" if e["entry_type"]==ET_FILE else "-")
+            print(f"{e['size']:12d}  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e['mtime']))}  [{kind}]  {e['path']}  ({blocks_info})")
 
 def cmd_test(args):
+    """Exit code 0 only if the footer digest matches and every block decodes (and passes its CRC32)."""
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd test")
     LOGGER.info("Verifying archive footer hash and block integrity...")
-    with open(args.archive,"rb") as f:
-        br=f; header=HeaderV1.unpack(br); toc_off,toc_sz,hk,digest=read_footer(br)
-        footer_len=8+4+1+32+5; br.seek(0,os.SEEK_END); end=br.tell(); br.seek(0)
-        h=make_hasher(hk); remain=end-footer_len; read=0
-        while read<remain:
-            chunk=br.read(min(1024*1024, remain-read)); hasher_update(h, chunk, hk); read+=len(chunk)
-        ok=(hasher_digest(h,hk)==digest); print(f"Footer hash match: {'OK' if ok else 'FAIL'}")
-        br.seek(toc_off); toc_data=br.read(toc_sz); key=None
-        if header.flags & F_ENCRYPTED:
-            if not args.password: raise SystemExit("Archive is encrypted; use --password to test")
-            pw=getpass.getpass("Password: ").encode(); key=kdf_derive_key(pw, header)
-            toc_data=aead_decrypt(key, header, 0xFFFFFFFFFFFFFFFF, toc_data, aad=b"vfa-toc")
-        toc=TOC.unpack(toc_data, solid=bool(header.flags & F_SOLID))
-        br.seek(len(header.pack()))
-        if header.flags & F_SOLID:
-            total_expected = sum(e.size for e in toc.entries if e.entry_type==ET_FILE)
-            data_total=0
-            solid_block_idx = 0
-            while br.tell() < toc_off:
-                hdr = br.read(5)
-                if len(hdr) < 5: break
-                blen = struct.unpack("<I", hdr[:4])[0];
-                meth = hdr[4]
-                payload = br.read(blen)
-                if key is not None:
-                    payload = aead_decrypt(key, header, solid_block_idx, payload, aad=b"vfa-data")
-                data = decompress_block(header.default_method, payload)
-                data_total += len(data)
-                solid_block_idx += 1
-            if data_total != total_expected:
-                print("Solid size mismatch"); return
-            print(f"Tested {sum(1 for e in toc.entries if e.entry_type==ET_FILE)} files in SOLID stream: OK.")
-        else:
-            blocks=0
-            for e in toc.entries:
-                if e.entry_type!=ET_FILE: continue
-                for (idx, usz, csz, meth) in e.blocks:
-                    hdr=br.read(5); 
-                    if len(hdr)<5: print("Unexpected EOF"); return
-                    blen=struct.unpack("<I", hdr[:4])[0]; mm=hdr[4]
-                    payload=br.read(blen); 
-                    if key is not None: payload=aead_decrypt(key, header, idx, payload, aad=b"vfa-data")
-                    data=decompress_block(meth, payload)
-                    if len(data)!=usz: print("Size mismatch"); return
-                    blocks+=1
-            print(f"Tested {sum(1 for e in toc.entries if e.entry_type==ET_FILE)} files, {blocks} blocks: OK.")
+    with vx.open_container(args.archive) as c:
+        ok = c.verify_digest()
+        print(f"Footer hash ({vx.HASH_NAMES.get(c.hash_kind, c.hash_kind)}) match: {'OK' if ok else ('FAIL' if ok is False else 'none stored')}")
+        _unlock(c, args)
+        try:
+            st = c.test()
+        except VFAError as e:
+            print(f"Block check: FAIL - {e}"); raise SystemExit(1)
+        nfiles = sum(1 for e in c.entries if e["entry_type"]==ET_FILE)
+        crc = ", CRC32 verified" if c.has_tocx else ", no block CRCs (VFA 1.0 archive)"
+        unit = "chunks" if getattr(c, "format", "VFA1") == "VFA2" else "blocks"
+        print(f"Tested {nfiles} files{' in SOLID stream' if c.solid else ''}, {st['blocks']} {unit}{crc}: OK.")
+        if ok is False: raise SystemExit(1)
 
 def cmd_extract(args):
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd extract")
-    outdir=pathlib.Path(args.output or "."); outdir.mkdir(parents=True, exist_ok=True)
-    with open(args.archive,"rb") as f:
-        br=f; header=HeaderV1.unpack(br); toc_off,toc_sz,hk,digest=read_footer(br)
-        br.seek(toc_off); toc_data=br.read(toc_sz); key=None
-        if header.flags & F_ENCRYPTED:
-            if not args.password: raise SystemExit("Archive is encrypted; use --password")
-            pw=getpass.getpass("Password: ").encode(); key=kdf_derive_key(pw, header)
-            toc_data=aead_decrypt(key, header, 0xFFFFFFFFFFFFFFFF, toc_data, aad=b"vfa-toc")
-        toc=TOC.unpack(toc_data, solid=bool(header.flags & F_SOLID))
-        br.seek(len(header.pack()))
+    outdir = args.output or "."
+    with vx.open_container(args.archive) as c:
+        if not args.no_verify:
+            if c.verify_digest() is False:
+                raise VFAError("Integrity check FAILED: the archive is corrupted or was modified (--no-verify to try anyway).")
+        elif not c.has_tocx:
+            LOGGER.warning("This is a VFA 1.0 archive without block CRCs: with --no-verify, corruption can go undetected.")
+        _unlock(c, args)
 
-        dirs=[e for e in toc.entries if e.entry_type==ET_DIR]
-        syms=[e for e in toc.entries if e.entry_type==ET_SYMLINK]
-        hlinks=[e for e in toc.entries if e.entry_type==ET_HARDLINK]
-        files=[e for e in toc.entries if e.entry_type==ET_FILE]
-
-        for e in dirs:
-            out_path = outdir / e.path
-            out_path.mkdir(parents=True, exist_ok=True)
-            try: os.chmod(out_path, e.mode)
-            except Exception: pass
-            try: os.utime(out_path, (e.mtime, e.mtime))
-            except Exception: pass
-            if e.meta_json and WIN:
-                try: win_apply_meta(str(out_path), json.loads(e.meta_json.decode()), True)
+        def after(e, out_path):
+            meta = None
+            if e["meta"]:
+                try: meta = json.loads(e["meta"].decode("utf-8"))
+                except Exception: LOGGER.warning(f"Unreadable metadata for {e['path']}")
+            et = e["entry_type"]
+            if et == ET_DIR:
+                if not WIN:
+                    try: os.chmod(out_path, e["mode"] & (0o7777 if args.posixmeta else 0o777))
+                    except Exception: pass
+                _set_mtime(out_path, e)
+            if not meta: return
+            if WIN and et in (ET_DIR, ET_FILE) and isinstance(meta.get("win"), dict):
+                try: win_apply_meta(out_path, meta["win"], et == ET_DIR, full=args.winmeta)
                 except Exception: pass
-            if e.meta_json and LIN and args.posixmeta:
+            if LIN and args.posixmeta:
+                pos = meta.get("posix", {})
                 try:
-                    meta=json.loads(e.meta_json.decode()); pos=meta.get("posix",{})
-                    try: os.chown(out_path, pos.get("uid", -1), pos.get("gid", -1))
-                    except Exception: pass
-                    if args.xattrs and "xattrs" in meta:
-                        apply_xattrs(str(out_path), {k:bytes.fromhex(v) for k,v in meta["xattrs"].items()}, follow_symlinks=False)
-                    if args.acl and meta.get("acl"): setfacl_restore(meta["acl"], str(out_path))
+                    if et == ET_SYMLINK: os.lchown(out_path, pos.get("uid",-1), pos.get("gid",-1))
+                    else: os.chown(out_path, pos.get("uid",-1), pos.get("gid",-1))
                 except Exception: pass
-            LOGGER.trace(f"Created directory {e.path}")
-
-        solid_concat=None
-        if header.flags & F_SOLID:
-            parts=[]
-            solid_block_idx = 0
-            while br.tell() < toc_off:
-                hdr=br.read(5)
-                if len(hdr)<5: break
-                blen=struct.unpack("<I", hdr[:4])[0];
-                meth=hdr[4]
-                payload=br.read(blen)
-                if key is not None:
-                    payload=aead_decrypt(key, header, solid_block_idx, payload, aad=b"vfa-data")
-                parts.append(decompress_block(header.default_method, payload))
-                solid_block_idx += 1
-            solid_concat=b"".join(parts)
-
-        for e in syms:
-            out_path = outdir / e.path
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            target=""
-            try:
-                meta=json.loads(e.meta_json.decode()); target=meta.get("link_target","")
-            except Exception: pass
-            try:
-                if LIN:
-                    try: os.remove(out_path)
-                    except Exception: pass
-                    os.symlink(target, out_path)
-                    try: os.lchmod(out_path, e.mode)
-                    except Exception: pass
-                    if args.posixmeta and "posix" in meta:
-                        pos=meta["posix"]
-                        try: os.lchown(out_path, pos.get("uid",-1), pos.get("gid",-1))
-                        except Exception: pass
-                    if args.xattrs and "xattrs" in meta:
-                        apply_xattrs(str(out_path), {k:bytes.fromhex(v) for k,v in meta["xattrs"].items()}, follow_symlinks=False)
-            except Exception: pass
-            LOGGER.trace(f"Created symlink {e.path} -> {target}")
-
-        for e in files:
-            LOGGER.debug(f"Extracting {e.path}")
-            out_path = outdir / e.path
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            if header.flags & F_SOLID:
-                segment = solid_concat[e.start_off: e.start_off + e.size]
-                with open(out_path, "wb") as fw: fw.write(segment)
-            else:
-                with open(out_path, "wb") as fw:
-                    for (idx, usz, csz, meth) in e.blocks:
-                        hdr=br.read(5)
-                        if len(hdr)<5: raise IOError("Unexpected EOF")
-                        blen=struct.unpack("<I", hdr[:4])[0]; mm=hdr[4]
-                        payload=br.read(blen)
-                        if len(payload)!=blen: raise IOError("Unexpected EOF payload")
-                        if key is not None: payload=aead_decrypt(key, header, idx, payload, aad=b"vfa-data")
-                        data=decompress_block(meth, payload)
-                        if len(data)!=usz: raise IOError("Size mismatch in block")
-                        fw.write(data)
-            try: os.chmod(out_path, e.mode)
-            except Exception: pass
-            try: os.utime(out_path, (e.mtime, e.mtime))
-            except Exception: pass
-
-            if e.meta_json and WIN:
-                try: win_apply_meta(str(out_path), json.loads(e.meta_json.decode()), False)
-                except Exception: pass
-
-            if e.meta_json and LIN and args.posixmeta:
                 try:
-                    meta=json.loads(e.meta_json.decode()); pos=meta.get("posix",{})
-                    try: os.chown(out_path, pos.get("uid",-1), pos.get("gid",-1))
-                    except Exception: pass
                     if args.xattrs and "xattrs" in meta:
-                        apply_xattrs(str(out_path), {k:bytes.fromhex(v) for k,v in meta["xattrs"].items()}, follow_symlinks=False)
-                    if args.acl and meta.get("acl"): setfacl_restore(meta["acl"], str(out_path))
-                    if args.sparse and "holes" in meta and LIN:
+                        apply_xattrs(out_path, {k:bytes.fromhex(v) for k,v in meta["xattrs"].items()}, follow_symlinks=False)
+                    if args.acl and meta.get("acl") and et != ET_SYMLINK: setfacl_restore(meta["acl"], out_path)
+                    if args.sparse and "holes" in meta and et == ET_FILE:
                         with open(out_path, "r+b") as fw:
                             for off, ln in meta["holes"]:
                                 fallocate_punch_hole(fw.fileno(), off, ln)
                 except Exception: pass
+            LOGGER.trace(f"Restored metadata for {e['path']}")
 
-            LOGGER.debug(f"Extracted {e.path}")
-
-        for e in hlinks:
-            out_path = outdir / e.path
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            target=""
-            try:
-                meta=json.loads(e.meta_json.decode()); target=meta.get("hardlink_to","")
-            except Exception: pass
-            try:
-                if target:
-                    src = outdir / target
-                    if src.exists():
-                        try:
-                            if out_path.exists(): os.remove(out_path)
-                        except Exception: pass
-                        os.link(src, out_path)
-                        LOGGER.trace(f"Created hardlink {e.path} -> {target}")
-            except Exception: pass
+        files, dirs = c.extract(outdir, members=args.members or None, links=LIN,
+                                keep_mode_bits=(0o7777 if args.posixmeta else 0o777), after_entry=after)
+        LOGGER.info(f"Extracted {len(files)} file(s) to {outdir}")
 
 def cmd_append(args):
+    """Append files. Non-solid: new blocks per file. Solid: the new files continue the solid stream in new
+    blocks (existing blocks are never rewritten). The archive is upgraded to VFA 1.1 (block table, SHA-256)."""
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd append")
-    with open(args.archive, "r+b") as f:
-        header,toc,key,toc_offset,toc_size,hash_kind,old_digest=_load_header_toc_and_key(f, need_password=args.password)
-        if header.flags & F_SOLID:
-            raise SystemExit("Append not supported for SOLID archives. Recreate or use non-solid.")
-        next_block=sum(len(e.blocks) for e in toc.entries if e.entry_type==ET_FILE)
-        f.seek(toc_offset); f.truncate()
+    with vx.open_container(args.archive) as c:
+        if getattr(c, "format", "VFA1") == "VFA2":
+            raise SystemExit("Append to VFA2 archives is not implemented yet (the format allows it; see VFA2.md)")
+        if c.arc_start != 0: raise SystemExit("Append works on a plain .vfa, not on an SFX/SFI executable")
+        if c.verify_digest() is False: raise SystemExit("Refusing to append: archive integrity check FAILED")
+        _unlock(c, args)
+        h = c.header
+        header = HeaderV1(h["version"], h["flags"], h["default_method"], h["default_level"], h["block_exp"],
+                          h["threads"], h["ram_mib"], h["kdf_id"], h["kdf_t"], h["kdf_m"], h["kdf_p"],
+                          h["salt"], h["aead_id"], h["nonce_prefix"], h["reserved"])
+        if c.solid and any(b.usz is None for b in c.blocks):   # VFA 1.0 solid: learn block sizes once
+            LOGGER.info("Upgrading block table (decoding existing solid blocks once)...")
+            pos = 0
+            for i, b in enumerate(c.blocks):
+                d = c.block_data(i, limit=c.stream_len - pos); b.usz = len(d); b.crc = vx.crc32(d); pos += len(d)
+        recs = [(b.off, b.csz, b.usz if b.usz is not None else 0, b.method, b.crc) for b in c.blocks]
+        toc = TOC([FileEntry(e["path"], e["mode"], e["mtime"], e["size"], list(e["blocks"]), e["start_off"],
+                             e["entry_type"], e["meta"] or None) for e in c.entries])
+        key, toc_offset, solid = c.key, c.toc_off, c.solid
+        stream_len = c.stream_len if solid else 0
+        with open(args.archive, "rb") as f:
+            f.seek(toc_offset); old_tail = f.read()          # old TOC + footer, restored if anything fails
+
+    if solid:
+        if args.method and NAME_TO_METHOD[args.method] != header.default_method:
+            raise SystemExit("Solid archives keep one method; --method must match the archive's method")
+        method = header.default_method
+    else:
         method = header.default_method if (not args.method) else NAME_TO_METHOD[args.method]
-        level = header.default_level if (args.level is None) else args.level
-        block_size = 1<<header.block_exp
+    level = header.default_level if (args.level is None) else args.level
+    block_size = 1<<header.block_exp
+    header.flags |= F_TOCX
+    if key is not None:   # a rewritten TOC must never reuse the old TOC's nonce
+        gen = struct.unpack("<I", header.reserved[:4])[0] + 1
+        header.reserved = struct.pack("<I", gen) + header.reserved[4:]
 
-        # Plan progress only for new files being appended
-        items = list(iter_tree(args.inputs))
-        file_items = [it for it in items if it[2] == ET_FILE]
-        total_files = len(file_items)
-        total_bytes = sum(int(getattr(st, "st_size", 0)) for _, st, _ in file_items)
-        prog = Progress(total_files, total_bytes)
-        LOGGER.info(f"Appending {total_files} files ({human_bytes(total_bytes)})...")
+    items = list(iter_tree(args.inputs))
+    file_items = [it for it in items if it[2] == ET_FILE]
+    prog = Progress(len(file_items), sum(int(getattr(st, "st_size", 0)) for _, st, _ in file_items))
+    LOGGER.info(f"Appending {prog.total_files} files ({human_bytes(prog.total_bytes)})...")
 
-        for fp, st, et in items:
-            if et!=ET_FILE: 
-                LOGGER.trace(f"Skipping non-file during append: {fp}")
-                continue
-            rel = str(fp)
-            st_mode = (st.st_mode & 0o7777)
-            st_mtime = int(getattr(st,"st_mtime", time.time()))
-            size = int(st.st_size)
-            entry=FileEntry(rel, st_mode, st_mtime, size, [], 0, ET_FILE)
-            LOGGER.debug(f"Compressing file {rel} ({human_bytes(size)})")
-            t0 = time.time()
-            with open(rel,"rb") as fr:
-                rem=size
-                while rem>0:
-                    chunk=fr.read(min(block_size, rem)); rem -= len(chunk)
-                    comp=compress_block(method, level, chunk)
-                    payload=comp if key is None else aead_encrypt(key, header, next_block, comp, aad=b"vfa-data")
-                    f.write(struct.pack("<I", len(payload))); f.write(struct.pack("<B", method)); f.write(payload)
-                    entry.blocks.append((next_block, len(chunk), len(payload), method)); next_block += 1
-            toc.entries.append(entry)
-            duration = time.time() - t0
-            prog.add_file(size, duration)
-            arch_so_far = f.tell()
-            elapsed, eta, rate, ratio = prog.estimate()
-            if LOGGER.level >= VLog.LEVELS["debug"]:
-                saved = max(0, prog.done_bytes - (arch_so_far))  # rough
-                ratio_now = (arch_so_far/prog.done_bytes) if prog.done_bytes else 0.0
-                LOGGER.debug(
-                    f"Done {rel} in {duration:.2f}s | "
-                    f"{prog.done_files}/{prog.total_files} files, "
-                    f"{human_bytes(prog.done_bytes)}/{human_bytes(prog.total_bytes)} | "
-                    f"arch {human_bytes(arch_so_far)} | "
-                    f"saved {human_bytes(saved)} | ratio {ratio_now:.3f} | "
-                    f"elapsed {elapsed:.1f}s | eta {('∞' if eta==float('inf') else f'{eta:.1f}s')}"
-                )
-
-        toc_data=toc.pack(solid=False)
-        LOGGER.trace("Writing updated TOC (append)...")
-        if key is not None: toc_data=aead_encrypt(key, header, 0xFFFFFFFFFFFFFFFF, toc_data, aad=b"vfa-toc")
-        toc_new_off=f.tell(); f.write(toc_data); toc_new_sz=len(toc_data)
-        upto=f.tell(); digest=_recompute_hash_until(f, upto, hash_kind if hash_kind!=H_NONE else default_hash_kind())
-        write_footer(f, toc_new_off, toc_new_sz, hash_kind if hash_kind!=H_NONE else default_hash_kind(), digest)
+    with open(args.archive, "r+b") as f:
+        try:
+            f.seek(toc_offset); f.truncate()
+            sink = _BlockSink(f, header, key, None, index=len(recs), recs=recs)
+            ss = _SolidStream(sink, method, level, 1 << DEFAULT_SOLID_CHUNK_EXP) if solid else None
+            if ss: ss.pos = stream_len
+            for fp, st, et in items:
+                if et!=ET_FILE:
+                    LOGGER.trace(f"Skipping non-file during append: {fp}")
+                    continue
+                rel = str(fp); t0 = time.time()
+                entry=FileEntry(rel, st.st_mode & 0o7777, int(getattr(st,"st_mtime", time.time())), 0, [],
+                                ss.pos if ss else 0, ET_FILE)
+                for chunk in _read_pieces(rel, (1 << 20) if ss else block_size):
+                    if ss: ss.write(chunk)
+                    else: entry.blocks.append(sink.put(method, level, chunk))
+                    entry.size += len(chunk)
+                toc.entries.append(entry)
+                prog.add_file(entry.size, time.time() - t0)
+            if ss: ss.flush()
+            f.seek(0); f.write(header.pack())
+            f.seek(0, os.SEEK_END)
+            toc_data = toc.pack(solid=solid, block_recs=sink.recs)
+            if key is not None:
+                toc_data = aead_encrypt(key, header, vx.toc_nonce_index(struct.unpack("<I", header.reserved[:4])[0]), toc_data, aad=b"vfa-toc")
+            toc_new_off=f.tell(); f.write(toc_data)
+            hk = default_hash_kind()
+            digest=_recompute_hash_until(f, f.tell(), hk)
+            f.seek(0, os.SEEK_END)
+            write_footer(f, toc_new_off, len(toc_data), hk, digest)
+        except BaseException:
+            LOGGER.error("Append failed; restoring the original archive")
+            f.seek(0); f.write(HeaderV1(h["version"], h["flags"], h["default_method"], h["default_level"], h["block_exp"],
+                          h["threads"], h["ram_mib"], h["kdf_id"], h["kdf_t"], h["kdf_m"], h["kdf_p"],
+                          h["salt"], h["aead_id"], h["nonce_prefix"], h["reserved"]).pack())
+            f.seek(toc_offset); f.truncate(); f.write(old_tail)
+            raise
         arch_final = f.tell()
-        elapsed, eta, rate, ratio = prog.estimate()
-        saved = max(0, prog.done_bytes - (arch_final - toc_new_sz))  # rough
-        LOGGER.info(
-            f"Append done in {elapsed:.2f}s | files {prog.done_files}/{prog.total_files} | "
-            f"added {human_bytes(prog.done_bytes)} | archive now {human_bytes(arch_final)}"
-        )
-
+    LOGGER.info(f"Append done | files {prog.done_files} | added {human_bytes(prog.done_bytes)} | archive now {human_bytes(arch_final)}")
 
 # ---------- CLI ----------
 def build_argparser():
@@ -1190,10 +1080,14 @@ def build_argparser():
     ap_c.add_argument("inputs", nargs="+", help="Input files/folders to include")
     ap_c.add_argument(
         "--method",
-        default=("zstd" if HAVE_ZSTD else "zlib"),
-        choices=list(NAME_TO_METHOD.keys()),
-        help="Compression method, default zstd",
+        default=None,
+        choices=list(NAME_TO_METHOD.keys()) + ["stored"],
+        help="Compression method, default zstd (VFA2 for now: stored/none only)",
     )
+    ap_c.add_argument("--format", choices=["vfa1", "vfa2"], default="vfa1",
+                      help="Container format (default vfa1; vfa2 is the new chunked format, see VFA2.md)")
+    ap_c.add_argument("--chunk-exp", type=int, default=26, dest="chunk_exp",
+                      help="VFA2: chunk size as power of two (default 2^26 = 64 MiB, max 2^30)")
     ap_c.add_argument(
         "--level",
         type=int,
@@ -1222,7 +1116,7 @@ def build_argparser():
         "--solid-chunk-exp",
         type=int,
         default=None,
-        help="Split solid stream into chunks of 2^N bytes (uncompressed)",
+        help=f"Split solid stream into chunks of 2^N bytes (uncompressed; default 2^{DEFAULT_SOLID_CHUNK_EXP}=64MiB, max 2^{MAX_BLOCK_EXP})",
     )
     ap_c.add_argument(
         "--solid-by",
@@ -1310,9 +1204,18 @@ def build_argparser():
     ap_x.add_argument(
         "--password", action="store_true", help="Prompt for password if encrypted"
     )
+    ap_x.add_argument("members", nargs="*", help="Only extract these archive paths (a directory selects everything below it)")
+    ap_x.add_argument("--no-verify", action="store_true", help="Skip the whole-archive digest check (blocks are still size/CRC checked)")
+    ap_x.add_argument("--winmeta", action="store_true", help="Windows: also restore owner/ACL (SDDL) and alternate data streams")
+    ap_x.add_argument("--posixmeta", action="store_true", help="Linux/Unix: restore uid/gid and setuid/setgid/sticky bits")
+    ap_x.add_argument("--xattrs", action="store_true", help="Restore extended attributes (with --posixmeta)")
+    ap_x.add_argument("--acl", action="store_true", help="Restore POSIX ACLs (with --posixmeta)")
+    ap_x.add_argument("--sparse", action="store_true", help="Re-punch sparse holes (with --posixmeta, Linux)")
 
-    # Logging flags for all subcommands
+    # Logging + non-interactive password flags for all subcommands
     for sp in (ap_c, ap_a, ap_l, ap_t, ap_x):
+        sp.add_argument("--password-env", metavar="VAR", help="Read the password from environment variable VAR (implies --password)")
+        sp.add_argument("--password-file", metavar="FILE", help="Read the password from FILE, trailing newline stripped (implies --password)")
         sp.add_argument("--log-level",
             choices=["quiet","error","warning","info","debug","trace"],
             default="warning",
@@ -1326,17 +1229,28 @@ def main(argv=None):
     # set global logger
     global LOGGER
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa runner main")
-    ap=build_argparser(); args=ap.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):    # a legacy console code page must not crash `vfa l` on a Unicode name
+        try: stream.reconfigure(errors="backslashreplace")
+        except Exception: pass
+    ap=build_argparser(); args, extra = ap.parse_known_args(argv)
+    # `vfa x a.vfa -o out some/member` - argparse cannot put positionals after options on its own
+    if extra and args.cmd == "x" and not any(x.startswith("-") for x in extra): args.members += extra
+    elif extra: ap.error("unrecognized arguments: " + " ".join(extra))
     # verbose alias
     if getattr(args, "verbose", False) and getattr(args, "log_level", None) == "warning":
         args.log_level = "info"
     LOGGER = VLog(getattr(args, "log_level", "warning"))
+    vx.set_logger(vx.VLog(getattr(args, "log_level", "warning")))
 
-    if args.cmd=="c": cmd_create(args)
-    elif args.cmd=="a": cmd_append(args)
-    elif args.cmd=="l": cmd_list(args)
-    elif args.cmd=="t": cmd_test(args)
-    elif args.cmd=="x": cmd_extract(args)
-    else: ap.print_help()
+    try:
+        if args.cmd=="c": cmd_create(args)
+        elif args.cmd=="a": cmd_append(args)
+        elif args.cmd=="l": cmd_list(args)
+        elif args.cmd=="t": cmd_test(args)
+        elif args.cmd=="x": cmd_extract(args)
+        else: ap.print_help()
+    except VFAError as e:
+        print(f"vfa: error: {e}", file=sys.stderr)
+        raise SystemExit(e.code or 1)
 
 if __name__=="__main__": main()

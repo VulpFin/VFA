@@ -1,0 +1,731 @@
+# Copyright (C) 2025 TG11  -  AGPL-3.0-or-later (see LICENSE)
+#!/usr/bin/env python3
+"""
+VFA correctness harness (VFA1 and VFA2). No pytest needed:
+
+    python test_vfa.py                  # both formats, everything except the 4 GiB tests (several minutes)
+    python test_vfa.py --format vfa2    # one format: vfa1 | vfa2 | all (default)
+    python test_vfa.py --quick          # smaller fuzz run
+    python test_vfa.py --big            # also the >4 GiB single-file tests (needs ~13 GB free, slow)
+    python test_vfa.py --fuzz 5000      # more fuzz cases per archive (default 600)
+    python test_vfa.py --only fuzz,ra   # groups: roundtrip,sample,encrypt,append,ra,refuse,paths,fuzz,determinism,sfx,signed,big
+
+What "pass" means:
+  roundtrip     every file comes back byte-identical (all methods x solid/non-solid, multi-block, edge-case files)
+  fuzz          a corrupted/truncated archive either raises VFAError or extracts byte-identical output:
+                never another exception (crash), never a hang, never different bytes
+  ra            one small member extracted from the middle of a large archive touches only its own blocks
+  refuse        unknown version / flags / extension records / methods / entry types are refused by name
+  determinism   same input + options -> byte-identical archive (no native codec yet: the -O0/-O3 check is SKIP)
+Failing fuzz inputs are saved to ./fuzz_failures/ for reproduction.
+"""
+import os, sys, io, json, struct, shutil, hashlib, random, tempfile, subprocess, pathlib, time, contextlib, traceback, argparse
+import multiprocessing as mp
+from typing import Tuple
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import vfa_extract as vx
+
+PY = sys.executable
+FAILS = []; SKIPS = []
+
+def check(name, cond, extra=""):
+    print(("PASS  " if cond else "FAIL  ") + name + (f"   {extra}" if extra and not cond else ""), flush=True)
+    if not cond: FAILS.append(name)
+    return cond
+
+def skip(name, why):
+    print(f"SKIP  {name}   ({why})", flush=True); SKIPS.append(name)
+
+# ---------------------------------------------------------------- helpers
+
+def vfa(*argv, cwd=None, env=None, expect=0):
+    """Run vfa.py in a subprocess (exactly what a user runs). Returns CompletedProcess."""
+    e = dict(os.environ); e.update(env or {})
+    r = subprocess.run([PY, str(HERE / "vfa.py"), *map(str, argv)], capture_output=True, text=True, cwd=cwd, env=e)
+    if expect is not None and r.returncode != expect:
+        print(f"      vfa {' '.join(map(str, argv))} -> exit {r.returncode}\n      {r.stdout[-400:]}{r.stderr[-800:]}")
+    return r
+
+def tree(d):
+    """{relative posix path: sha256} for files, plus '<dir>/' markers for directories."""
+    d = pathlib.Path(d); out = {}
+    for p in d.rglob("*"):
+        rel = p.relative_to(d).as_posix()
+        out[rel + "/" if p.is_dir() else rel] = "" if p.is_dir() else hashlib.sha256(p.read_bytes()).hexdigest()
+    return out
+
+def same_tree(a, b):
+    ta, tb = tree(a), tree(b)
+    if ta == tb: return True, ""
+    diff = sorted(set(ta.items()) ^ set(tb.items()))[:6]
+    return False, f"differs: {diff}"
+
+def make_corpus(root: pathlib.Path):
+    """The edge-case corpus from the M2 list (the exe comes from the running Python)."""
+    rnd = random.Random(1234)
+    (root / "nested/deeper/deepest").mkdir(parents=True); (root / "emptydir").mkdir()
+    (root / "empty.bin").write_bytes(b"")
+    (root / "one.bin").write_bytes(b"\x7f")
+    (root / "repetitive.txt").write_bytes(b"All work and no play makes VFA a dull archiver.\n" * 100_000)
+    (root / "random.bin").write_bytes(rnd.randbytes(3 * 1024 * 1024))
+    (root / "allbytes.bin").write_bytes(bytes(range(256)) * 257)
+    text = ("Grüße aus Zürich - 日本語のテキスト - Ελληνικά - русский - العربية - emoji 🦊🐟\n"
+            "The quick brown fox jumps over the lazy dog. 0123456789\n") * 3000
+    (root / "utf8.txt").write_text(text, encoding="utf-8")
+    (root / "utf16.txt").write_text(text, encoding="utf-16")
+    rows = ["id,timestamp,sensor,value,flag"] + [f"{i},{1700000000 + i * 7},{'ABCD'[i % 4]},{rnd.gauss(20, 5):.4f},{i % 3 == 0}" for i in range(60_000)]
+    (root / "data.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    shutil.copyfile(sys.executable, root / "program.exe")
+    (root / "nested/deeper/deepest/note.txt").write_text("deep\n")
+    (root / "nested/unicode_éè_日本.txt").write_text("unicode name\n", encoding="utf-8")
+    (root / "block_exact.bin").write_bytes(rnd.randbytes(4096 * 3))       # exactly 3 blocks at --block-exp 12
+    (root / "block_plus1.bin").write_bytes(rnd.randbytes(4096 * 3 + 1))
+    return root
+
+def extract_cmp(arc, src_dir, work, *extra, env=None, label=""):
+    out = work / ("out_" + hashlib.md5(str(arc).encode()).hexdigest()[:8])
+    shutil.rmtree(out, ignore_errors=True)
+    r = vfa("x", arc, "-o", out, *extra, env=env)
+    if r.returncode != 0: return False, r.stderr[-300:]
+    return same_tree(src_dir, out / src_dir.name)
+
+# ---------------------------------------------------------------- a tiny independent writer (follows VFA1.md)
+
+def raw_archive(path, files, *, solid=False, method=0, frame_method=None, version=1, extra_flags=0, tocx=True,
+                extra_tocx=(), entry_type=0, toc_trailing=b"", encrypt=None):
+    """Write a VFA1 archive by hand from the spec, so tests can produce what vfa.py never would.
+    files: list of (path, bytes). method 0 stores data as-is; frame_method overrides the method byte everywhere."""
+    import vfa as V
+    meth = method if frame_method is None else frame_method
+    flags = (vx.F_SOLID if solid else 0) | (vx.F_TOCX if tocx else 0) | extra_flags
+    hdr = V.HeaderV1(); hdr.version = version; hdr.flags = flags; hdr.default_method = meth
+    out = bytearray(hdr.pack()); recs = []; toc = V.TOC()
+    def put(data):
+        comp = V.compress_block(method, 1, data) if frame_method is None else data
+        recs.append((len(out), len(comp), len(data), meth, vx.crc32(data)))
+        out.extend(struct.pack("<IB", len(comp), meth)); out.extend(comp)
+        return (len(recs) - 1, len(data), len(comp), meth)
+    if solid:
+        stream = b"".join(d for _, d in files); pos = 0
+        for p, d in files:
+            toc.entries.append(V.FileEntry(p, 0o644, 1_700_000_000, len(d), [], pos, entry_type)); pos += len(d)
+        if stream: put(stream)
+    else:
+        for p, d in files:
+            e = V.FileEntry(p, 0o644, 1_700_000_000, len(d), [], 0, entry_type)
+            if d: e.blocks.append(put(d))
+            toc.entries.append(e)
+    body = toc.pack(solid)
+    if tocx:
+        recs_b = struct.pack("<I", len(recs)) + b"".join(vx.BLOCK_REC.pack(o, c, u, m, vx.BF_CRC, k) for o, c, u, m, k in recs)
+        rec_list = [(vx.TX_TOCCRC, vx.TXF_CRITICAL, struct.pack("<I", vx.crc32(body))),
+                    (vx.TX_BLOCKS, vx.TXF_CRITICAL, recs_b), *extra_tocx]
+        body += vx.TOCX_MAGIC + struct.pack("<I", len(rec_list)) + b"".join(struct.pack("<HHI", t, f, len(b)) + b for t, f, b in rec_list)
+    body += toc_trailing
+    toc_off = len(out); out += body
+    digest = hashlib.sha256(bytes(out)).digest()
+    out += struct.pack("<QIB", toc_off, len(body), vx.H_SHA256) + digest + vx.END_MAGIC
+    pathlib.Path(path).write_bytes(bytes(out))
+    return path
+
+def open_extract(path, dest, password=None, verify=True, members=None):
+    with vx.open_container(str(path)) as c:
+        if verify and c.verify_digest() is False: raise vx.VFAError("digest mismatch")
+        c.unlock(password)
+        return c.extract(str(dest), members=members)
+
+# ---------------------------------------------------------------- test groups
+
+def t_roundtrip(work, corpus):
+    import vfa as V
+    for m in V.NAME_TO_METHOD:
+        for solid in (False, True):
+            arc = work / f"rt_{m}_{'s' if solid else 'n'}.vfa"
+            flags = ["--solid", "--solid-chunk-exp", "20"] if solid else ["--block-exp", "16"]
+            r = vfa("c", arc, corpus.name, "--method", m, "--level", "3", *flags, cwd=corpus.parent)
+            if not check(f"roundtrip create {m} {'solid' if solid else 'non-solid'}", r.returncode == 0, r.stderr[-300:]): continue
+            check(f"roundtrip test   {m} {'solid' if solid else 'non-solid'}", vfa("t", arc).returncode == 0)
+            ok, why = extract_cmp(arc, corpus, work)
+            check(f"roundtrip bytes  {m} {'solid' if solid else 'non-solid'}", ok, why)
+    arc = work / "rt_blocks12.vfa"
+    vfa("c", arc, corpus.name, "--method", "zstd", "--block-exp", "12", cwd=corpus.parent)
+    with vx.Container(str(arc)) as c:
+        c.unlock(None)
+        e = next(e for e in c.entries if e["path"].replace("\\", "/").endswith("block_exact.bin"))
+        e2 = next(e for e in c.entries if e["path"].replace("\\", "/").endswith("block_plus1.bin"))
+        check("block boundaries: exact multiple -> 3 blocks, +1 byte -> 4 blocks", len(e["blocks"]) == 3 and len(e2["blocks"]) == 4,
+              f"{len(e['blocks'])}/{len(e2['blocks'])}")
+    ok, why = extract_cmp(arc, corpus, work); check("roundtrip bytes  4 KiB blocks", ok, why)
+
+def t_sample(work):
+    src = HERE / "sample"
+    stage = work / "sample_copy"; shutil.rmtree(stage, ignore_errors=True)
+    shutil.copytree(src, stage / "sample", ignore=shutil.ignore_patterns("__pycache__"))
+    for m, flags in (("zstd", []), ("zstd", ["--solid"]), ("xz", ["--solid"]), ("none", [])):
+        arc = work / f"sample_{m}_{len(flags)}.vfa"
+        vfa("c", arc, "sample", "--method", m, *flags, cwd=stage)
+        ok, why = extract_cmp(arc, stage / "sample", work)
+        check(f"sample\\ round-trip ({m}{' solid' if flags else ''})", ok, why)
+
+def t_encrypt(work, corpus):
+    env = {"VFA_TEST_PW": "correct horse ☃"}; kdf = ["--kdf-mem-kib", "8192", "--kdf-time", "1", "--kdf-parallel", "1"]
+    for solid in (False, True):
+        arc = work / f"enc_{solid}.vfa"
+        vfa("c", arc, corpus.name, "--password-env", "VFA_TEST_PW", *kdf, *(["--solid"] if solid else []), cwd=corpus.parent, env=env)
+        ok, why = extract_cmp(arc, corpus, work, "--password-env", "VFA_TEST_PW", env=env)
+        check(f"encrypted round-trip ({'solid' if solid else 'non-solid'})", ok, why)
+        out = work / "wrongpw"; shutil.rmtree(out, ignore_errors=True)
+        r = vfa("x", arc, "-o", out, "--password-env", "VFA_TEST_PW", env={"VFA_TEST_PW": "wrong"}, expect=None)
+        check(f"wrong password -> exit 5, nothing written ({'solid' if solid else 'non-solid'})",
+              r.returncode == 5 and not any(p.is_file() for p in out.rglob("*")), f"exit {r.returncode}")
+        r = vfa("l", arc, expect=None)
+        check("encrypted list without password refuses", r.returncode != 0)
+
+def t_append(work, corpus):
+    extra = work / "extra_in"; shutil.rmtree(extra, ignore_errors=True); (extra / "more").mkdir(parents=True)
+    (extra / "more/a.txt").write_text("appended\n"); (extra / "more/b.bin").write_bytes(os.urandom(70_000))
+    env = {"VFA_TEST_PW": "pw"}
+    for solid in (False, True):
+        for enc in (False, True):
+            tag = f"{'solid' if solid else 'non-solid'}{' encrypted' if enc else ''}"
+            arc = work / f"app_{solid}_{enc}.vfa"
+            pwf = ["--password-env", "VFA_TEST_PW"] if enc else []
+            vfa("c", arc, corpus.name, *pwf, "--kdf-mem-kib", "8192", "--kdf-time", "1", *(["--solid"] if solid else []), cwd=corpus.parent, env=env)
+            r1 = vfa("a", arc, "more", *pwf, cwd=extra, env=env); r2 = vfa("a", arc, "more/a.txt", *pwf, cwd=extra, env=env)
+            out = work / "app_out"; shutil.rmtree(out, ignore_errors=True)
+            r = vfa("x", arc, "-o", out, *pwf, env=env)
+            ok = r1.returncode == 0 and r2.returncode == 0 and r.returncode == 0 and same_tree(corpus, out / corpus.name)[0] \
+                and (out / "more/b.bin").read_bytes() == (extra / "more/b.bin").read_bytes()
+            check(f"append twice + full round-trip ({tag})", ok, r1.stderr[-200:] + r2.stderr[-200:] + r.stderr[-200:])
+            check(f"append: archive still tests OK ({tag})", vfa("t", arc, *pwf, env=env).returncode == 0)
+            if enc:
+                with vx.Container(str(arc)) as c:
+                    check(f"append: TOC nonce generation advanced to 2 ({tag})", c.header["toc_gen"] == 2, str(c.header["toc_gen"]))
+    # a VFA 1.0 archive (no block table) is upgraded on append
+    leg = raw_archive(work / "legacy10.vfa", [("l/a.txt", b"hello " * 1000), ("l/b.txt", b"world")], solid=True, method=vx.M_ZLIB, tocx=False)
+    r = vfa("a", leg, "more/a.txt", cwd=extra)
+    with vx.Container(str(leg)) as c:
+        c.unlock(None); st = c.test()
+        check("append upgrades a VFA 1.0 solid archive to a block table", r.returncode == 0 and c.has_tocx and st["blocks"] == 2)
+
+def t_random_access(work):
+    big = work / "ra_src"; shutil.rmtree(big, ignore_errors=True); (big / "d").mkdir(parents=True)
+    rnd = random.Random(7); needle = b"NEEDLE-" + rnd.randbytes(5000)
+    for i in range(24):
+        (big / f"d/f{i:02d}.bin").write_bytes(rnd.randbytes(4 * 1024 * 1024))
+        if i == 12: (big / "d/f12_needle.bin").write_bytes(needle)
+    for solid in (False, True):
+        arc = work / f"ra_{solid}.vfa"
+        vfa("c", arc, big.name, "--method", "zstd", "--level", "1", *(["--solid", "--solid-chunk-exp", "22"] if solid else []), cwd=big.parent)
+        with vx.Container(str(arc)) as c:
+            c.unlock(None); calls = []; orig = c.block_data
+            c.block_data = lambda i, limit=None: (calls.append(i), orig(i, limit=limit))[1]
+            out = work / "ra_out"; shutil.rmtree(out, ignore_errors=True)
+            t0 = time.perf_counter(); c.extract(str(out), members=["ra_src/d/f12_needle.bin"]); dt = time.perf_counter() - t0
+            got = (out / "ra_src/d/f12_needle.bin").read_bytes()
+            check(f"random access ({'solid' if solid else 'non-solid'}): member byte-identical", got == needle)
+            check(f"random access ({'solid' if solid else 'non-solid'}): decoded {len(calls)} of {len(c.blocks)} blocks in {dt*1000:.0f} ms",
+                  len(calls) <= 2 and len(c.blocks) >= 20, f"blocks {calls}")
+            check(f"random access ({'solid' if solid else 'non-solid'}): nothing else written",
+                  [p.name for p in out.rglob("*") if p.is_file()] == ["f12_needle.bin"])
+
+def t_refuse(work):
+    def refused(name, path, needle, verify=True):
+        try:
+            open_extract(path, work / "refuse_out", verify=verify)
+            return check(name, False, "was accepted")
+        except vx.VFAError as e:
+            return check(name, needle.lower() in str(e).lower(), f"message: {e}")
+        except Exception as e:
+            return check(name, False, f"crashed: {e!r}")
+    f = [("r/a.txt", b"payload " * 100)]
+    refused("refuse: header version 2", raw_archive(work / "v2.vfa", f, version=2), "version 2")
+    refused("refuse: unknown header flag", raw_archive(work / "flag.vfa", f, extra_flags=1 << 9), "feature flags")
+    refused("refuse: unknown critical TOC extension", raw_archive(work / "crit.vfa", f, extra_tocx=[(77, vx.TXF_CRITICAL, b"x")]), "extension type 77")
+    try:
+        open_extract(raw_archive(work / "opt.vfa", f, extra_tocx=[(78, 0, b"future")]), work / "opt_out")
+        check("accept: unknown optional TOC extension is ignored", (work / "opt_out/r/a.txt").read_bytes() == f[0][1])
+    except Exception as e: check("accept: unknown optional TOC extension is ignored", False, repr(e))
+    refused("refuse: unknown compression method 99", raw_archive(work / "m99.vfa", f, frame_method=99), "method 99")
+    refused("refuse: unknown entry type 9", raw_archive(work / "et9.vfa", f, entry_type=9), "entry type 9")
+    refused("refuse: trailing bytes after the TOC", raw_archive(work / "trail.vfa", f, tocx=False, toc_trailing=b"junk"), "trailing")
+    p = raw_archive(work / "vfa2.vfa", f); b = bytearray(p.read_bytes()); b[-5:] = b"/VFA2"; p.write_bytes(bytes(b))
+    try: vx.Container(str(p)); check("refuse: VFA1 reader names a /VFA2 file as a different format", False, "accepted")
+    except vx.VFAError as e: check("refuse: VFA1 reader names a /VFA2 file as a different format", "different vfa format" in str(e).lower(), str(e))
+    refused("refuse: a VFA1 body behind a /VFA2 end magic is rejected by the VFA2 reader", p, "")
+
+def t_paths(work):
+    bad = ["../evil.txt", "/abs_evil.txt", "C:/drive_evil.txt", "a/../../evil2.txt", "ok/../../../evil3.txt"]
+    if os.name == "nt": bad += ["CON", "nested/aux.txt", "file.txt:ads"]
+    for p in bad:
+        arc = raw_archive(work / "bad.vfa", [("fine.txt", b"x"), (p, b"evil")])
+        dest = work / "jail" / "inner"; shutil.rmtree(work / "jail", ignore_errors=True); dest.mkdir(parents=True)
+        try:
+            open_extract(arc, dest); check(f"path refused: {p!r}", False, "was extracted")
+        except vx.VFAError:
+            outside = [q for q in (work / "jail").rglob("*") if q.is_file()]
+            check(f"path refused before writing anything: {p!r}", not outside, str(outside))
+        except Exception as e:
+            check(f"path refused: {p!r}", False, f"crashed: {e!r}")
+    import vfa as V
+    ok = all(not V._safe_ads_name(n) for n in (":..\\..\\evil", ":a/b", "x:y", None)) and V._safe_ads_name(":Zone.Identifier:$DATA")
+    check("Windows ADS names with path separators are rejected", ok)
+
+def t_determinism(work, corpus):
+    for m, flags in (("zstd", []), ("xz", ["--solid"]), ("none", [])):
+        a1, a2 = work / "det1.vfa", work / "det2.vfa"
+        vfa("c", a1, corpus.name, "--method", m, *flags, cwd=corpus.parent); vfa("c", a2, corpus.name, "--method", m, *flags, cwd=corpus.parent)
+        check(f"determinism: same input -> identical archive ({m}{' solid' if flags else ''})", a1.read_bytes() == a2.read_bytes())
+    skip("determinism: native codec at -O0 vs -O3", "VFA1 has no native codec; this check arrives with the VFA2 C coder (M3)")
+
+def t_sfx(work, corpus):
+    arc = work / "sfx.vfa"; vfa("c", arc, corpus.name, "--solid", cwd=corpus.parent)
+    exe = work / "fake_sfx.exe"; exe.write_bytes(b"MZ" + os.urandom(5000) + arc.read_bytes())
+    out = work / "sfx_out"; shutil.rmtree(out, ignore_errors=True)
+    r = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(exe), "-o", str(out)], capture_output=True, text=True)
+    check("SFX stub extracts stub+archive", r.returncode == 0 and same_tree(corpus, out / corpus.name)[0], r.stderr[-300:])
+    b = bytearray(exe.read_bytes()); b[len(b) // 2] ^= 0x10; exe.write_bytes(bytes(b))
+    out2 = work / "sfx_out2"; shutil.rmtree(out2, ignore_errors=True)
+    r = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(exe), "-o", str(out2)], capture_output=True, text=True)
+    check("SFX stub refuses a corrupted file and writes nothing", r.returncode != 0 and (not out2.exists() or not any(out2.rglob("*"))))
+
+# ---------------------------------------------------------------- fuzzing
+
+def _fuzz_worker(job):
+    """Runs in a pool process. Returns (kind, detail). kind in refused / identical / WRONG / CRASH."""
+    data, verify, password, want = job
+    import vfa_extract as vxw
+    vxw.set_logger(vxw.VLog("quiet"))
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        p = os.path.join(td, "f.vfa"); open(p, "wb").write(data)
+        dest = os.path.join(td, "out")
+        try:
+            with vxw.open_container(p) as c:
+                if verify and c.verify_digest() is False: raise vxw.VFAError("digest mismatch")
+                c.unlock(password); c.extract(dest)
+        except vxw.VFAError as e:
+            return ("refused", str(e)[:80])
+        except Exception:
+            return ("CRASH", traceback.format_exc()[-600:])
+        stray = [n for n in os.listdir(td) if n not in ("f.vfa", "out")]
+        if stray: return ("ESCAPE", str(stray))
+        if want is None: return ("accepted", "")           # structure fuzz: any self-consistent result is fine
+        got = {}
+        for root, _, files in os.walk(dest):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                got[os.path.relpath(fp, dest).replace("\\", "/")] = hashlib.sha256(open(fp, "rb").read()).hexdigest()
+        return ("identical", "") if got == want else ("WRONG", f"{sorted(set(got.items()) ^ set(want.items()))[:3]}")
+
+def mutate(data: bytes, rnd: random.Random) -> Tuple:
+    b = bytearray(data); n = len(b); k = rnd.randrange(8)
+    if k == 0: i = rnd.randrange(n); b[i] ^= 1 << rnd.randrange(8); d = f"bitflip@{i}"
+    elif k == 1: i = rnd.randrange(n); b[i] = rnd.randrange(256); d = f"byte@{i}"
+    elif k == 2: i = rnd.randrange(n); L = rnd.randint(2, 32); b[i:i + L] = rnd.randbytes(min(L, n - i)); d = f"run@{i}+{L}"
+    elif k == 3: L = rnd.randrange(1, n); b = b[:L]; d = f"truncate@{L}"
+    elif k == 4: i = rnd.randrange(n); L = rnd.randint(1, 64); del b[i:i + L]; d = f"delete@{i}+{L}"
+    elif k == 5: i = rnd.randrange(n); b[i:i] = rnd.randbytes(rnd.randint(1, 64)); d = f"insert@{i}"
+    elif k == 6: b += rnd.randbytes(rnd.randint(1, 64)); d = "append"
+    else:   # aim at the footer/TOC end where the structure lives
+        i = max(0, n - rnd.randint(1, 120)); b[i] ^= 1 << rnd.randrange(8); d = f"tailflip@{i}"
+    return bytes(b), d
+
+FAILDIR = HERE / "fuzz_failures"
+
+def run_jobs(jobs, labels):
+    """Run fuzz jobs in a process pool; a job that takes > 60 s is a HANG (the pool is replaced)."""
+    ctx = mp.get_context("spawn")
+    res = []; pool = ctx.Pool(min(4, os.cpu_count() or 2))
+    try:
+        pend = [pool.apply_async(_fuzz_worker, (j,)) for j in jobs]
+        for i, a in enumerate(pend):
+            try: res.append(a.get(timeout=60))
+            except mp.TimeoutError:
+                res.append(("HANG", labels[i])); pool.terminate(); pool = ctx.Pool(min(4, os.cpu_count() or 2))
+                pend[i + 1:] = [pool.apply_async(_fuzz_worker, (j,)) for j in jobs[i + 1:]]
+    finally:
+        pool.terminate()
+    return res
+
+def run_fuzz(targets, want, n_cases, quick, rnd):
+    """targets: (name, path, password, verify_modes). Every prefix truncation + n_cases random mutations each."""
+    for name, path, pw, modes in targets:
+        data = pathlib.Path(path).read_bytes()
+        for verify in modes:
+            jobs, labels = [], []
+            for L in range(0, len(data), 1 if not quick else 7):
+                jobs.append((data[:L], verify, pw, want)); labels.append(f"truncate@{L}")
+            for _ in range(n_cases):
+                m, d = mutate(data, rnd); jobs.append((m, verify, pw, want)); labels.append(d)
+            t0 = time.perf_counter(); res = run_jobs(jobs, labels); dt = time.perf_counter() - t0
+            bad = [(labels[i], r) for i, r in enumerate(res) if r[0] in ("WRONG", "CRASH", "HANG", "ESCAPE")]
+            counts = {k: sum(1 for r in res if r[0] == k) for k in ("refused", "identical", "WRONG", "CRASH", "HANG", "ESCAPE")}
+            tag = f"fuzz {name}, {'digest+CRC' if verify else 'CRC only (--no-verify)'}"
+            if bad:
+                FAILDIR.mkdir(exist_ok=True)
+                for lab, r in bad[:20]:
+                    j = labels.index(lab); fn = FAILDIR / f"{pathlib.Path(path).stem}_{'v' if verify else 'nv'}_{j}.vfa"
+                    fn.write_bytes(jobs[j][0]); print(f"      {r[0]} {lab}: {r[1][:300]}  -> {fn.name}")
+            check(f"{tag}: {len(jobs)} cases in {dt:.0f}s {counts}", not bad)
+
+def t_fuzz(work, n_cases, quick):
+    import vfa as V
+    rnd = random.Random(20261011)
+    files = [("z/a.txt", b"alpha " * 300), ("z/b.bin", bytes(range(256)) * 9), ("z/empty", b""), ("z/c.txt", b"gamma\n" * 50)]
+    want = {p: hashlib.sha256(d).hexdigest() for p, d in files}
+    targets = [
+        ("stored, non-solid (CRC is the only check)", raw_archive(work / "fz_none.vfa", files, method=vx.M_NONE), None, (True, False)),
+        ("zstd, non-solid", raw_archive(work / "fz_zstd.vfa", files, method=vx.M_ZSTD), None, (True, False)),
+        ("xz, solid", raw_archive(work / "fz_xz.vfa", files, method=vx.M_XZ, solid=True), None, (True, False)),
+        ("lz4, solid", raw_archive(work / "fz_lz4.vfa", files, method=vx.M_LZ4, solid=True), None, (True, False)),
+        ("VFA 1.0 layout (no CRCs), zlib", raw_archive(work / "fz_legacy.vfa", files, method=vx.M_ZLIB, tocx=False), None, (True,)),
+    ]
+    zc = work / "fz_src"; shutil.rmtree(zc, ignore_errors=True)
+    for p, d in files: (zc / p).parent.mkdir(parents=True, exist_ok=True); (zc / p).write_bytes(d)
+    encp = work / "fz_enc.vfa"
+    vfa("c", encp, "z", "--method", "zstd", "--password-env", "PW", "--kdf-mem-kib", "1024", "--kdf-time", "1", "--kdf-parallel", "1",
+        cwd=zc, env={"PW": "pw"})
+    targets.append(("AES-GCM encrypted, zstd", encp, "pw", (True,)))
+
+    run_fuzz(targets, want, n_cases, quick, rnd)
+
+    # documented limitation, measured: VFA 1.0 archives without --verify have no per-block check
+    data = pathlib.Path(targets[4][1]).read_bytes(); jobs = []
+    for _ in range(n_cases):
+        m, d = mutate(data, rnd); jobs.append((m, False, None, want))
+    res = run_jobs(jobs, ["legacy"] * len(jobs)); faildir = HERE / "fuzz_failures"
+    wrong = sum(1 for r in res if r[0] == "WRONG"); crash = sum(1 for r in res if r[0] in ("CRASH", "HANG"))
+    for j, r in enumerate(res):
+        if r[0] in ("CRASH", "HANG"):
+            faildir.mkdir(exist_ok=True); fn = faildir / f"legacy_nv_{j}.vfa"; fn.write_bytes(jobs[j][0])
+            print(f"      {r[0]}: {r[1][-400:]}  -> {fn.name}")
+    check(f"fuzz VFA 1.0 layout with --no-verify: no crash/hang (silently wrong output in {wrong}/{len(jobs)} cases - "
+          "expected: 1.0 archives rely on the digest, never skip it for them)", crash == 0)
+
+# ---------------------------------------------------------------- the 4 GiB+ file
+
+def peak_rss_of(p: subprocess.Popen) -> int:
+    """Peak resident memory of a finished child, in bytes (0 if unknown)."""
+    if os.name == "nt":
+        import ctypes, ctypes.wintypes as w
+        class PMC(ctypes.Structure):
+            _fields_ = [("cb", w.DWORD), ("PageFaultCount", w.DWORD), ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t), ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t), ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+        pmc = PMC(); pmc.cb = ctypes.sizeof(PMC)
+        if ctypes.windll.psapi.GetProcessMemoryInfo(w.HANDLE(int(p._handle)), ctypes.byref(pmc), pmc.cb):
+            return pmc.PeakWorkingSetSize
+        return 0
+    import resource
+    return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024   # max over all children so far
+
+def t_big(work, fmt="vfa1"):
+    size = (4 << 30) + 123_457                          # > 4 GiB and not block-aligned
+    src = work / "big"; shutil.rmtree(src, ignore_errors=True); src.mkdir()
+    f = src / "huge.bin"; rnd = random.Random(99); h = hashlib.sha256()
+    text = (b"The quick brown fox jumps over the lazy dog. " * 12000)[: 1 << 19]
+    with open(f, "wb") as fw:                           # every MiB: 512 KiB random + 512 KiB text -> roughly 2:1
+        left = size; i = 0
+        while left:
+            blk = (os.urandom(1 << 19) + struct.pack("<Q", i) + text[8:])[:left]
+            fw.write(blk); h.update(blk); left -= len(blk); i += 1
+    want = h.hexdigest()
+    # measure the real interpreter, not the venv launcher (which would report its own few MiB)
+    import site
+    real_py = getattr(sys, "_base_executable", PY) or PY
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([*site.getsitepackages(), str(HERE)]))
+    for flags in ([], ["--solid"]):
+        arc = work / "big.vfa"
+        codec = ["--method", "zstd", "--level", "3"] if fmt == "vfa1" else ["--format", "vfa2"]
+        p = subprocess.Popen([real_py, str(HERE / "vfa.py"), "c", str(arc), "big", *codec, *flags], cwd=work, env=env)
+        p.wait(); rss_c = peak_rss_of(p)
+        out = work / "big_out"; shutil.rmtree(out, ignore_errors=True)
+        p = subprocess.Popen([real_py, str(HERE / "vfa.py"), "x", str(arc), "-o", str(out)], env=env); p.wait(); rss_x = peak_rss_of(p)
+        g = hashlib.sha256()
+        with open(out / "big/huge.bin", "rb") as fr:
+            for b in iter(lambda: fr.read(1 << 24), b""): g.update(b)
+        check(f"{fmt} 4 GiB+ file round-trip ({'solid' if flags else 'non-solid'}); archive {arc.stat().st_size / 2**20:.0f} MiB, "
+              f"peak RSS create {rss_c / 2**20:.0f} MiB / extract {rss_x / 2**20:.0f} MiB", g.hexdigest() == want)
+        shutil.rmtree(out, ignore_errors=True); arc.unlink()
+    shutil.rmtree(src, ignore_errors=True)
+
+# ================================================================ VFA2 (VFA2.md)
+
+def build2(path, files, *, dirs=("z",), records=(), index_mut=None, extra_entries=(), **kw):
+    """Write a VFA2 archive with vfa2.Writer2; index_mut(raw_index) lets a test hand-edit the index while every
+    CRC and the digest stay valid (so the parser itself is exercised, not just the checksums)."""
+    import vfa2 as V2
+    class W(V2.Writer2):
+        def _index_bytes(self, records=()):
+            raw = super()._index_bytes(records)
+            return index_mut(raw) if index_mut else raw
+    with open(path, "wb") as f:
+        w = W(f, **kw)
+        for d in dirs: w.add_dir(d, 0o755, 1_700_000_000)
+        for p, d in files: w.add_file(p, 0o644, 1_700_000_000, d)
+        for et, p in extra_entries: w._entry(et, p, 0o644, 1_700_000_000)
+        w.close(records)
+    return pathlib.Path(path)
+
+def refoot2(b) -> bytes:
+    """Recompute the digest and footer CRC after a test edited bytes before the footer."""
+    import vfa2 as V2
+    b = bytearray(b); fs = len(b) - V2.FOOTER_SIZE
+    off, ilen, alen, kind, _ = V2.FOOT.unpack(bytes(b[fs:fs + V2.FOOT.size]))
+    body = V2.FOOT.pack(off, ilen, alen, kind, hashlib.sha256(bytes(b[:fs])).digest())
+    b[fs:fs + V2.FOOT.size + 4] = body + struct.pack("<I", V2.crc32(body))
+    return bytes(b)
+
+def patch_frame2(path, frame_off, byte_index, value):
+    """Set one byte of a frame header (0-based within the 26-byte body), fix that frame's CRC and the footer."""
+    import vfa2 as V2
+    b = bytearray(pathlib.Path(path).read_bytes())
+    b[frame_off + byte_index] = value
+    b[frame_off + V2.FRAME.size:frame_off + V2.FRAME_SIZE] = struct.pack("<I", V2.crc32(bytes(b[frame_off:frame_off + V2.FRAME.size])))
+    pathlib.Path(path).write_bytes(refoot2(b))
+
+def t2_roundtrip(work, corpus):
+    for flags in ([], ["--solid"], ["--chunk-exp", "12"], ["--solid", "--chunk-exp", "12"]):
+        tag = " ".join(flags) or "non-solid, 64 MiB chunks"
+        arc = work / f"v2rt_{len(flags)}_{'s' if '--solid' in flags else 'n'}.vfa"
+        r = vfa("c", arc, corpus.name, "--format", "vfa2", *flags, cwd=corpus.parent)
+        if not check(f"vfa2 create ({tag})", r.returncode == 0, r.stderr[-300:]): continue
+        check(f"vfa2 test   ({tag})", vfa("t", arc).returncode == 0)
+        ok, why = extract_cmp(arc, corpus, work); check(f"vfa2 bytes  ({tag})", ok, why)
+        if "12" in flags:
+            with vx.open_container(str(arc)) as c:
+                c.unlock(None)
+                multi = max(len(e["extents"]) for e in c.entries if e["entry_type"] == vx.ET_FILE)
+                check(f"vfa2 files span several 4 KiB chunks ({tag}): max {multi} extents, {len(c.chunks)} chunks", multi > 1)
+    dup = build2(work / "v2dup.vfa", [("z/a", b"same bytes " * 900), ("z/b", b"same bytes " * 900), ("z/c", b"other")])
+    with vx.open_container(str(dup)) as c:
+        c.unlock(None); out = work / "v2dup_out"; shutil.rmtree(out, ignore_errors=True); c.extract(str(out))
+        check("vfa2 dedup: two identical files share one chunk, both extract", len(c.chunks) == 2 and
+              (out / "z/a").read_bytes() == (out / "z/b").read_bytes() == b"same bytes " * 900)
+    with vx.open_container(str(build2(work / "v2emp.vfa", [], dirs=()))) as c:
+        c.unlock(None); check("vfa2 empty archive (no chunks, no entries) is valid", c.entries == [] and c.chunks == [])
+
+def t2_sample(work):
+    stage = work / "sample_copy2"; shutil.rmtree(stage, ignore_errors=True)
+    shutil.copytree(HERE / "sample", stage / "sample", ignore=shutil.ignore_patterns("__pycache__"))
+    for flags in ([], ["--solid"]):
+        arc = work / f"v2sample_{len(flags)}.vfa"
+        vfa("c", arc, "sample", "--format", "vfa2", *flags, cwd=stage)
+        ok, why = extract_cmp(arc, stage / "sample", work)
+        check(f"vfa2 sample\\ round-trip ({'solid' if flags else 'non-solid'})", ok, why)
+
+def t2_encrypt(work, corpus):
+    env = {"VFA_TEST_PW": "correct horse ☃"}; kdf = ["--kdf-mem-kib", "8192", "--kdf-time", "1", "--kdf-parallel", "1"]
+    for solid in (False, True):
+        arc = work / f"v2enc_{solid}.vfa"
+        vfa("c", arc, corpus.name, "--format", "vfa2", "--password-env", "VFA_TEST_PW", *kdf, *(["--solid"] if solid else []), cwd=corpus.parent, env=env)
+        ok, why = extract_cmp(arc, corpus, work, "--password-env", "VFA_TEST_PW", env=env)
+        check(f"vfa2 encrypted round-trip ({'solid' if solid else 'non-solid'})", ok, why)
+        out = work / "v2wrongpw"; shutil.rmtree(out, ignore_errors=True)
+        r = vfa("x", arc, "-o", out, "--password-env", "VFA_TEST_PW", env={"VFA_TEST_PW": "wrong"}, expect=None)
+        check(f"vfa2 wrong password -> exit 5, nothing written ({'solid' if solid else 'non-solid'})",
+              r.returncode == 5 and not any(p.is_file() for p in out.rglob("*")), f"exit {r.returncode}")
+    check("vfa2 encrypted list without password refuses", vfa("l", work / "v2enc_True.vfa", expect=None).returncode != 0)
+    # the cleartext frame header (coder/filter ids, sizes) is bound into AES-GCM as associated data:
+    # decrypting with any header byte changed must fail
+    arc = build2(work / "v2enc_aad.vfa", [("z/a", b"x" * 5000)], password=b"pw", kdf=(1, 1024, 1))
+    with vx.open_container(str(arc)) as c:
+        c.unlock("pw"); import vfa2 as V2
+        fh = c._read_frame_header(c.chunks[0][0], V2.CHUNK_MAGIC, "chunk 0")
+        results = []
+        for i in range(V2.FRAME.size):
+            t = dict(fh); h = bytearray(fh["hdr"]); h[i] ^= 1; t["hdr"] = bytes(h)
+            try: c._frame_payload(t, c.data_key); results.append(False)
+            except vx.VFAError as e: results.append("Decryption failed" in str(e))
+        check(f"vfa2 every frame-header byte is authenticated by AES-GCM ({sum(results)}/{len(results)})", all(results))
+
+def t2_random_access(work):
+    big = work / "ra_src"
+    if not big.exists():
+        (big / "d").mkdir(parents=True); rnd = random.Random(7)
+        for i in range(24):
+            (big / f"d/f{i:02d}.bin").write_bytes(rnd.randbytes(4 * 1024 * 1024))
+            if i == 12: (big / "d/f12_needle.bin").write_bytes(b"NEEDLE-" + rnd.randbytes(5000))
+    needle = (big / "d/f12_needle.bin").read_bytes()
+    for flags in ([], ["--solid"]):
+        arc = work / f"v2ra_{len(flags)}.vfa"
+        vfa("c", arc, big.name, "--format", "vfa2", "--chunk-exp", "22", *flags, cwd=big.parent)
+        with vx.open_container(str(arc)) as c:
+            c.unlock(None); seen = set(); orig = c.chunk_data
+            c.chunk_data = lambda i: (seen.add(i), orig(i))[1]
+            out = work / "v2ra_out"; shutil.rmtree(out, ignore_errors=True)
+            t0 = time.perf_counter(); c.extract(str(out), members=["ra_src/d/f12_needle.bin"]); dt = time.perf_counter() - t0
+            tag = "solid" if flags else "non-solid"
+            check(f"vfa2 random access ({tag}): member byte-identical", (out / "ra_src/d/f12_needle.bin").read_bytes() == needle)
+            check(f"vfa2 random access ({tag}): decoded {len(seen)} of {len(c.chunks)} chunks in {dt*1000:.0f} ms",
+                  len(seen) <= 2 and len(c.chunks) >= 20, str(seen))
+
+def t2_refuse(work):
+    import vfa2 as V2
+    f = [("z/a.txt", b"payload " * 100)]
+    def refused(name, path, needle, verify=True):
+        try:
+            open_extract(path, work / "refuse2_out", verify=verify); return check(name, False, "was accepted")
+        except vx.VFAError as e:
+            return check(name, needle.lower() in str(e).lower(), f"message: {e}")
+        except Exception as e:
+            return check(name, False, f"crashed: {e!r}")
+    def accepted(name, path):
+        try:
+            out = work / ("acc_" + path.stem); shutil.rmtree(out, ignore_errors=True); open_extract(path, out)
+            check(name, (out / "z/a.txt").read_bytes() == f[0][1])
+        except Exception as e: check(name, False, repr(e))
+    refused("vfa2 refuse: min_reader_version 2", build2(work / "r_minr.vfa", f, min_reader=2), "reader of version 2")
+    refused("vfa2 refuse: unknown required feature bit", build2(work / "r_feat.vfa", f, required_extra=1 << 7), "requires features")
+    accepted("vfa2 accept: longer header (future optional fields)", build2(work / "r_hx.vfa", f, header_extra=b"\x01" * 22))
+    p = build2(work / "r_flag.vfa", f)
+    with vx.open_container(str(p)) as c: c.unlock(None); off = c.chunks[0][0]
+    patch_frame2(p, off, 6, 0x80)
+    refused("vfa2 refuse: unknown frame flag", p, "frame flags")
+    for table, cid, needle, label in ((V2.CODERS, 1, "vulp-tans", "coder 1"), (V2.FILTERS, 3, "bcj-x86", "filter 3")):
+        table[cid] = V2.Codec(cid, "test-only", (lambda raw, level=0: (b"", bytes(raw))), None)
+        try: p = build2(work / f"r_c{cid}.vfa", f, **({"coder": cid} if table is V2.CODERS else {"filt": cid}))
+        finally: del table[cid]
+        refused(f"vfa2 refuse: unimplemented {label} is named ({needle})", p, needle)
+    refused("vfa2 refuse: unknown critical index record", build2(work / "r_crit.vfa", f, records=[(77, V2.XR_CRITICAL, b"x")]), "record type 77")
+    accepted("vfa2 accept: unknown optional index record", build2(work / "r_opt.vfa", f, records=[(78, 0, b"future")]))
+    refused("vfa2 refuse: unknown entry type 9", build2(work / "r_et.vfa", f, extra_entries=[(9, "z/odd")]), "entry type 9")
+    refused("vfa2 refuse: trailing bytes in the index", build2(work / "r_trail.vfa", f, index_mut=lambda r: r + b"junk"), "trailing")
+    p = build2(work / "r_v1.vfa", f)
+    try: vx.Container(str(p)); check("VFA1 reader names a VFA2 file as a different format", False, "accepted")
+    except vx.VFAError as e: check("VFA1 reader names a VFA2 file as a different format", "different vfa format" in str(e).lower(), str(e))
+
+def t2_paths(work):
+    bad = ["../evil.txt", "/abs_evil.txt", "C:/drive_evil.txt", "a/../../evil2.txt"]
+    if os.name == "nt": bad += ["CON", "nested/aux.txt", "file.txt:ads", "what?.txt"]
+    for p in bad:
+        arc = build2(work / "bad2.vfa", [("fine.txt", b"x"), (p, b"evil")], dirs=())
+        dest = work / "jail2" / "inner"; shutil.rmtree(work / "jail2", ignore_errors=True); dest.mkdir(parents=True)
+        try:
+            open_extract(arc, dest); check(f"vfa2 path refused: {p!r}", False, "was extracted")
+        except vx.VFAError:
+            outside = [q for q in (work / "jail2").rglob("*") if q.is_file()]
+            check(f"vfa2 path refused before writing anything: {p!r}", not outside, str(outside))
+        except Exception as e:
+            check(f"vfa2 path refused: {p!r}", False, f"crashed: {e!r}")
+
+def t2_determinism(work, corpus):
+    for flags in ([], ["--solid", "--chunk-exp", "16"]):
+        a1, a2 = work / "d2a.vfa", work / "d2b.vfa"
+        vfa("c", a1, corpus.name, "--format", "vfa2", *flags, cwd=corpus.parent); vfa("c", a2, corpus.name, "--format", "vfa2", *flags, cwd=corpus.parent)
+        check(f"vfa2 determinism: same input -> identical archive ({' '.join(flags) or 'non-solid'})", a1.read_bytes() == a2.read_bytes())
+    skip("vfa2 determinism: native codec at -O0 vs -O3 (and MSVC vs gcc)", "M1 has only the stored coder; arrives with the C tANS coder in M3")
+
+def t2_sfx(work, corpus):
+    arc = work / "v2sfx.vfa"; vfa("c", arc, corpus.name, "--format", "vfa2", "--solid", cwd=corpus.parent)
+    exe = work / "v2fake_sfx.exe"; exe.write_bytes(b"MZ" + os.urandom(5000) + arc.read_bytes())
+    out = work / "v2sfx_out"; shutil.rmtree(out, ignore_errors=True)
+    r = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(exe), "-o", str(out)], capture_output=True, text=True)
+    check("vfa2 SFX stub extracts stub+archive", r.returncode == 0 and same_tree(corpus, out / corpus.name)[0], r.stderr[-300:])
+    sfi = work / "v2sfi.exe"
+    r = subprocess.run([PY, str(HERE / "pack_sfi.py"), "--stub", str(exe), "--archive", str(arc), "--name", "T", "-o", str(sfi)], capture_output=True, text=True)
+    with vx.open_container(str(sfi)) as c:
+        c.unlock(None)
+        check("vfa2 SFI container: pack_sfi accepts VFA2, manifest found, archive reads",
+              r.returncode == 0 and (c.manifest or {}).get("name") == "T" and c.verify_digest() is True, r.stderr[-300:])
+    b = bytearray(exe.read_bytes()); b[len(b) // 2] ^= 0x10; exe.write_bytes(bytes(b))
+    out2 = work / "v2sfx_out2"; shutil.rmtree(out2, ignore_errors=True)
+    r = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(exe), "-o", str(out2)], capture_output=True, text=True)
+    check("vfa2 SFX stub refuses a corrupted file and writes nothing", r.returncode != 0 and (not out2.exists() or not any(out2.rglob("*"))))
+
+def t_signed(work, corpus, fmt):
+    """Authenticode layout: [PE stub][archive][pad to 8][WIN_CERTIFICATE], PE security directory -> certificate.
+    (A structural simulation: no real signtool run; the PE checksum is not updated.)"""
+    arc = work / f"sig_{fmt}.vfa"; vfa("c", arc, corpus.name, "--format", fmt, cwd=corpus.parent)
+    pe = bytearray(pathlib.Path(sys._base_executable if hasattr(sys, "_base_executable") else sys.executable).read_bytes())
+    e_lfanew, = struct.unpack("<I", pe[0x3C:0x40]); opt = e_lfanew + 24
+    dd = opt + (96 if struct.unpack("<H", pe[opt:opt + 2])[0] == 0x10B else 112)
+    so, sl = struct.unpack("<II", pe[dd + 32:dd + 40])
+    if (so, sl) != (0, 0):                          # the interpreter is signed itself: strip that signature first
+        if so + sl != len(pe): skip(f"{fmt} Authenticode layout", "cannot strip the test PE's own signature"); return
+        pe = pe[:so]; pe[dd + 32:dd + 40] = bytes(8)
+    body = bytes(pe) + arc.read_bytes()
+    pad = (-len(body)) % 8; blob = os.urandom(1500)
+    cert = struct.pack("<IHH", 8 + len(blob), 0x0200, 2) + blob
+    pe[dd + 32:dd + 40] = struct.pack("<II", len(body) + pad, len(cert))
+    signed = work / f"signed_{fmt}.exe"; signed.write_bytes(bytes(pe) + arc.read_bytes() + b"\0" * pad + cert)
+    out = work / f"signed_out_{fmt}"; shutil.rmtree(out, ignore_errors=True)
+    r = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(signed), "-o", str(out)], capture_output=True, text=True)
+    check(f"{fmt}: archive found and verified behind an Authenticode certificate table (pad {pad})",
+          r.returncode == 0 and same_tree(corpus, out / corpus.name)[0], r.stderr[-300:])
+
+def t2_fuzz(work, n_cases, quick):
+    rnd = random.Random(20261012)
+    files = [("z/a.txt", b"alpha " * 300), ("z/b.bin", bytes(range(256)) * 9), ("z/empty", b""), ("z/c.txt", b"gamma\n" * 50)]
+    want = {p: hashlib.sha256(d).hexdigest() for p, d in files}
+    targets = [
+        ("vfa2 non-solid", build2(work / "fz2_n.vfa", files), None, (True, False)),
+        ("vfa2 solid, 4 KiB chunks", build2(work / "fz2_s.vfa", files, solid=True, chunk_size=4096), None, (True, False)),
+        ("vfa2 encrypted", build2(work / "fz2_e.vfa", files, password=b"pw", kdf=(1, 1024, 1)), "pw", (True, False)),
+    ]
+    run_fuzz(targets, want, n_cases, quick, rnd)
+    # the oracle must be able to fail: an intact archive judged against the wrong expectation must read as WRONG
+    bogus = dict(want); bogus["z/a.txt"] = "0" * 64
+    check("fuzz oracle self-test: a wrong expectation is reported as WRONG",
+          _fuzz_worker((targets[0][1].read_bytes(), True, None, bogus))[0] == "WRONG")
+    # structure fuzz: mutate the index, keep every CRC and the digest valid -> exercises the parser and the
+    # cross-checks, not just the checksums. Oracle: refuse or extract, never crash/hang/escape.
+    jobs, labels = [], []
+    for k in range(n_cases):
+        def mut(raw, k=k):
+            b = bytearray(raw); m, d = mutate(bytes(b), rnd)
+            labels.append("index:" + d); return m
+        p = build2(work / "fz2_struct.vfa", files, index_mut=mut)
+        jobs.append((p.read_bytes(), True, None, None))
+    res = run_jobs(jobs, labels)
+    bad = [(labels[i], r) for i, r in enumerate(res) if r[0] in ("WRONG", "CRASH", "HANG", "ESCAPE")]
+    for lab, r in bad[:10]: print(f"      {r[0]} {lab}: {r[1][:400]}")
+    counts = {k: sum(1 for r in res if r[0] == k) for k in ("refused", "accepted", "CRASH", "HANG", "ESCAPE")}
+    check(f"vfa2 structure fuzz (index mutated, CRCs+digest recomputed): {len(jobs)} cases {counts}", not bad)
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--format", choices=["vfa1", "vfa2", "all"], default="all")
+    ap.add_argument("--quick", action="store_true"); ap.add_argument("--big", action="store_true")
+    ap.add_argument("--fuzz", type=int, default=None); ap.add_argument("--only"); ap.add_argument("--keep", action="store_true")
+    a = ap.parse_args()
+    groups = set(a.only.split(",")) if a.only else {"roundtrip", "sample", "encrypt", "append", "ra", "refuse", "paths",
+                                                     "fuzz", "determinism", "sfx", "signed"}
+    if a.big: groups.add("big")
+    n = a.fuzz if a.fuzz is not None else (150 if a.quick else 600)
+    work = pathlib.Path(tempfile.mkdtemp(prefix="vfa-test-"))
+    print(f"work dir: {work}")
+    suites = {
+        "vfa1": [("roundtrip", lambda c: t_roundtrip(work, c)), ("sample", lambda c: t_sample(work)),
+                 ("encrypt", lambda c: t_encrypt(work, c)), ("append", lambda c: t_append(work, c)),
+                 ("ra", lambda c: t_random_access(work)), ("refuse", lambda c: t_refuse(work)), ("paths", lambda c: t_paths(work)),
+                 ("determinism", lambda c: t_determinism(work, c)), ("sfx", lambda c: t_sfx(work, c)),
+                 ("signed", lambda c: t_signed(work, c, "vfa1")), ("fuzz", lambda c: t_fuzz(work, n, a.quick)),
+                 ("big", lambda c: t_big(work, "vfa1"))],
+        "vfa2": [("roundtrip", lambda c: t2_roundtrip(work, c)), ("sample", lambda c: t2_sample(work)),
+                 ("encrypt", lambda c: t2_encrypt(work, c)), ("ra", lambda c: t2_random_access(work)),
+                 ("refuse", lambda c: t2_refuse(work)), ("paths", lambda c: t2_paths(work)),
+                 ("determinism", lambda c: t2_determinism(work, c)), ("sfx", lambda c: t2_sfx(work, c)),
+                 ("signed", lambda c: t_signed(work, c, "vfa2")), ("fuzz", lambda c: t2_fuzz(work, n, a.quick)),
+                 ("big", lambda c: t_big(work, "vfa2"))],
+    }
+    try:
+        corpus = make_corpus(work / "corpus")
+        t0 = time.perf_counter()
+        for fmt in (["vfa1", "vfa2"] if a.format == "all" else [a.format]):
+            print(f"\n==== {fmt}")
+            for g, fn in suites[fmt]:
+                if g in groups: fn(corpus)
+        print(f"\n{len(FAILS)} failed, {len(SKIPS)} skipped, in {time.perf_counter() - t0:.0f}s")
+        for f in FAILS: print("  FAILED:", f)
+    finally:
+        if not a.keep: shutil.rmtree(work, ignore_errors=True)
+    return 1 if FAILS else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
