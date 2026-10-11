@@ -382,8 +382,9 @@ class Writer2:
         if not (1 << 12) <= chunk_size <= MAX_CHUNK: raise ValueError("chunk_size must be 4 KiB .. 1 GiB")
         if coder not in CODERS or CODERS[coder].encode is None: raise ValueError(f"coder {coder} cannot encode")
         if isinstance(filt, int): filt = (filt, b"")
-        # cross-chunk dedup of content-defined segments: needs the C chunker; off when encrypting (set below)
-        self.cdc = bool(dedup) and NATIVE and cdc
+        # cross-chunk dedup of content-defined segments; off when encrypting (set below). Without the C extension
+        # the pure-Python chunker gives the same cuts (slower, ~5 MB/s), so the archive does not depend on it
+        self.cdc = bool(dedup) and cdc
         if filt is not None and (filt[0] not in FILTERS or FILTERS[filt[0]].encode is None):
             raise ValueError(f"filter {filt[0]} cannot encode")
         self.routing: List[dict] = []

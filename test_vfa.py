@@ -1244,6 +1244,18 @@ def t2_dedup(work, corpus):
               and sorted(q.name for q in (out / "z").iterdir()) == ["a", "a.vfapart"])
     except Exception as e:
         check("vfa2: an entry named like another's temporary file (a, a.vfapart) extracts both intact", False, repr(e))
+    # without the C extension, content-defined dedup still runs (pure-Python chunker) and the archive is identical
+    import vulp_ref
+    files = [("z/v100.bin", base[:1_500_000]), ("z/v110.bin", shifted[:1_500_000])]
+    pn = build2(work / "dd_nat.vfa", files, coder=0, filt=0, cdc=True, chunk_size=1 << 20)
+    saved = V2._native, V2.NATIVE
+    V2._native, V2.NATIVE = vulp_ref, False
+    try:
+        pr = build2(work / "dd_ref.vfa", files, coder=0, filt=0, cdc=True, chunk_size=1 << 20)
+    finally:
+        V2._native, V2.NATIVE = saved
+    check(f"vfa2 dedup without the C extension: same archive as with it ({pr.stat().st_size:,} B, stored coder)",
+          pn.read_bytes() == pr.read_bytes() and pr.stat().st_size < 2_500_000, f"{pn.stat().st_size} vs {pr.stat().st_size}")
     # a chunk-boundary case: dedup references into the unflushed buffer and across flushes, small chunks
     files = [("z/a", base[:600_000]), ("z/b", base[:600_000]), ("z/c", base[100_000:700_000])]
     p = build2(work / "dd_small.vfa", files, cdc=True, solid=True, chunk_size=1 << 18, coder=3, filt=None)
