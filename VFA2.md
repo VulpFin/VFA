@@ -191,14 +191,24 @@ copied.
 chunk (`offset ≤` bytes already produced); the literals end exactly at the end of the block; every extra bit is
 used; all four streams decode to exactly their stated lengths; no trailing bytes.
 
-**Encoder (informative, not normative).** Two match finders feed a lazy parser:
+**Encoder (informative, not normative).** Two match finders feed a lazy parser (levels 0–6) or an optimal parser
+(levels 7–9):
 - *local:* hash chains (2^17 heads) over a 512 KiB sliding window, sized for an L2 cache;
 - *long-range:* a sparse table of rolling hashes of 32-byte windows at content-defined anchor positions (about 1 in
   16 positions), covering the whole chunk. It stores positions only, at most 2^22 entries (16 MiB), whatever the
   chunk size. Found matches are extended backwards into the pending literals.
 On long literal runs the parser searches fewer positions (level 9 searches all), but it still inserts every
 position and checks every long-range anchor, so long repeats inside incompressible data (e.g. two installers that
-carry the same compressed payload) are still found. Levels 0–9 trade chain depth for speed (`--level`).
+carry the same compressed payload) are still found. Levels 0–6 trade chain depth for speed (`--level`).
+
+Levels 7–9 use a price-driven optimal parse. The input is decided 4096 positions at a time. Every position gets its
+match candidates: the repeat offset, the hash chain, and the long-range table. A forward pass keeps the cheapest way
+to reach each position. Prices are bit costs in Q8 fixed point, taken from adaptive symbol counts. Each statistics
+epoch is one LZ block: literals are seeded from the block's byte histogram, and code counts are halved. Exact
+extra-bit counts are added. A candidate of 64 bytes or more is taken at once. The hash table has 2^20 heads, and
+the window is 2 / 4 / 8 MiB at levels 7 / 8 / 9, capped at the input size, with chain depths 16 / 32 / 64.
+Everything is integer arithmetic, so the output is the same on every compiler. The stream is ordinary vulp-lz:
+decoders cannot tell which parser made it.
 
 ### Filters
 

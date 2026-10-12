@@ -87,7 +87,7 @@ class Codec:
     def __init__(self, cid, name, encode=None, decode=None):
         self.id, self.name, self.encode, self.decode = cid, name, encode, decode
 
-NATIVE_API = 2                               # vulp.h VULP_VERSION this code needs (2: vulp-lz, cdc)
+NATIVE_API = 3                               # vulp.h VULP_VERSION this code needs (2: vulp-lz, cdc; 3: optimal parser)
 NATIVE_PROBLEM = ""                          # why the C extension is not used, if it is not
 try:
     import _vulp as _native                  # C codec core (build_vulp.py)

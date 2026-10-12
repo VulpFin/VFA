@@ -130,6 +130,12 @@ static void advance(lzenc *e, size_t q)
 static size_t match_len(const uint8_t *a, const uint8_t *b, size_t max)
 {
     size_t l = 0;
+    while (max - l >= 8) {                    /* 8 bytes at a time; byte order does not matter for equality */
+        uint64_t x, y;
+        memcpy(&x, a + l, 8); memcpy(&y, b + l, 8);
+        if (x != y) break;
+        l += 8;
+    }
     while (l < max && a[l] == b[l]) l++;
     return l;
 }
@@ -251,6 +257,191 @@ static void add_seq(lzenc *e, size_t lit_from, size_t p, size_t ml, uint32_t off
     e->block_raw += ml;
 }
 
+/* ------------------------------------------------------------------ optimal parser (levels >= VULP_LZ_OPT_LEVEL)
+ *
+ * Price-driven parse in the style of zstd's btopt: the input is taken OPT_SEG positions at a time; every position
+ * gets all useful match candidates (repeat offset, hash chain, long-range table), and a forward pass over the
+ * segment keeps, for each position, the cheapest way to reach it. Prices are bit costs in Q8 fixed point, from
+ * adaptive symbol statistics (log2 of total/count) plus the exact number of extra bits. Integer only, so the
+ * output is the same on every compiler and machine. Decoders see an ordinary vulp-lz stream: the format is
+ * unchanged, only the choice of sequences is better. */
+
+#define OPT_LEVEL 7                   /* levels 7..9 use it */
+#define OPT_SEG 4096u                 /* positions decided per pass */
+#define OPT_MAXCAND 32u               /* match candidates kept per position */
+#define OPT_INF 0xFFFFFFFFu
+
+typedef struct { uint32_t cost, len, off, litlen, rep; } optnode;
+
+typedef struct {
+    uint32_t lit[256], ll[VULP_LZ_MAXCODE + 1], ml[VULP_LZ_MAXCODE + 1], of[VULP_LZ_MAXCODE + 1];     /* counts */
+    uint32_t litp[256], llp[VULP_LZ_MAXCODE + 1], mlp[VULP_LZ_MAXCODE + 1], ofp[VULP_LZ_MAXCODE + 1]; /* Q8 bits */
+} optstats;
+
+static void opt_prices(const uint32_t *cnt, uint32_t *price, unsigned n)
+{
+    uint64_t tot = 0;
+    uint32_t lt;
+    unsigned i;
+    for (i = 0; i < n; i++) tot += cnt[i];
+    if (tot > 0xFFFFFFFFu) tot = 0xFFFFFFFFu;
+    lt = vulp_log2_q16((uint32_t)tot);
+    for (i = 0; i < n; i++) price[i] = (lt - vulp_log2_q16(cnt[i])) >> 8;      /* counts are >= 1 */
+}
+
+static void opt_reprice(optstats *st)
+{
+    opt_prices(st->lit, st->litp, 256);
+    opt_prices(st->ll, st->llp, VULP_LZ_MAXCODE + 1);
+    opt_prices(st->ml, st->mlp, VULP_LZ_MAXCODE + 1);
+    opt_prices(st->of, st->ofp, VULP_LZ_MAXCODE + 1);
+}
+
+/* a new statistics epoch (start, and after every block flush, since each block gets its own tANS tables):
+ * literals from the histogram of the next block's input, code counts halved (small codes favoured at the start) */
+static void opt_epoch(optstats *st, const uint8_t *in, size_t n, size_t p, int first)
+{
+    size_t i, end = p + VULP_LZ_BLOCK < n ? p + VULP_LZ_BLOCK : n;
+    unsigned c;
+    for (c = 0; c < 256; c++) st->lit[c] = 1;
+    for (i = p; i < end; i++) st->lit[in[i]]++;
+    for (c = 0; c <= VULP_LZ_MAXCODE; c++) {
+        if (first) { uint32_t prior = c < 32 ? 32u >> (c / 4) : 1; st->ll[c] = prior + 1; st->ml[c] = prior + 1; st->of[c] = 1 + (c >= 16 && c < 40); }
+        else { st->ll[c] = st->ll[c] / 2 + 1; st->ml[c] = st->ml[c] / 2 + 1; st->of[c] = st->of[c] / 2 + 1; }
+    }
+    opt_reprice(st);
+}
+
+static uint32_t vprice(const uint32_t *codep, uint32_t v)
+{
+    uint32_t extra;
+    unsigned nb, c = vcode(v, &extra, &nb);
+    return codep[c] + ((uint32_t)nb << 8);
+}
+
+/* candidates at p for a path whose repeat offset is rep: strictly increasing lengths, each with the nearest offset
+ * that reaches it (so the cheapest offset for every length is kept); returns the count */
+static unsigned opt_candidates(lzenc *e, size_t p, uint32_t rep, uint32_t *lens, uint32_t *offs)
+{
+    const uint8_t *in = e->in;
+    size_t max = e->n - p, best = VULP_LZ_MINMATCH - 1, l;
+    uint32_t depth = e->depth, cur;
+    unsigned nc = 0;
+    if (max > 0xFFFFFFF0u) max = 0xFFFFFFF0u;
+    if (rep <= p) {
+        l = match_len(in + p, in + p - rep, max);
+        if (l > best) { best = l; lens[nc] = (uint32_t)l; offs[nc++] = rep; }
+    }
+    cur = e->head[hash4(in + p, e->hlog)];
+    while (cur && depth-- && nc < OPT_MAXCAND && best < max) {
+        size_t cand = (size_t)cur - 1;
+        if (cand >= p || p - cand > e->wmask) break;
+        if (in[cand + best] == in[p + best]) {
+            l = match_len(in + p, in + cand, max);
+            if (l > best) { best = l; lens[nc] = (uint32_t)l; offs[nc++] = (uint32_t)(p - cand); }
+        }
+        {
+            uint32_t nxt = e->chain[cand & e->wmask];
+            if (nxt >= cur) break;
+            cur = nxt;
+        }
+    }
+    if (e->ltab && nc < OPT_MAXCAND && p + VULP_LZ_LONG_MIN <= e->n && e->hpos == p && is_anchor(e->h)) {
+        uint32_t c = e->ltab[(e->h * LH_MUL) >> (32 - e->llog)];
+        if (c) {
+            size_t cand = (size_t)c - 1;
+            if (cand < p && !memcmp(in + cand, in + p, VULP_LZ_LONG_MIN)) {
+                l = match_len(in + p, in + cand, max);
+                if (l > best) { lens[nc] = (uint32_t)l; offs[nc++] = (uint32_t)(p - cand); }
+            }
+        }
+    }
+    return nc;
+}
+
+static void opt_count(optstats *st, const lzenc *e, size_t lit_from, size_t p)
+{
+    size_t i;
+    for (i = lit_from; i < p; i++) st->lit[e->in[i]]++;
+    st->ll[e->llc[e->nseq - 1]]++; st->ml[e->mlc[e->nseq - 1]]++; st->of[e->ofc[e->nseq - 1]]++;
+}
+
+/* emit one sequence chosen by the parser; flushes a full block and starts a new statistics epoch */
+static void opt_emit(lzenc *e, optstats *st, size_t *lit_start, size_t p, size_t ml, uint32_t off)
+{
+    add_seq(e, *lit_start, p, ml, off);
+    opt_count(st, e, *lit_start, p);
+    *lit_start = p + ml;
+    if (e->block_raw >= VULP_LZ_BLOCK || e->nseq + 2 >= e->seqcap) { flush_block(e); opt_epoch(st, e->in, e->n, p + ml, 0); }
+}
+
+static void opt_parse(lzenc *e, size_t *p_io, size_t *lit_io, size_t *adv_io, optnode *node, uint32_t suff)
+{
+    const uint8_t *in = e->in;
+    size_t n = e->n, p = *p_io, lit_start = *lit_io, adv = *adv_io;
+    uint32_t lens[OPT_MAXCAND + 1], offs[OPT_MAXCAND + 1];
+    uint32_t *path = (uint32_t *)malloc((OPT_SEG + suff + 2) * sizeof(uint32_t));
+    optstats *st = (optstats *)malloc(sizeof(optstats));
+    if (!path || !st) { e->err = VULP_E_NOMEM; free(path); free(st); return; }
+    opt_epoch(st, in, n, p, 1);
+    while (p + VULP_LZ_MINMATCH <= n && !e->err) {
+        size_t seg = n - p < OPT_SEG ? n - p : OPT_SEG, i, k, end, sc_at = 0, sc_len = 0;
+        uint32_t lt0 = (uint32_t)(p - lit_start), sc_off = 0;
+        unsigned np;
+        for (k = 0; k <= seg + suff; k++) node[k].cost = OPT_INF;
+        node[0].cost = vprice(st->llp, lt0); node[0].len = 0; node[0].litlen = lt0; node[0].rep = e->rep;
+        for (i = 0; i < seg; i++) {
+            optnode *a = &node[i];
+            size_t q = p + i;
+            uint32_t base, c, prev, j;
+            unsigned nc, m;
+            if (a->cost == OPT_INF) continue;
+            c = a->cost + st->litp[in[q]] + vprice(st->llp, a->litlen + 1) - vprice(st->llp, a->litlen);
+            if (c < node[i + 1].cost) { node[i + 1].cost = c; node[i + 1].len = 0; node[i + 1].litlen = a->litlen + 1; node[i + 1].rep = a->rep; }
+            if (q + VULP_LZ_MINMATCH > n) continue;
+            while (adv < q) advance(e, adv++);
+            nc = opt_candidates(e, q, a->rep, lens, offs);
+            if (!nc) continue;
+            if (lens[nc - 1] >= suff) {               /* long enough: take it now, decide the segment up to here */
+                sc_at = i; sc_len = lens[nc - 1]; sc_off = offs[nc - 1];
+                break;
+            }
+            base = a->cost + vprice(st->llp, 0);      /* the next sequence starts with an empty literal run */
+            prev = VULP_LZ_MINMATCH - 1;
+            for (m = 0; m < nc; m++) {
+                uint32_t op = vprice(st->ofp, offs[m] == a->rep ? 0 : offs[m]);
+                for (j = prev + 1; j <= lens[m]; j++) {
+                    c = base + op + vprice(st->mlp, j - VULP_LZ_MINMATCH);
+                    if (c < node[i + j].cost) { node[i + j].cost = c; node[i + j].len = j; node[i + j].off = offs[m]; node[i + j].litlen = 0; node[i + j].rep = offs[m]; }
+                }
+                prev = lens[m];
+            }
+        }
+        end = sc_len ? sc_at : seg;
+        /* backtrack: node indices where a match ends, then emit forwards */
+        np = 0;
+        for (k = end; k > 0;) {
+            if (node[k].len) { path[np++] = (uint32_t)k; k -= node[k].len; }
+            else k--;
+        }
+        while (np--) {
+            k = path[np];
+            opt_emit(e, st, &lit_start, p + k - node[k].len, node[k].len, node[k].off);
+        }
+        if (sc_len) {
+            size_t q = p + sc_at;
+            opt_emit(e, st, &lit_start, q, sc_len, sc_off);
+            p = q + sc_len;
+        } else p += end;
+        if (e->block_raw + (p - lit_start) >= VULP_LZ_BLOCK) {     /* long literal run: end the block here */
+            add_literals(e, lit_start, p); lit_start = p; flush_block(e); opt_epoch(st, in, n, p, 0);
+        }
+        opt_reprice(st);
+    }
+    free(path); free(st);
+    *p_io = p; *lit_io = lit_start; *adv_io = adv;
+}
+
 size_t vulp_lz_bound(size_t n)
 {
     /* worst case: short matches with far offsets cost up to ~7 bytes per 4 input bytes (3 RAW code bytes + extra
@@ -266,18 +457,23 @@ int vulp_lz_encode(const uint8_t *in, size_t n, int level, uint8_t *out, size_t 
     size_t p = 0, lit_start = 0, adv = 0, ltsize;
     static const uint32_t depths[10] = {2, 4, 6, 8, 12, 16, 24, 32, 64, 128};
     static const unsigned skips[10] = {5, 5, 6, 6, 7, 7, 7, 8, 9, 0};       /* 0: search every position */
-    unsigned i;
+    unsigned i, wlog;
     int rc;
     if (n > 0xFFFFFFFFu) return VULP_E_PARAM;
     if (level < 0) level = 0;
     if (level > 9) level = 9;
     memset(&e, 0, sizeof e);
     e.in = in; e.n = n; e.out = out; e.cap = cap; e.rep = 1;
-    e.hlog = 17; e.wmask = ((uint32_t)1 << VULP_LZ_WINDOW_LOG) - 1;
+    e.hlog = 17; wlog = VULP_LZ_WINDOW_LOG;
+    if (level >= OPT_LEVEL) {                 /* optimal parse: bigger hash table, window 2/4/8 MiB */
+        e.hlog = 20; wlog = (unsigned)(14 + level);
+        while (wlog > VULP_LZ_WINDOW_LOG && ((size_t)1 << (wlog - 1)) >= n) wlog--;   /* no bigger than the input */
+    }
+    e.wmask = ((uint32_t)1 << wlog) - 1;
     e.depth = depths[level]; e.lazy = level >= 4; e.skip_shift = skips[level];
     e.bpow = 1;
     for (i = 0; i < VULP_LZ_LONG_MIN - 1; i++) e.bpow *= RH_BASE;   /* RH_BASE^(MIN-1): weight of the outgoing byte */
-    e.litcap = VULP_LZ_BLOCK + 8; e.seqcap = VULP_LZ_BLOCK / VULP_LZ_MINMATCH + 8;
+    e.litcap = VULP_LZ_BLOCK + OPT_SEG + 8; e.seqcap = VULP_LZ_BLOCK / VULP_LZ_MINMATCH + 8;
     e.head = (uint32_t *)calloc((size_t)1 << e.hlog, sizeof(uint32_t));
     e.chain = (uint32_t *)calloc((size_t)e.wmask + 1, sizeof(uint32_t));
     e.lits = (uint8_t *)malloc(e.litcap);
@@ -294,6 +490,15 @@ int vulp_lz_encode(const uint8_t *in, size_t n, int level, uint8_t *out, size_t 
     e.hpos = (size_t)-1;
     if (e.ltab) roll_init(&e, 0);
 
+    if (level >= OPT_LEVEL) {
+        static const uint32_t odepth[3] = {16, 32, 64}, osuff[3] = {64, 64, 64};
+        uint32_t suff = osuff[level - OPT_LEVEL];
+        optnode *node = (optnode *)malloc((OPT_SEG + suff + 2) * sizeof(optnode));
+        if (!node) { rc = VULP_E_NOMEM; goto done; }
+        e.depth = odepth[level - OPT_LEVEL];
+        opt_parse(&e, &p, &lit_start, &adv, node, suff);
+        free(node);
+    }
     while (p + VULP_LZ_MINMATCH <= n && !e.err) {
         uint32_t off = 0, off2 = 0;
         size_t len, len2;

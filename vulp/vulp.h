@@ -12,7 +12,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define VULP_VERSION 2               /* bump when the API grows or encoder output changes (2: vulp-lz, cdc) */
+#define VULP_VERSION 3               /* bump when the API grows or encoder output changes (2: vulp-lz, cdc;
+                                        3: optimal parser at levels 7-9) */
 
 #define VULP_OK          0
 #define VULP_E_CORRUPT  -1           /* the encoded data is invalid; never "best effort" output */
