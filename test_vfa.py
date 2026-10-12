@@ -1004,6 +1004,8 @@ def t2_native(work, corpus):
                 lz = C.lz_encode(d, 6)                 # None: did not fit in len+4096 -> the CLI uses the full bound
                 if lz is None: lz = b""
                 h = zlib.crc32(lz, h)
+                lz9 = C.lz_encode(d, 9)                # the optimal parser
+                h = zlib.crc32(lz9 if lz9 is not None else b"", h)
                 cuts = C.cdc(d, 2048, 13, 65536)
                 h = zlib.crc32(b"".join(struct.pack("<Q", c) for c in cuts), h)
                 lines.append(f"size={len(d)} tans={tl} lz={len(lz)} cdc={len(cuts)} digest={h:08x}")

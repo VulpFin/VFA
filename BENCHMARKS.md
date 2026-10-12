@@ -508,3 +508,63 @@ extraction goes chunk by chunk and decodes each chunk once. The writer's dedup i
   find, and VFA2 stores what it cannot shrink.
 - **Small files (blob.bin, 1 MiB ramp): 899 bytes, against 359–746 for the others.** That is the fixed container
   overhead on a tiny archive.
+
+## 2026-10-12 07:52 M4.1 optimal parser (levels 7-9), Linux
+
+Machine: Linux-6.18.44-fc-v114-x86_64-with-glibc2.39, x86_64, 4 logical CPUs. Tools: python 3.13.16; xz xz (XZ Utils) 5.4.5; zstd *** Zstandard CLI (64-bit) v1.5.5, by Yann Collet ***; 7z 7-Zip 23.01 (x64) : Copyright (c) 1999-2023 Igor Pavlov : 2023-06-20; python-zstandard 0.25.0
+
+Ratio = compressed / original (lower is better). MB/s are of original data. RSS = peak resident memory of the process. Stub = size of the self-extractor the format needs ("-" = none exists for that tool).
+
+### sample (41,430,058 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa2-lz-solid | 0.3988 | 16,523,530 | 25.5 | 93.1 | 102.2 MiB | 121.2 MiB | - | ok |
+| vfa2-lz9-solid | 0.3981 | 16,494,918 | 2.6 | 103.1 | 134.8 MiB | 121.3 MiB | - | ok |
+| xz-9e | 0.3975 (best) | 16,466,920 | 2.7 | 142.6 | 422.7 MiB | 41.5 MiB | - | ok |
+| zstd-ultra22 | 0.3975 | 16,469,958 | 6.6 | 723.1 | 708.0 MiB | 43.5 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.4488 | 18,595,617 | 7.1 | 118.8 | 390.2 MiB | 56.5 MiB | - | ok |
+
+### vfa.py (60,974 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa2-lz-solid | 0.3012 | 18,364 | 0.5 | 0.5 | 33.8 MiB | 30.9 MiB | - | ok |
+| vfa2-lz9-solid | 0.2923 | 17,825 | 0.4 | 0.5 | 37.2 MiB | 31.0 MiB | - | ok |
+| xz-9e | 0.2719 (best) | 16,580 | 1.0 | 13.9 | 30.7 MiB | 2.0 MiB | - | ok |
+| zstd-ultra22 | 0.2757 | 16,808 | 0.0 | 14.6 | 651.3 MiB | 2.6 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.2730 | 16,645 | 3.0 | 6.3 | 7.6 MiB | 5.6 MiB | - | ok |
+
+VFA rows include Python interpreter start-up (~0.3-1 s per run); on small inputs that dominates MB/s.
+
+### M4.1: what the optimal parser buys (measured)
+
+Levels 7–9 replace the greedy/lazy parse with a price-driven optimal parse. Only the encoder changes: the stream
+format, the decoder and the SFX stub are the same, and archives made at these levels open with any M4 reader.
+Levels 0–6 produce exactly the same output as before.
+
+Text, through the `_vulp` extension directly (no interpreter start-up), one chunk per input. Sizes in bytes, then
+compress / decompress MB/s:
+
+| input | lz -6 | lz -7 | lz -8 | lz -9 | xz -9e | zstd -19 |
+|---|---:|---:|---:|---:|---:|---:|
+| Python 3.13 stdlib, 155 .py files concatenated (4,590,540) | 1,045,409 (15 / 162) | 972,167 (3.0 / 209) | 952,849 (1.5 / 228) | **939,212** (1.0 / 209) | 878,068 | 896,033 |
+| /usr/share/common-licenses concatenated (303,076) | 48,780 (30 / 318) | 46,957 (7.4 / 269) | 46,432 (5.6 / 220) | **46,112** (4.6 / 297) | 43,736 | 45,134 |
+| this repo's *.py + *.md (540,877) | 139,684 (13 / 145) | 133,649 (3.8 / 172) | 132,324 (3.0 / 167) | **131,424** (2.7 / 202) | 125,060 | 128,090 |
+
+Reading:
+- **Text:** level 9 is 5–10% smaller than level 6, and decodes as fast or faster (fewer, longer sequences). It
+  still loses to xz -9e by 5–7% and to zstd -19 by 2–5%. The rest of the gap is in the format, not the parser: xz and
+  zstd remember several recent offsets (vulp-lz: one) and xz codes literals with context. Closing it needs a format
+  change, which is its own decision.
+- **sample\ (mostly x86 executables):** 0.3983 → 0.3981. Binary data was already close to xz; the parser has little
+  to add there.
+- **Cost:** level 9 compresses sample\ at 2.6 MB/s (xz -9e: 2.7), with 135 MiB peak RSS (xz -9e: 423 MiB). On
+  repetitive text it drops to about 1 MB/s; the time is in walking hash chains over the 8 MiB window. A binary-tree
+  match finder would be the fix if that matters.
+- **Determinism:** level 9 is now part of the cross-compiler digest in the `native` test group. gcc and clang at
+  -O0, -O3 and -O3 -march=native -ffast-math give identical level-9 output (Linux). MSVC: not yet run with the
+  new parser.
+- **Rejected on the way:** a dictionary-free text transform (capital-letter flags + per-chunk word dictionary)
+  measured -2.1% on code, -0.3% on prose, -0.8% on this repo, and 0% on sample\ (20 KB of text in 40 MB). Not built;
+  filter 5 stays reserved.

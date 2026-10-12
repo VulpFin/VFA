@@ -7,7 +7,7 @@
  *                                 output (cost as u64 LE, filtered bytes, encoded bytes). Builds must print identical
  *                                 lines; test_vfa.py recomputes the same CRC through the _vulp extension.
  *                                 Also decodes everything back and exits 1 on any mismatch.
- *                                 Then vulp-lz (level 6) and content-defined chunking are hashed into the same line.
+ *                                 Then vulp-lz (levels 6 and 9) and content-defined chunking are hashed into the same line.
  *   vulpcli fuzz FILE N SEED      encode FILE (tANS, then vulp-lz), then decode N corrupted/truncated variants of
  *                                 each. Built with sanitizers,
  *                                 the oracle is "no crash, no sanitizer report"; prints how many were refused.
@@ -76,7 +76,7 @@ static int digest(const char *path)
         if (vulp_filter_inv(CONFIGS[c].id, CONFIGS[c].p, CONFIGS[c].plen, dec, back, n) != VULP_OK || memcmp(back, in, n)) { bad = 1; break; }
         if (c == 0) printf("size=%lu tans=%lu", (unsigned long)n, (unsigned long)elen);
     }
-    if (!bad) {                     /* vulp-lz at level 6; output that would not fit in n+4096 counts as empty */
+    if (!bad) {                     /* vulp-lz at levels 6 and 9; output that would not fit in n+4096 counts as empty */
         size_t cap = vulp_lz_bound(n), llen = 0, k, nc, maxc = n / 2048 + 2;
         uint8_t *lz = (uint8_t *)malloc(cap), cb[8];
         uint64_t *cuts = (uint64_t *)malloc(maxc * sizeof(uint64_t));
@@ -86,9 +86,16 @@ static int digest(const char *path)
             if (vulp_lz_decode(lz, llen, dec, n) != VULP_OK || memcmp(dec, in, n)) bad = 1;
             if (llen > n + 4096) llen = 0;
             h = crc(h, lz, llen);
+            size_t l6 = llen;
+            /* level 9: the optimal parser (price-driven, much more arithmetic than the greedy levels) */
+            llen = 0;
+            if (vulp_lz_encode(in, n, 9, lz, cap, &llen) != VULP_OK) bad = 1;
+            else if (vulp_lz_decode(lz, llen, dec, n) != VULP_OK || memcmp(dec, in, n)) bad = 1;
+            if (llen > n + 4096) llen = 0;
+            h = crc(h, lz, llen);
             nc = vulp_cdc(in, n, 2048, 13, 65536, cuts, maxc);
             for (k = 0; k < nc; k++) { for (i = 0; i < 8; i++) cb[i] = (uint8_t)(cuts[k] >> (8 * i)); h = crc(h, cb, 8); }
-            printf(" lz=%lu cdc=%lu", (unsigned long)llen, (unsigned long)nc);
+            printf(" lz=%lu cdc=%lu", (unsigned long)l6, (unsigned long)nc);
         }
         free(lz); free(cuts);
     }
