@@ -1,9 +1,11 @@
-# VFA2 container format: spec revision 2 (milestone M3)
+# VFA2 container format: spec revision 3 (milestone M4)
 
-VFA2 is VFA's chunked container. Revision 1 (M1) defined the container with the single coder `stored`. **Revision 2
-(M3) adds the `vulp-tans` coder, four filters, the `segmented` filter and the ROUTING record.** The container itself
-is unchanged: a revision-1 reader opens a revision-2 archive and refuses, by name, exactly the chunks whose coder or
-filter it lacks. The dual-dictionary match finder (M4) and context mixing (M5) are still to come.
+VFA2 is VFA's chunked container. Revision 1 (M1) defined the container with the single coder `stored`. Revision 2
+(M3) added the `vulp-tans` coder, four filters, the `segmented` filter and the ROUTING record. **Revision 3 (M4) adds
+the `vulp-lz` coder (LZ77 with a local and a long-range match finder, tANS-coded streams) and, in the writer,
+content-defined dedup across chunks.** The container itself is unchanged since revision 1: an older reader opens a
+newer archive and refuses, by name, exactly the chunks whose coder or filter it lacks. Dedup needs no reader
+support at all; it is expressed with ordinary index extents. Context mixing (M5) is still to come.
 
 - `vfa2.py` implements it: `Writer2` for writing, `Archive2` for reading. The codecs are C (`vulp/vulp.c`, built by
   `build_vulp.py` into the `_vulp` extension); `vulp_ref.py` is an independent pure-Python implementation of the
@@ -91,6 +93,7 @@ Decoding a chunk: decrypt (if encrypted) → coder decode → inverse filter →
 | 0 | stored | none | M1: payload = filtered data |
 | 1 | vulp-tans | none | M3: see *vulp-tans* |
 | 2 | vulp-cm | | reserved, M5 |
+| 3 | vulp-lz | none | M4: see *vulp-lz*. The writer's default. |
 
 **Filters** (all size-preserving bijections in this revision: filtered size = `raw_size`):
 
@@ -153,6 +156,49 @@ Example: the 64 bytes `00`×48 `01`×16 as one TANS block (22 bytes):
 02 | 40 00 00 00 | 05 | 01 | 18 08 | 33 00 00 00 | 11 00 | 40 55 55 55 f9 ff 07
 kind len=64       log=5 nsym=2 f=24,8  nbits=51      state=17  bitstream (7 bytes)
 ```
+
+### vulp-lz (coder 3)
+
+The payload is a sequence of LZ blocks; their `raw_len` fields add up to exactly the filtered size, and no bytes may
+follow the last block. Matches may reach back across blocks to any earlier byte **of the same chunk** (never into
+another chunk). The writer aims for 1 MiB blocks; a reader accepts any size.
+
+```
+u32 raw_len (>= 1)   u32 nseq (<= raw_len / 4)   u32 nlit (<= raw_len)
+u32 size, vulp-tans payload of the nlit literal bytes
+u32 size, vulp-tans payload of nseq literal-length codes
+u32 size, vulp-tans payload of nseq match-length codes
+u32 size, vulp-tans payload of nseq offset codes
+u32 nbits, extra-bits stream (ceil(nbits/8) bytes, bits LSB-first, read forwards; padding bits 0)
+```
+
+Each embedded stream is a complete vulp-tans payload (same block rules as coder 1) of exactly the stated length.
+
+**Values.** Each literal length, match length and offset is sent as a code (one byte, in its stream) plus extra bits
+(in the shared bit stream, in sequence order: literal length, match length, offset):
+- `v < 16`: code `v`, no extra bits.
+- otherwise `hb = floor(log2 v)`, code `= 16 + 2·(hb−4) + (bit hb−1 of v)`, extra = the low `hb−1` bits of v.
+  Decoding code `c ≥ 16`: `k = c − 16`, `hb = k/2 + 4`, `v = ((2 + (k mod 2)) << (hb−1)) | extra`. Codes above 71 are
+  invalid.
+
+**Sequences.** For each sequence: copy `ll` literals (next bytes of the literal stream); then the match:
+`ml = mv + 4`; the offset value `ov = 0` means "repeat the previous offset" (initially 1 at the start of each
+chunk), otherwise the offset is `ov` (and becomes the previous offset). Copy `ml` bytes starting `offset` bytes back,
+one byte at a time, so a short offset repeats a pattern. After the last sequence, the rest of the literal stream is
+copied.
+
+**Decoder rules** (any violation → the chunk is refused): every length and offset stays inside the block and the
+chunk (`offset ≤` bytes already produced); the literals end exactly at the end of the block; every extra bit is
+used; all four streams decode to exactly their stated lengths; no trailing bytes.
+
+**Encoder (informative, not normative).** Two match finders feed a lazy parser:
+- *local:* hash chains (2^17 heads) over a 512 KiB sliding window, sized for an L2 cache;
+- *long-range:* a sparse table of rolling hashes of 32-byte windows at content-defined anchor positions (about 1 in
+  16 positions), covering the whole chunk. It stores positions only, at most 2^22 entries (16 MiB), whatever the
+  chunk size. Found matches are extended backwards into the pending literals.
+On long literal runs the parser searches fewer positions (level 9 searches all), but it still inserts every
+position and checks every long-range anchor, so long repeats inside incompressible data (e.g. two installers that
+carry the same compressed payload) are still found. Levels 0–9 trade chain depth for speed (`--level`).
 
 ### Filters
 
@@ -243,8 +289,18 @@ u32 footer CRC32   "/VFA2"
 - **`--solid`**: files are packed back to back into chunks of 2^`--chunk-exp` bytes (default 2^26 = 64 MiB). A
   file may span chunks.
 - Identical chunks (same SHA-256) are written once, unless encrypting.
-- **Coder:** `--method tans` (default) or `--method stored`. A chunk that tANS does not make smaller is stored, and
-  the ROUTING record says so.
+- **Cross-chunk dedup** (default; `--no-dedup` turns it off; always off when encrypting). Each file's bytes are cut
+  into content-defined segments (gear rolling hash, 16 KiB minimum, about 64 KiB on average, 256 KiB maximum). A
+  segment of 4 KiB or more whose SHA-256 was seen before is not written again: the file gets an extent pointing at
+  the earlier copy, in an earlier chunk or earlier in the current one. Because the cut points depend only on
+  content, data shifted by insertions (a new version of an installer) still lines up. The writer keeps only the
+  segment fingerprints (at most 2^20, about 200 MiB of RAM, covering ~64 GiB of distinct data), never the data. Readers
+  need nothing new: these are ordinary extents. VFA's reader extracts chunk by chunk (each needed chunk is decoded
+  once, and its bytes are written at the right offsets into every file that uses them), so deduplicated files do not
+  cost repeated decodes, and extraction holds one decoded chunk at a time. Reading one file on its own (random
+  access, the viewer) keeps the last two decoded chunks.
+- **Coder:** `--method lz` (default), `--method tans` or `--method stored`. A chunk that the coder does not make
+  smaller is stored, and the ROUTING record says so.
 - **Filter:** `--filter auto` (default) or a forced filter (`none`, `delta:N`, `shuffle:K`, `bitshuffle:K`,
   `bcj-x86`, `bcj-arm64`). Auto routing:
   1. The chunk is cut into *units* at file boundaries: a file piece of 256 KiB or more is its own unit (split at
@@ -255,12 +311,17 @@ u32 footer CRC32   "/VFA2"
   3. The lowest estimate wins if it beats `none` by more than 1/64; ties go to the earlier candidate.
   4. Adjacent units with the same filter are merged. One filter for the whole chunk is written as that filter;
      otherwise as `segmented`.
-  The estimate is order-0, which is what vulp-tans codes. Once M4 adds match finding, the cost model must change
-  (BCJ, for example, helps matches far more than it helps order-0 statistics) and will be re-measured.
+  With vulp-lz, order-0 statistics are the wrong yardstick (BCJ helps matches, not byte statistics), so step 3 is
+  different: `none`, the two best order-0 candidates, and bcj-x86 / bcj-arm64 when the sample looks like machine
+  code (≥ 0.4% E8/E9 bytes, or ≥ 2% aligned BL words) are each compressed with vulp-lz at a fast level, and the
+  smallest real output wins under the same 1/64 rule. The ROUTING record keeps both sets of numbers.
 - Same input and same options give a byte-identical archive (the harness checks this). Encrypted archives differ
   every time, by design (salt, nonces).
 - mtime is stored to the nanosecond and restored with `os.utime(ns=...)`.
-- Not in M1: **append** (the format allows it; `vfa a` refuses VFA2 for now) and the ROUTING record (M3).
+- **Memory** (measured, Linux, see BENCHMARKS.md): peak RSS is bounded by the chunk size, not the file size. With
+  64 MiB chunks, about 250 MiB to create and about 205 MiB to extract, from 256 MiB inputs to 1 GiB, and the same
+  shape at 4 GiB.
+- Not yet: **append** (the format allows it; `vfa a` refuses VFA2 for now).
 
 ## What the checks do and do not protect against
 
@@ -277,10 +338,10 @@ u32 footer CRC32   "/VFA2"
 3 bytes, so the chunk is still stored, but the index gains a ROUTING record saying so.)
 
 ```
-00000000: 5646 4132 3200 0200 0100 0000 0000 0000  VFA22...........
+00000000: 5646 4132 3200 0300 0100 0000 0000 0000  VFA22...........
 00000010: 0000 0000 0000 0000 0000 0000 0000 0000  ................
-00000020: 0000 0000 0000 0000 0000 0000 0000 7604  ..............v.
-00000030: 7a56 5643 4b32 0000 0000 0000 0300 0000  zVVCK2..........
+00000020: 0000 0000 0000 0000 0000 0000 0000 3196  ..............1.
+00000030: 3ef9 5643 4b32 0000 0000 0000 0300 0000  >.VCK2..........
 00000040: 0000 0000 0300 0000 7a7a 6fed aeb3 c9f4  ........zzo.....
 00000050: 6869 0a56 4958 3200 0000 0000 0064 0000  hi.VIX2......d..
 00000060: 0000 0000 0064 0000 0082 2012 4b49 989a  .....d.... .KI..
@@ -291,10 +352,10 @@ u32 footer CRC32   "/VFA2"
 000000b0: 0000 0000 0000 0000 0001 0000 0000 0000  ................
 000000c0: 0000 0000 0000 0000 0003 0000 0000 0000  ................
 000000d0: 0000 0000 0053 0000 0000 0000 0082 0000  .....S..........
-000000e0: 0000 0000 0017 0100 0000 0000 0001 d04e  ...............N
-000000f0: 7f8a 36ec 409d 02fe 75a3 3e35 b862 8832  ..6.@...u.>5.b.2
-00000100: e14a c085 ca4a c090 0e73 ed78 4a0e aa45  .J...J...s.xJ..E
-00000110: 72ad 2f56 4641 32                        r./VFA2
+000000e0: 0000 0000 0017 0100 0000 0000 0001 27f6  ..............'.
+000000f0: a3c0 8967 21dc 9226 7886 1386 7e1c 605a  ...g!..&x...~.`Z
+00000100: f7cf 5886 3d79 0579 48f9 f609 f5f1 1f01  ..X.=y.yH.......
+00000110: 67fe 2f56 4641 32                        g./VFA2
 ```
 
 | bytes | field |
@@ -302,7 +363,7 @@ u32 footer CRC32   "/VFA2"
 | **Header** | |
 | `00–03` | `VFA2` |
 | `04–05` | header_size 50 |
-| `06–07` | spec_version 2 |
+| `06–07` | spec_version 3 |
 | `08–09` | min_reader 1 |
 | `0a–11` | required / optional features: 0 |
 | `12–2d` | KDF / AEAD / salt: unused (zeros) |
@@ -350,14 +411,13 @@ u32 footer CRC32   "/VFA2"
 | `10e–111` | footer CRC32 |
 | `112–116` | `/VFA2` |
 
-## Known limits of revision 2
+## Known limits of revision 3
 
-- **No match finding yet (M4).** vulp-tans is an order-0 entropy coder: it removes skewed byte statistics but not
-  repetition. VFA2 therefore still loses to VFA1+xz/zstd on almost everything except data a filter linearises (ramps,
-  counters, numeric columns). That is the expected state between M3 and M4; BENCHMARKS.md shows by how much.
-- **The `text` filter (id 5) is not implemented.** A text transform only pays off against a model that sees context
-  (M4's matches or M5's context mixing); against order-0 it cannot be measured meaningfully. It will be designed
-  against the M4/M5 coder, or dropped if it does not help there.
+- **vulp-lz is a zstd-class coder, not an LZMA-class one.** Its sequences are tANS-coded per stream with no context
+  modelling, so on text it stays a few percent behind xz -9e (see BENCHMARKS.md). The M5 context-mixing tier is
+  where that gap is meant to close.
+- **The `text` filter (id 5) is not implemented.** It will be designed against the M5 context-mixing coder, or
+  dropped if it does not help there.
 - **Small or sparse blocks fall back to RAW:** the TANS frequency table is stored densely up to the highest symbol
   present (≤ 256 entries, 1–2 bytes each), about 0.2% of a 128 KiB block.
 - **No append yet.**

@@ -238,3 +238,70 @@ def _filter(fid, params, data, inverse):
 
 def filter_fwd(fid, params, data) -> bytes: return _filter(fid, params, data, False)
 def filter_inv(fid, params, data) -> bytes: return _filter(fid, params, data, True)
+
+# ---------------------------------------------------------------- vulp-lz (coder 3) decoder and CDC (VFA2.md)
+
+LZ_MINMATCH, LZ_MAXCODE = 4, 71
+
+def _lz_value(code, bits):
+    if code < 16: return code
+    if code > LZ_MAXCODE: raise ValueError("corrupt encoded data")
+    k = code - 16; hb = k // 2 + 4
+    extra = bits(hb - 1)
+    return ((2 | (k & 1)) << (hb - 1)) | extra
+
+def lz_decode(payload, n: int) -> bytes:
+    p = bytes(payload); ip = 0; out = bytearray(); rep = 1
+    def bad(): raise ValueError("corrupt encoded data")
+    def u32():
+        nonlocal ip
+        if len(p) - ip < 4: bad()
+        v, = struct.unpack_from("<I", p, ip); ip += 4; return v
+    def stream(count):
+        nonlocal ip
+        sz = u32()
+        if len(p) - ip < sz: bad()
+        d = tans_decode(p[ip:ip + sz], count); ip += sz; return d
+    while len(out) < n:
+        raw, nseq, nlit = u32(), u32(), u32()
+        if raw == 0 or raw > n - len(out) or nlit > raw or nseq > (raw - nlit) // LZ_MINMATCH: bad()
+        bend = len(out) + raw
+        lits = stream(nlit); llc = stream(nseq); mlc = stream(nseq); ofc = stream(nseq)
+        nbits = u32(); nbytes = (nbits + 7) >> 3
+        if len(p) - ip < nbytes: bad()
+        acc = int.from_bytes(p[ip:ip + nbytes], "little")
+        if acc >> nbits: bad()                                  # padding bits must be zero
+        pos = 0
+        def bits(nb):
+            nonlocal pos
+            if nb > nbits - pos: bad()
+            v = (acc >> pos) & ((1 << nb) - 1); pos += nb; return v
+        lp = 0
+        for i in range(nseq):
+            ll = _lz_value(llc[i], bits); mv = _lz_value(mlc[i], bits); ov = _lz_value(ofc[i], bits)
+            if ll > nlit - lp or ll > bend - len(out): bad()
+            out += lits[lp:lp + ll]; lp += ll
+            ml = mv + LZ_MINMATCH
+            if ov: rep = ov
+            if rep > len(out) or ml > bend - len(out): bad()
+            start = len(out) - rep
+            for k in range(ml): out.append(out[start + k])   # byte by byte: overlapping copies repeat the pattern
+        if pos != nbits: bad()
+        if nlit - lp != bend - len(out): bad()
+        out += lits[lp:]
+        ip += nbytes
+    if ip != len(p): bad()
+    return bytes(out)
+
+def cdc(data, min_size, avg_log, max_size):
+    gear = []; x = 0x9E3779B9
+    for _ in range(256):
+        x ^= (x << 13) & 0xFFFFFFFF; x ^= x >> 17; x ^= (x << 5) & 0xFFFFFFFF; gear.append(x)
+    avg_log = max(1, min(30, avg_log)); cuts = []; h = 0; start = 0; d = bytes(data)
+    for i, b in enumerate(d):
+        h = ((h << 1) + gear[b]) & 0xFFFFFFFF
+        ln = i - start + 1
+        if (ln >= min_size and (h >> (32 - avg_log)) == 0) or ln >= max_size:
+            cuts.append(i + 1); start = i + 1; h = 0
+    if len(d) > start: cuts.append(len(d))
+    return cuts

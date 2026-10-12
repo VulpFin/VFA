@@ -84,12 +84,80 @@ static PyObject *py_cost(PyObject *self, PyObject *args)
     return PyLong_FromUnsignedLongLong(c);
 }
 
+static PyObject *py_lz_encode(PyObject *self, PyObject *args)
+{
+    Py_buffer in;
+    int level = 6, rc;
+    PyObject *res;
+    size_t cap, out_len = 0;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*|i", &in, &level)) return NULL;
+    if (in.len > MAX_IN) { PyBuffer_Release(&in); PyErr_SetString(PyExc_ValueError, "input too large"); return NULL; }
+    /* only output smaller than the input is useful (the writer stores the chunk otherwise): no 2x worst-case buffer */
+    cap = (size_t)in.len + 4096;
+    res = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)cap);
+    if (!res) { PyBuffer_Release(&in); return NULL; }
+    Py_BEGIN_ALLOW_THREADS
+    rc = vulp_lz_encode((const uint8_t *)in.buf, (size_t)in.len, level, (uint8_t *)PyBytes_AS_STRING(res), cap, &out_len);
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&in);
+    if (rc == VULP_E_SPACE) { Py_DECREF(res); Py_RETURN_NONE; }          /* does not fit: LZ does not pay off */
+    if (rc != VULP_OK) { Py_DECREF(res); return err(rc); }
+    if (_PyBytes_Resize(&res, (Py_ssize_t)out_len) < 0) return NULL;
+    return res;
+}
+
+static PyObject *py_lz_decode(PyObject *self, PyObject *args)
+{
+    Py_buffer in;
+    Py_ssize_t n;
+    PyObject *res;
+    int rc;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*n", &in, &n)) return NULL;
+    if (n < 0 || n > MAX_IN) { PyBuffer_Release(&in); PyErr_SetString(PyExc_ValueError, "bad output size"); return NULL; }
+    res = PyBytes_FromStringAndSize(NULL, n);
+    if (!res) { PyBuffer_Release(&in); return NULL; }
+    Py_BEGIN_ALLOW_THREADS
+    rc = vulp_lz_decode((const uint8_t *)in.buf, (size_t)in.len, (uint8_t *)PyBytes_AS_STRING(res), (size_t)n);
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&in);
+    if (rc != VULP_OK) { Py_DECREF(res); return err(rc); }
+    return res;
+}
+
+static PyObject *py_cdc(PyObject *self, PyObject *args)
+{
+    Py_buffer in;
+    unsigned int min_size, avg_log, max_size;
+    size_t maxc, nc, i;
+    uint64_t *cuts;
+    PyObject *res;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*III", &in, &min_size, &avg_log, &max_size)) return NULL;
+    if (min_size == 0 || max_size < min_size) { PyBuffer_Release(&in); PyErr_SetString(PyExc_ValueError, "bad sizes"); return NULL; }
+    maxc = (size_t)in.len / min_size + 2;
+    cuts = (uint64_t *)PyMem_Malloc(maxc * sizeof(uint64_t));
+    if (!cuts) { PyBuffer_Release(&in); return PyErr_NoMemory(); }
+    Py_BEGIN_ALLOW_THREADS
+    nc = vulp_cdc((const uint8_t *)in.buf, (size_t)in.len, min_size, avg_log, max_size, cuts, maxc);
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&in);
+    res = PyList_New((Py_ssize_t)nc);
+    if (res) for (i = 0; i < nc; i++) PyList_SET_ITEM(res, (Py_ssize_t)i, PyLong_FromUnsignedLongLong(cuts[i]));
+    PyMem_Free(cuts);
+    return res;
+}
+
 static PyMethodDef methods[] = {
     {"tans_encode", py_tans_encode, METH_VARARGS, "tans_encode(data) -> bytes"},
     {"tans_decode", py_tans_decode, METH_VARARGS, "tans_decode(payload, raw_size) -> bytes (ValueError if corrupt)"},
     {"filter_fwd", py_filter_fwd, METH_VARARGS, "filter_fwd(id, params, data) -> bytes"},
     {"filter_inv", py_filter_inv, METH_VARARGS, "filter_inv(id, params, data) -> bytes"},
     {"cost", py_cost, METH_VARARGS, "cost(data) -> estimated order-0 coded size in 1/65536 bits"},
+    {"lz_encode", py_lz_encode, METH_VARARGS, "lz_encode(data, level=6) -> bytes, or None if it would not be smaller"},
+    {"lz_decode", py_lz_decode, METH_VARARGS, "lz_decode(payload, raw_size) -> bytes (ValueError if corrupt)"},
+    {"cdc", py_cdc, METH_VARARGS, "cdc(data, min_size, avg_log, max_size) -> list of segment end offsets"},
     {NULL, NULL, 0, NULL}
 };
 

@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define VULP_VERSION 1               /* bump when the encoder's output for the same input changes */
+#define VULP_VERSION 2               /* bump when the API grows or encoder output changes (2: vulp-lz, cdc) */
 
 #define VULP_OK          0
 #define VULP_E_CORRUPT  -1           /* the encoded data is invalid; never "best effort" output */
@@ -43,6 +43,26 @@ uint32_t vulp_log2_q16(uint32_t x);
 /* Filters are size-preserving bijections: out has exactly n bytes. in and out must not overlap. */
 int vulp_filter_fwd(int id, const uint8_t *params, size_t plen, const uint8_t *in, uint8_t *out, size_t n);
 int vulp_filter_inv(int id, const uint8_t *params, size_t plen, const uint8_t *in, uint8_t *out, size_t n);
+
+/* LZ ("vulp-lz", coder 3, M4): LZ77 parse + tANS-coded literal / length / offset streams. Matches may reach back
+ * anywhere in the chunk. Two match finders feed the parser (encoder only; the decoder does not care):
+ *   local:  hash chains over a sliding window of 2^VULP_LZ_WINDOW_LOG bytes (sized for L2 cache)
+ *   long:   a sparse table of rolling hashes of VULP_LZ_LONG_MIN-byte windows at content-defined anchors (about
+ *           one position in VULP_LZ_LONG_STRIDE), covering the whole chunk (positions only - the data is the chunk) */
+#define VULP_LZ_MINMATCH    4
+#define VULP_LZ_WINDOW_LOG  19          /* 512 KiB local window */
+#define VULP_LZ_LONG_MIN    32
+#define VULP_LZ_LONG_STRIDE 16
+#define VULP_LZ_BLOCK       (1u << 20)  /* raw bytes per LZ block the encoder aims for; the decoder accepts any */
+#define VULP_LZ_MAXCODE     71          /* largest length/offset code (values up to 2^32-1) */
+size_t vulp_lz_bound(size_t n);
+int vulp_lz_encode(const uint8_t *in, size_t n, int level, uint8_t *out, size_t cap, size_t *out_len);
+int vulp_lz_decode(const uint8_t *in, size_t in_len, uint8_t *out, size_t n);
+
+/* Content-defined chunking (gear rolling hash) for the writer's cross-chunk dedup. Writes segment END offsets to
+ * cuts (at most max_cuts) and returns how many; the last cut is always n (for n > 0). Encoder only. */
+size_t vulp_cdc(const uint8_t *in, size_t n, uint32_t min_size, unsigned avg_log, uint32_t max_size,
+                uint64_t *cuts, size_t max_cuts);
 
 const char *vulp_strerror(int err);
 

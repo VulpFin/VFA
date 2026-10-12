@@ -9,7 +9,7 @@ VFA correctness harness (VFA1 and VFA2). No pytest needed:
     python test_vfa.py --big            # also the >4 GiB single-file tests (needs ~13 GB free, slow)
     python test_vfa.py --fuzz 5000      # more fuzz cases per archive (default 600)
     python test_vfa.py --only fuzz,ra   # groups: roundtrip,sample,encrypt,append,ra,refuse,paths,fuzz,determinism,sfx,signed,
-                                        #         codec,native,big
+                                        #         codec,native,lz,dedup,big
 
 What "pass" means:
   roundtrip     every file comes back byte-identical (all methods x solid/non-solid, multi-block, edge-case files)
@@ -429,6 +429,19 @@ def peak_rss_of(p: subprocess.Popen) -> int:
     import resource
     return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024   # max over all children so far
 
+def run_peak(cmd, cwd=None, env=None):
+    """Run cmd; return its own peak RSS in bytes (0 if unknown). Linux: GNU time (a child's ru_maxrss would include
+    this harness's forked memory, and RUSAGE_CHILDREN is a max over all children). Windows: PeakWorkingSetSize."""
+    if sys.platform.startswith("linux") and os.path.isfile("/usr/bin/time"):
+        fd, rf = tempfile.mkstemp(); os.close(fd)
+        try:
+            subprocess.run(["/usr/bin/time", "-q", "-f", "%M", "-o", rf, *cmd], cwd=cwd, env=env)
+            kb = pathlib.Path(rf).read_text().split()
+            return int(kb[-1]) * 1024 if kb else 0
+        finally: os.unlink(rf)
+    p = subprocess.Popen(cmd, cwd=cwd, env=env); p.wait()
+    return peak_rss_of(p)
+
 def t_big(work, fmt="vfa1"):
     size = (4 << 30) + 123_457                          # > 4 GiB and not block-aligned
     src = work / "big"; shutil.rmtree(src, ignore_errors=True); src.mkdir()
@@ -447,10 +460,9 @@ def t_big(work, fmt="vfa1"):
     for flags in ([], ["--solid"]):
         arc = work / "big.vfa"
         codec = ["--method", "zstd", "--level", "3"] if fmt == "vfa1" else ["--format", "vfa2"]
-        p = subprocess.Popen([real_py, str(HERE / "vfa.py"), "c", str(arc), "big", *codec, *flags], cwd=work, env=env)
-        p.wait(); rss_c = peak_rss_of(p)
+        rss_c = run_peak([real_py, str(HERE / "vfa.py"), "c", str(arc), "big", *codec, *flags], cwd=work, env=env)
         out = work / "big_out"; shutil.rmtree(out, ignore_errors=True)
-        p = subprocess.Popen([real_py, str(HERE / "vfa.py"), "x", str(arc), "-o", str(out)], env=env); p.wait(); rss_x = peak_rss_of(p)
+        rss_x = run_peak([real_py, str(HERE / "vfa.py"), "x", str(arc), "-o", str(out)], env=env)
         g = hashlib.sha256()
         with open(out / "big/huge.bin", "rb") as fr:
             for b in iter(lambda: fr.read(1 << 24), b""): g.update(b)
@@ -712,8 +724,20 @@ def t2_fuzz(work, n_cases, quick):
         check("fuzz target really uses the segmented filter + tANS", any(ch[3] == 1 and ch[4] == V2.SEGMENTED for ch in c.chunks), str(c.chunks))
     run_fuzz([("vfa2 tANS + auto filter", build2(work / "fz2_t.vfa", tfiles, coder=1, filt=None), None, (True, False)),
               ("vfa2 tANS, solid, segmented filter", seg, None, (True, False)),
-              ("vfa2 tANS + bitshuffle:4", build2(work / "fz2_b.vfa", tfiles, coder=1, filt=(2, b"\x04\x01")), None, (True, False))],
+              ("vfa2 tANS + bitshuffle:4", build2(work / "fz2_b.vfa", tfiles, coder=1, filt=(2, b"\x04\x01")), None, (True, False)),
+              ("vfa2 vulp-lz + auto filter", build2(work / "fz2_l.vfa", tfiles, coder=3, filt=None), None, (True, False))],
              twant, n_cases, quick, rnd)
+    # dedup: a second copy of the ramp makes the writer reference earlier segments instead of storing them
+    dfiles = tfiles + [("z/ramp2.bin", tfiles[-1][1])]
+    dd = build2(work / "fz2_d.vfa", dfiles, coder=3, filt=None, solid=True, chunk_size=1 << 17, cdc=True)
+    with vx.open_container(str(dd)) as c:
+        c.unlock(None); ents = {e["path"]: e for e in c.entries}
+        inside = lambda x, y: x[0] == y[0] and y[1] <= x[1] and x[1] + x[2] <= y[1] + y[2]
+        check("fuzz target really uses dedup (part of ramp2.bin points into ramp.bin's stored bytes)",
+              any(inside(x, y) for x in ents["z/ramp2.bin"]["extents"] for y in ents["z/ramp.bin"]["extents"]),
+              str(ents["z/ramp2.bin"]["extents"])[:200])
+    run_fuzz([("vfa2 vulp-lz, solid, dedup", dd, None, (True, False))],
+             {p: hashlib.sha256(d).hexdigest() for p, d in dfiles}, n_cases, quick, rnd)
     # the oracle must be able to fail: an intact archive judged against the wrong expectation must read as WRONG
     bogus = dict(want); bogus["z/a.txt"] = "0" * 64
     check("fuzz oracle self-test: a wrong expectation is reported as WRONG",
@@ -863,7 +887,7 @@ def t2_codec(work, corpus):
 
 # ---- native builds
 
-NATIVE_SRC = ["vulp/vulp.c", "vulp/vulpcli.c"]
+NATIVE_SRC = ["vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulpcli.c"]
 FP_TYPES = re.compile(r"\b(float|double|_Float\d+|__fp16|_Complex|fenv_t)\b|#\s*include\s*<(math|fenv|tgmath|complex)\.h>|\b(fabs|sqrt|pow|exp|log|log2|floor|ceil|round)\s*\(")
 # x86 floating-point arithmetic/conversion (SSE/AVX scalar+packed, x87). Plain moves/bitwise (movaps, pxor) are integer-safe.
 FP_INSN = re.compile(r"\b(v?(add|sub|mul|div|sqrt|min|max|rcp|rsqrt|round|cmp|comi|ucomi|h?addsub|hadd|hsub|dp)(ss|sd|ps|pd)|"
@@ -905,7 +929,7 @@ def t2_native(work, corpus):
     srcs = [str(HERE / s) for s in NATIVE_SRC]
     # 1. source lint: no floating-point types or math in the codec (C) ...
     hits = []
-    for f in ["vulp/vulp.c", "vulp/vulp.h", "vulp/vulpcli.c", "vulp/vulpmodule.c"]:
+    for f in ["vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulp.h", "vulp/vulpcli.c", "vulp/vulpmodule.c"]:
         for ln, line in enumerate(strip_c_comments((HERE / f).read_text()).splitlines(), 1):
             if FP_TYPES.search(line): hits.append(f"{f}:{ln}: {line.strip()}")
     check("native: no float/double/<math.h> in the C codec sources", not hits, str(hits[:5]))
@@ -916,7 +940,9 @@ def t2_native(work, corpus):
     import ast
     targets = {"vulp_ref.py": None, "vfa2.py": {"classify", "route", "units", "_sample", "_hint", "seg_pack", "seg_unpack",
                                                 "_seg_apply", "_tans_encode", "_tans_decode", "_filter_codec", "_stored_encode",
-                                                "_stored_decode", "_flush", "chunk_data", "filter_label", "parse_filter"}}
+                                                "_stored_decode", "_flush", "chunk_data", "filter_label", "parse_filter",
+                                                "_lz_encode", "_lz_decode", "_code_hints", "_segment", "_reference",
+                                                "_append", "add_file"}}
     hits = []
     for fname, funcs in targets.items():
         tree = ast.parse((HERE / fname).read_text())
@@ -975,7 +1001,12 @@ def t2_native(work, corpus):
                     fl = C.filter_fwd(fid, p, d); e = C.tans_encode(fl)
                     if i == 0: tl = len(e)
                     h = zlib.crc32(struct.pack("<Q", C.cost(fl)), h); h = zlib.crc32(fl, h); h = zlib.crc32(e, h)
-                lines.append(f"size={len(d)} tans={tl} digest={h:08x}")
+                lz = C.lz_encode(d, 6)                 # None: did not fit in len+4096 -> the CLI uses the full bound
+                if lz is None: lz = b""
+                h = zlib.crc32(lz, h)
+                cuts = C.cdc(d, 2048, 13, 65536)
+                h = zlib.crc32(b"".join(struct.pack("<Q", c) for c in cuts), h)
+                lines.append(f"size={len(d)} tans={tl} lz={len(lz)} cdc={len(cuts)} digest={h:08x}")
             check("native: the _vulp extension (as bundled into the stubs) matches the standalone builds", "\n".join(lines) + "\n" == ref[1],
                   f"{lines[:2]} vs {ref[1].splitlines()[:2]}")
         except ImportError:
@@ -984,12 +1015,14 @@ def t2_native(work, corpus):
     objs = []
     for label, mk in comps:
         if "O0" in label or "Od" in label: continue
-        obj = work / ("vulp_" + re.sub(r"\W+", "_", label) + ".o")
-        argv, env = mk([str(HERE / "vulp/vulp.c")], obj)
-        r = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=work)
-        if r.returncode == 0: objs.append((label, obj, env))
+        for src in ("vulp/vulp.c", "vulp/vulp_lz.c"):
+            obj = work / ("obj_" + re.sub(r"\W+", "_", label + "_" + src) + ".o")
+            argv, env = mk([str(HERE / src)], obj)
+            r = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=work)
+            if r.returncode == 0: objs.append((label, obj, env, src))
+            else: check(f"native: {src} compiles with {label}", False, (r.stdout + r.stderr)[-300:])
     scanned = 0
-    for label, obj, env in objs:
+    for label, obj, env, src in objs:
         if label.startswith("msvc"):
             import build_vulp; db = build_vulp.msvc_tool(env, "dumpbin")
             if not db: continue
@@ -1001,11 +1034,11 @@ def t2_native(work, corpus):
         found = sorted({m.group(0) for line in r.stdout.splitlines() if "\t" in line or label.startswith("msvc")
                         for m in [FP_INSN.search(line.split("\t", 2)[-1] if "\t" in line else line)] if m})
         scanned += 1
-        check(f"native: no floating-point instructions in vulp.c compiled by {label}", not found, str(found[:10]))
+        check(f"native: no floating-point instructions in {src} compiled by {label}", not found, str(found[:10]))
     if not scanned: skip("native: floating-point instruction scan", "no disassembler (objdump / dumpbin) found")
     elif objs:
         # oracle self-test: the same scan must flag a function that really uses floating point
-        label, _, env = objs[0]; probe = work / "fp_probe.c"; pobj = work / "fp_probe.o"
+        label, _, env, _src = objs[0]; probe = work / "fp_probe.c"; pobj = work / "fp_probe.o"
         probe.write_text("double vfa_probe(double a, int b) { return a * 1.5 + (double)b; }\n")
         mk = dict(comps)[label]; argv, env = mk([str(probe)], pobj)
         subprocess.run(argv, capture_output=True, env=env, cwd=work)
@@ -1038,6 +1071,245 @@ def t2_native(work, corpus):
         check(f"native: {cc} ASan+UBSan build: encoder on {min(12, len(inputs))} inputs + {4000 * (len(logs) - 1)} corrupted "
               f"decodes, no sanitizer report ({summary} ...)", ok, "".join(l.stderr[-600:] for l in logs if l.returncode or l.stderr))
 
+    # 5. clang UBSan in trap mode: needs no sanitizer runtime and catches what gcc's UBSan lets through
+    #    (e.g. arithmetic on a NULL pointer, NULL + 0, which clang checks and gcc does not)
+    if os.name != "nt" and shutil.which("clang"):
+        exe = work / "vulpcli_ubtrap"
+        r = subprocess.run(["clang", "-std=c99", "-O1", "-g", "-fsanitize=undefined", "-fsanitize-trap=undefined",
+                            "-o", str(exe), *srcs], capture_output=True, text=True)
+        if r.returncode:
+            check("native: clang UBSan (trap mode) build", False, r.stderr[-600:])
+        else:
+            logs = [subprocess.run([str(exe), "digest", *map(str, inputs[:12])], capture_output=True, text=True)]
+            for i, f in enumerate([x for x in inputs if x.stat().st_size > 1000][:6]):
+                logs.append(subprocess.run([str(exe), "fuzz", str(f), "2000", str(i + 1)], capture_output=True, text=True))
+            check(f"native: clang UBSan (trap mode): encoder on {min(12, len(inputs))} inputs + {2000 * (len(logs) - 1)} "
+                  f"corrupted decodes, no trap", all(l.returncode == 0 for l in logs),
+                  "; ".join(f"rc={l.returncode} {l.stderr[-200:]}" for l in logs if l.returncode))
+    else:
+        skip("native: clang UBSan (trap mode)", "no clang (Windows: run on Linux/WSL)")
+
+# ================================================================ VFA2 M4: vulp-lz + cross-chunk dedup
+
+def t2_lz(work, corpus):
+    import vfa2 as V2, vulp_ref as R
+    try:
+        import _vulp as C
+    except ImportError:
+        check("vfa2 lz: the _vulp C extension is built", False, "not importable"); return
+    cases = codec_cases(corpus); rnd = random.Random(4242)
+    a = rnd.randbytes(5 << 20)
+    cases["long-range: 5 MiB, 1 MiB other, same 5 MiB again"] = a + rnd.randbytes(1 << 20) + a
+    cases["3 MiB of zeros (one huge match)"] = bytes(3 << 20)
+    mism = []; n = 0; ratios = {}
+    for name, d in cases.items():
+        for lvl in (0, 6, 9):
+            e = C.lz_encode(d, lvl)
+            if e is None: continue
+            n += 1
+            if C.lz_decode(e, len(d)) != d: mism.append(f"C decode L{lvl} {name}")
+            if len(d) <= 300_000 and R.lz_decode(e, len(d)) != d: mism.append(f"reference decode L{lvl} {name}")
+            if lvl == 6: ratios[name] = len(e) / max(1, len(d))
+    check(f"vfa2 lz: {n} encodings decode byte-identically (C), and with the pure-Python reference where small", not mism, str(mism[:5]))
+    lr = ratios.get("long-range: 5 MiB, 1 MiB other, same 5 MiB again", 9)      # 6 of 11 MiB are unique random bytes
+    check(f"vfa2 lz: long-range match across a 1 MiB gap found (ratio {lr:.4f}; optimum 6/11 = 0.5455)", lr < 6 / 11 + 0.002)
+    check(f"vfa2 lz: 3 MiB of zeros -> {ratios.get('3 MiB of zeros (one huge match)', 9) * 3145728:.0f} bytes",
+          ratios.get("3 MiB of zeros (one huge match)", 9) * 3145728 < 200)
+    check("vfa2 lz: empty input encodes to an empty payload that decodes", C.lz_encode(b"", 6) == b"" and C.lz_decode(b"", 0) == b""
+          and R.lz_decode(b"", 0) == b"")
+    cd = [(nm, d[:120_000]) for nm, d in list(cases.items())[:10]]
+    check("vfa2 lz: content-defined cut points, C == reference", all(C.cdc(d, 512, 11, 8192) == R.cdc(d, 512, 11, 8192) for _, d in cd))
+    # block counts that cannot fit (every match is >= 4 bytes, so nlit + 4*nseq <= raw) are refused up front
+    raw = 1 << 20; m = struct.pack("<III", raw, raw // 4, raw)
+    refused = []
+    for impl in (C, R):
+        try: impl.lz_decode(m, raw); refused.append(False)
+        except Exception: refused.append(True)
+    check("vfa2 lz: a block claiming nlit = raw and nseq = raw/4 is refused by both decoders", all(refused))
+    # corrupted vulp-lz payloads: no crash in either decoder, and both agree
+    src = cases["corpus/data.csv (64 KiB)"] if "corpus/data.csv (64 KiB)" in cases else cases["random 5000"]
+    enc = C.lz_encode(src, 6); stats = {"refused": 0, "identical": 0, "different": 0}; crash = []; disagree = []
+    for k in range(3000):
+        m, _ = mutate(enc, rnd); size = len(src) if k % 5 else rnd.randrange(len(src) + 2)
+        res = []
+        for impl in ((C,) if k % 10 else (C, R)):
+            try: out = impl.lz_decode(m, size); res.append(out); stats["identical" if out == src else "different"] += 1
+            except ValueError: res.append("refused"); stats["refused"] += 1
+            except Exception as e: crash.append(f"{impl.__name__}: {e!r}")
+        if len(res) == 2 and res[0] != res[1]: disagree.append(k)
+    check(f"vfa2 lz: corrupted payloads never crash either decoder {stats}", not crash, str(crash[:3]))
+    check("vfa2 lz: C and reference decoders agree on corrupted payloads (accept/refuse and bytes)", not disagree, str(disagree[:5]))
+    # a stale extension left over from an older build (API 1: no vulp-lz): refused cleanly, never half-used.
+    # vfa.py's own folder (with the real module) comes first on sys.path, so run it through a launcher that puts
+    # the stale module in front.
+    stale = work / "stale_ext"; stale.mkdir(exist_ok=True)
+    (stale / "_vulp.py").write_text("VERSION = 1\nfrom vulp_ref import tans_encode, tans_decode, filter_fwd, filter_inv, cost\n")
+    (stale / "launch.py").write_text("import sys, runpy\nsys.path[:0] = [%r, %r]\nsys.argv = sys.argv[1:]\n"
+                                     "runpy.run_path(sys.argv[0], run_name='__main__')\n" % (str(stale), str(HERE)))
+    def stale_vfa(*argv, cwd=None):
+        return subprocess.run([PY, str(stale / "launch.py"), str(HERE / "vfa.py"), *map(str, argv)], capture_output=True, text=True, cwd=cwd)
+    src = work / "stale_src"; (src / "z").mkdir(parents=True, exist_ok=True); (src / "z/a.txt").write_bytes(b"stale extension " * 400)
+    r = stale_vfa("c", work / "stale_new.vfa", "z", "--format", "vfa2", cwd=src)
+    check("vfa2: a stale _vulp extension (API 1) makes 'vfa c' say it is out of date, not crash",
+          r.returncode != 0 and "out of date" in (r.stdout + r.stderr) and "Traceback" not in r.stderr, (r.stdout + r.stderr)[-300:])
+    lzarc = build2(work / "stale_lz.vfa", [("z/a.txt", b"stale extension " * 400)], coder=3, filt=(0, b""))
+    out = work / "stale_out"; shutil.rmtree(out, ignore_errors=True)
+    r = stale_vfa("x", lzarc, "-o", out)
+    check("vfa2: with a stale extension, vulp-lz archives still extract (pure-Python fallback, with a warning)",
+          r.returncode == 0 and (out / "z/a.txt").read_bytes() == b"stale extension " * 400 and "out of date" in r.stdout + r.stderr,
+          (r.stdout + r.stderr)[-300:])
+    # an older reader (M3: no vulp-lz) names what it lacks
+    p = build2(work / "r_lz.vfa", [("z/a.txt", b"vulp-lz " * 2000)], coder=3, filt=(0, b""))
+    saved = (V2.CODERS.pop(3), dict(V2.RESERVED_CODERS)); V2.RESERVED_CODERS[3] = "vulp-lz (M4)"
+    try:
+        try: open_extract(p, work / "r_lz_out"); check("vfa2 refuse: a reader without vulp-lz names it", False, "accepted")
+        except vx.VFAError as e: check("vfa2 refuse: a reader without vulp-lz names it (simulated M3 reader)", "coder id 3 (vulp-lz" in str(e), str(e))
+    finally:
+        V2.CODERS[3] = saved[0]; V2.RESERVED_CODERS.clear(); V2.RESERVED_CODERS.update(saved[1])
+
+def t2_dedup(work, corpus):
+    import vfa2 as V2
+    if not V2.NATIVE: skip("vfa2 dedup", "needs the _vulp extension"); return
+    rnd = random.Random(77)
+    base = rnd.randbytes(3 << 20)
+    shifted = b"a different header " * 50 + base[:1 << 20] + rnd.randbytes(70_000) + base[1 << 20:]   # inserts move offsets
+    d = work / "dd"; shutil.rmtree(d, ignore_errors=True); (d / "s").mkdir(parents=True)
+    (d / "s/v100.bin").write_bytes(base); (d / "s/v110.bin").write_bytes(shifted)
+    sizes = {}
+    for flags in ([], ["--no-dedup"], ["--solid"]):
+        arc = work / f"dd_{'_'.join(f.strip('-') for f in flags) or 'default'}.vfa"
+        vfa("c", arc, "s", "--format", "vfa2", *flags, cwd=d)
+        ok, why = extract_cmp(arc, d / "s", work); sizes[" ".join(flags) or "non-solid"] = arc.stat().st_size
+        check(f"vfa2 dedup: shifted near-duplicate files round-trip ({' '.join(flags) or 'non-solid'})", ok, why)
+    (d / "same").mkdir(exist_ok=True); (d / "same/a.bin").write_bytes(base[:1 << 20]); (d / "same/b.bin").write_bytes(base[:1 << 20])
+    for flags, want in (([], 1), (["--no-dedup"], 2)):
+        arc = work / f"dd_same_{len(flags)}.vfa"; vfa("c", arc, "same", "--format", "vfa2", *flags, cwd=d)
+        with vx.open_container(str(arc)) as c:
+            c.unlock(None)
+            check(f"vfa2 dedup: two identical files -> {len(c.chunks)} chunk(s) {' '.join(flags) or '(default)'}", len(c.chunks) == want)
+    check(f"vfa2 dedup: non-solid archive of two near-duplicates {sizes['non-solid']:,} B vs {sizes['--no-dedup']:,} B without dedup",
+          sizes["non-solid"] < 0.6 * sizes["--no-dedup"])
+    with vx.open_container(str(work / "dd_default.vfa")) as c:
+        c.unlock(None)
+        v110 = next(e for e in c.entries if e["path"].endswith("v110.bin")); v100 = next(e for e in c.entries if e["path"].endswith("v100.bin"))
+        own = {ch for ch, _, _ in v100["extents"]}
+        check(f"vfa2 dedup: v110.bin borrows extents from v100.bin's chunk ({len(v110['extents'])} extents)",
+              any(ch in own for ch, _, _ in v110["extents"]))
+        seen = []; orig = c.chunk_data
+        c.chunk_data = lambda i: (seen.append(i), orig(i))[1]
+        out = work / "dd_ra"; shutil.rmtree(out, ignore_errors=True)
+        c.extract(str(out), members=["s/v110.bin"])
+        check(f"vfa2 dedup: random access to the deduplicated member decodes {len(set(seen))} chunk(s), "
+              f"({len(seen)} chunk requests, cache hits included)", (out / "s/v110.bin").read_bytes() == shifted and len(set(seen)) <= 2)
+    p = build2(work / "dd_enc.vfa", [("z/a", base[:1 << 20]), ("z/b", base[:1 << 20])], password=b"pw", kdf=(1, 1024, 1), cdc=True)
+    with vx.open_container(str(p)) as c:
+        c.unlock("pw")
+        check("vfa2 dedup is off when encrypting (identical files get separate chunks)", len(c.chunks) == 2)
+    # duplicate paths whose extents span chunks (chunk-major extraction must not open one target twice)
+    # the second entry shares the first one's bytes (dedup references back into its chunks) plus a new tail
+    first = base[:300_000]; second = first + base[900_000:1_000_000]
+    for solid in (False, True):
+        p = build2(work / f"dd_dup_{solid}.vfa", [("z/a", first), ("z/a", second)], coder=3, filt=None,
+                   solid=solid, chunk_size=1 << 16, cdc=True)
+        out = work / "dd_dup_out"; shutil.rmtree(out, ignore_errors=True)
+        try:
+            open_extract(p, out)
+            check(f"vfa2: duplicate paths spanning chunks extract, last entry wins ({'solid' if solid else 'non-solid'})",
+                  (out / "z/a").read_bytes() == second and not list(out.rglob("*.vfapart")))
+        except Exception as e:
+            check(f"vfa2: duplicate paths spanning chunks extract, last entry wins ({'solid' if solid else 'non-solid'})", False, repr(e))
+    # case aliases ("z/A" then "z/a"): kept apart on a case-sensitive destination, coalesced (last wins) on a
+    # case-insensitive one such as default macOS - simulated by forcing the probes (volume: ASCII case folds)
+    p = build2(work / "dd_case.vfa", [("z/A", first), ("z/a", second), ("..z/A", first), ("..z/a", second)],
+               dirs=("z", "..z"), coder=3, filt=None, solid=True, chunk_size=1 << 16, cdc=True)
+    real, real_same = vx._case_insensitive, vx._same_on_volume
+    for forced in (None, True):
+        out = work / "dd_case_out"; shutil.rmtree(out, ignore_errors=True); out.mkdir()
+        ci = real(str(out)) if forced is None else forced
+        vx._case_insensitive = (lambda d, v=ci: v)
+        if forced: vx._same_on_volume = lambda d, a, b: a.lower() == b.lower()
+        try:
+            open_extract(p, out)
+            ok = True
+            for top in ("z", "..z"):     # "..z" is a name inside dest, not a parent reference
+                names = sorted(q.name for q in (out / top).iterdir())
+                if ci:   # one file survives, holding the last entry's bytes (its name is the volume's business)
+                    ok &= len(names) == 1 and (out / top / names[0]).read_bytes() == second
+                else:
+                    ok &= names == ["A", "a"] and (out / top / "A").read_bytes() == first and (out / top / "a").read_bytes() == second
+            check(f"vfa2: case-alias paths on a case-{'in' if ci else ''}sensitive destination "
+                  f"({'coalesced, last wins' if ci else 'kept apart'})", ok, repr(names))
+        except Exception as e:
+            check(f"vfa2: case-alias paths (case-{'in' if ci else ''}sensitive)", False, repr(e))
+        finally:
+            vx._case_insensitive, vx._same_on_volume = real, real_same
+    # a directory already at dest that links to another one: d1/a and d2/a are one file (last entry wins)
+    if os.name != "nt":
+        p = build2(work / "dd_link.vfa", [("z/d1/a", first), ("z/d2/a", second)], dirs=(), coder=3, filt=None,
+                   solid=True, chunk_size=1 << 16, cdc=True)
+        out = work / "dd_link_out"; shutil.rmtree(out, ignore_errors=True)
+        (out / "z/d1").mkdir(parents=True); os.symlink("d1", out / "z/d2")
+        try:
+            open_extract(p, out)
+            check("vfa2: two paths through a symlinked directory already at dest are one file (last entry wins)",
+                  (out / "z/d1/a").read_bytes() == second and not list(out.rglob("*.vfapart")))
+        except Exception as e:
+            check("vfa2: two paths through a symlinked directory already at dest are one file (last entry wins)", False, repr(e))
+    # ...but names that only LOOK alike (ss/\u00df, NFC/NFD, I-with-dot/i+dot) are merged only if the volume itself
+    # says so: here a case-sensitive one stands in for NTFS, which keeps them all apart; no file may be dropped
+    if not vx._case_insensitive(str(work)):
+        names = ["ss", "\u00df", "\u00e9", "e\u0301", "\u0130", "i\u0307"]
+        p = build2(work / "dd_fold.vfa", [(f"z/{n}", first[:1000 + i]) for i, n in enumerate(names)], coder=3, filt=None)
+        out = work / "dd_fold_out"; shutil.rmtree(out, ignore_errors=True); out.mkdir()
+        real = vx._case_insensitive; vx._case_insensitive = lambda d: True
+        try:
+            open_extract(p, out)
+            check("vfa2: names that fold alike but the volume keeps apart (ss/\u00df, NFC/NFD, \u0130/i\u0307) all extract",
+                  all((out / "z" / n).read_bytes() == first[:1000 + i] for i, n in enumerate(names)))
+        except Exception as e:
+            check("vfa2: names that fold alike but the volume keeps apart all extract", False, repr(e))
+        finally:
+            vx._case_insensitive = real
+    # a final name equal to another entry's temporary name: "a" reuses "a.vfapart"'s first chunk, so both are open at once
+    p = build2(work / "dd_tmp.vfa", [("z/a.vfapart", first[:70_000]), ("z/a", second)], coder=3, filt=None,
+               solid=True, chunk_size=1 << 16, cdc=True)
+    out = work / "dd_tmp_out"; shutil.rmtree(out, ignore_errors=True)
+    try:
+        open_extract(p, out)
+        check("vfa2: an entry named like another's temporary file (a, a.vfapart) extracts both intact",
+              (out / "z/a").read_bytes() == second and (out / "z/a.vfapart").read_bytes() == first[:70_000]
+              and sorted(q.name for q in (out / "z").iterdir()) == ["a", "a.vfapart"])
+    except Exception as e:
+        check("vfa2: an entry named like another's temporary file (a, a.vfapart) extracts both intact", False, repr(e))
+    # without the C extension, content-defined dedup still runs (pure-Python chunker) and the archive is identical
+    import vulp_ref
+    files = [("z/v100.bin", base[:1_500_000]), ("z/v110.bin", shifted[:1_500_000])]
+    pn = build2(work / "dd_nat.vfa", files, coder=0, filt=0, cdc=True, chunk_size=1 << 20)
+    saved = V2._native, V2.NATIVE
+    V2._native, V2.NATIVE = vulp_ref, False
+    try:
+        pr = build2(work / "dd_ref.vfa", files, coder=0, filt=0, cdc=True, chunk_size=1 << 20)
+    finally:
+        V2._native, V2.NATIVE = saved
+    check(f"vfa2 dedup without the C extension: same archive as with it ({pr.stat().st_size:,} B, stored coder)",
+          pn.read_bytes() == pr.read_bytes() and pr.stat().st_size < 2_500_000, f"{pn.stat().st_size} vs {pr.stat().st_size}")
+    # chunks smaller than a default segment (4-32 KiB): segments shrink to fit, so shifted copies still dedup
+    for cexp in (12, 15):
+        sz = {}
+        for cdc in (True, False):
+            q = build2(work / f"dd_small_cs_{cexp}_{cdc}.vfa", [("z/v100.bin", base[:400_000]), ("z/v110.bin", shifted[:400_000])],
+                       coder=0, filt=0, solid=True, chunk_size=1 << cexp, cdc=cdc)
+            sz[cdc] = q.stat().st_size
+            out = work / "dd_small_cs_out"; shutil.rmtree(out, ignore_errors=True); open_extract(q, out)
+            ok_rt = (out / "z/v100.bin").read_bytes() == base[:400_000] and (out / "z/v110.bin").read_bytes() == shifted[:400_000]
+        check(f"vfa2 dedup with {1 << cexp >> 10} KiB chunks: {sz[True]:,} B vs {sz[False]:,} B without CDC, round-trips",
+              ok_rt and sz[True] < sz[False] * 0.7)
+    # a chunk-boundary case: dedup references into the unflushed buffer and across flushes, small chunks
+    files = [("z/a", base[:600_000]), ("z/b", base[:600_000]), ("z/c", base[100_000:700_000])]
+    p = build2(work / "dd_small.vfa", files, cdc=True, solid=True, chunk_size=1 << 18, coder=3, filt=None)
+    out = work / "dd_small_out"; shutil.rmtree(out, ignore_errors=True); open_extract(p, out)
+    check("vfa2 dedup: solid, 256 KiB chunks, references into the current buffer and earlier chunks round-trip",
+          all((out / pth).read_bytes() == dat for pth, dat in files))
 
 # ---------------------------------------------------------------- main
 
@@ -1048,7 +1320,7 @@ def main():
     ap.add_argument("--fuzz", type=int, default=None); ap.add_argument("--only"); ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
     groups = set(a.only.split(",")) if a.only else {"roundtrip", "sample", "encrypt", "append", "ra", "refuse", "paths",
-                                                     "fuzz", "determinism", "sfx", "signed", "codec", "native"}
+                                                     "fuzz", "determinism", "sfx", "signed", "codec", "native", "lz", "dedup"}
     if a.big: groups.add("big")
     n = a.fuzz if a.fuzz is not None else (150 if a.quick else 600)
     work = pathlib.Path(tempfile.mkdtemp(prefix="vfa-test-"))
@@ -1065,7 +1337,8 @@ def main():
                  ("refuse", lambda c: t2_refuse(work)), ("paths", lambda c: t2_paths(work)),
                  ("determinism", lambda c: t2_determinism(work, c)), ("sfx", lambda c: t2_sfx(work, c)),
                  ("signed", lambda c: t_signed(work, c, "vfa2")), ("codec", lambda c: t2_codec(work, c)),
-                 ("native", lambda c: t2_native(work, c)), ("fuzz", lambda c: t2_fuzz(work, n, a.quick)),
+                 ("native", lambda c: t2_native(work, c)), ("lz", lambda c: t2_lz(work, c)),
+                 ("dedup", lambda c: t2_dedup(work, c)), ("fuzz", lambda c: t2_fuzz(work, n, a.quick)),
                  ("big", lambda c: t_big(work, "vfa2"))],
     }
     try:

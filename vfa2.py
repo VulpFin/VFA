@@ -23,13 +23,14 @@ Every chunk frame is independently decodable and names the filter and coder that
 end maps files to extents (chunk, offset, length). Readers refuse - by name - any version, feature bit, frame
 flag, coder, filter, entry type or critical index record they do not know.
 
-Coders: 0 stored, 1 vulp-tans (M3). Filters: 0 none, 1 delta, 2 shuffle, 3 bcj-x86, 4 bcj-arm64 (M3). The codecs are
+Coders: 0 stored, 1 vulp-tans (M3), 3 vulp-lz (M4). Filters: 0 none, 1 delta, 2 shuffle, 3 bcj-x86, 4 bcj-arm64,
+6 segmented (M3). The writer also deduplicates content-defined segments across chunks (M4). The codecs are
 the C extension _vulp (vulp/vulp.c, built by build_vulp.py); without it, decoding falls back to the pure-Python
 reference vulp_ref.py (slow, same results). The writer picks a filter per chunk with an integer cost estimate over a
 sample and records why in the index (ROUTING record). Standard library only otherwise, plus 'cryptography' for
 encrypted archives (exactly what VFA1 needs).
 """
-import hashlib, io, json, os, struct, zlib
+import collections, hashlib, io, json, os, struct, zlib
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import vfa_extract as vx
@@ -39,7 +40,7 @@ from vfa_extract import VFAError, ET_FILE, ET_DIR, ET_SYMLINK, ET_HARDLINK, ET_N
 
 MAGIC = b"VFA2"
 END_MAGIC = b"/VFA2"
-SPEC_VERSION = 2            # the VFA2.md revision this code writes (2 = M3: tANS + filters)
+SPEC_VERSION = 3            # the VFA2.md revision this code writes (2 = M3: tANS + filters, 3 = M4: vulp-lz + dedup)
 READER_VERSION = 1          # archives whose min_reader_version is above this are refused
 
 HDR = struct.Struct("<4sHHHIIBBBBII16s")      # magic, header_size, spec_version, min_reader, required, optional,
@@ -60,6 +61,7 @@ KNOWN_FRAME_FLAGS = FF_ENCRYPTED
 NONCE_LEN = 12
 MAX_CHUNK = 1 << 30                           # raw_size limit for any chunk (reader refuses larger)
 MAX_INDEX = 1 << 31
+CACHE_CHUNKS = 2                              # reader: decoded chunks kept (each <= MAX_CHUNK; 64 MiB by default)
 
 FOOT = struct.Struct("<QQQB32s")              # index_offset, index_frame_len, archive_len, digest_kind, digest
 FOOTER_SIZE = FOOT.size + 4 + len(END_MAGIC)  # + u32 footer CRC32 + "/VFA2" = 66
@@ -85,12 +87,20 @@ class Codec:
     def __init__(self, cid, name, encode=None, decode=None):
         self.id, self.name, self.encode, self.decode = cid, name, encode, decode
 
+NATIVE_API = 2                               # vulp.h VULP_VERSION this code needs (2: vulp-lz, cdc)
+NATIVE_PROBLEM = ""                          # why the C extension is not used, if it is not
 try:
     import _vulp as _native                  # C codec core (build_vulp.py)
+    if getattr(_native, "VERSION", 0) < NATIVE_API or not all(hasattr(_native, f) for f in ("lz_encode", "lz_decode", "cdc")):
+        # a module built from older sources (e.g. left over from M3): never call into it half-way
+        NATIVE_PROBLEM = (f"the _vulp extension at {getattr(_native, '__file__', '?')} is out of date (API "
+                          f"{getattr(_native, 'VERSION', 0)}, need {NATIVE_API}); rebuild it with: python build_vulp.py")
+        raise ImportError(NATIVE_PROBLEM)
     NATIVE = True
 except ImportError:                          # pure-Python reference: identical output, ~100x slower
     import vulp_ref as _native
     NATIVE = False
+    NATIVE_PROBLEM = NATIVE_PROBLEM or "the _vulp C extension is not built; build it with: python build_vulp.py"
 
 def _vulp_call(fn, *a):
     try: return fn(*a)
@@ -111,13 +121,25 @@ def _tans_decode(params, data, raw_size):
     if params: raise VFAError("vulp-tans takes no parameters")
     return _vulp_call(_native.tans_decode, data, raw_size)
 
+def _lz_encode(raw, level=6):
+    """None when vulp-lz would not make the data smaller (the writer then stores the chunk)."""
+    if not NATIVE: raise VFAError(f"vulp-lz encoding needs the C codec: {NATIVE_PROBLEM}")
+    out = _native.lz_encode(raw, max(0, min(9, int(level))))
+    return b"", out
+
+def _lz_decode(params, data, raw_size):
+    if params: raise VFAError("vulp-lz takes no parameters")
+    return _vulp_call(_native.lz_decode, data, raw_size)
+
 def _filter_codec(fid, name):
     """Filters in this revision are size-preserving bijections; params are the filter's own bytes (VFA2.md)."""
     return Codec(fid, name, lambda raw, params=b"": (params, _vulp_call(_native.filter_fwd, fid, params, raw)),
                  lambda params, data, raw_size: _vulp_call(_native.filter_inv, fid, params, data))
 
 CODERS: Dict[int, Codec] = {0: Codec(0, "stored", _stored_encode, _stored_decode),
-                            1: Codec(1, "vulp-tans", _tans_encode, _tans_decode)}
+                            1: Codec(1, "vulp-tans", _tans_encode, _tans_decode),
+                            3: Codec(3, "vulp-lz", _lz_encode, _lz_decode)}
+CODER_LZ = 3
 FILTERS: Dict[int, Codec] = {0: _filter_codec(0, "none"), 1: _filter_codec(1, "delta"), 2: _filter_codec(2, "shuffle"),
                              3: _filter_codec(3, "bcj-x86"), 4: _filter_codec(4, "bcj-arm64")}
 SEGMENTED = 6
@@ -189,6 +211,11 @@ def parse_filter(spec: str):
 CANDIDATES = [(0, b""), (1, b"\x01"), (1, b"\x02"), (1, b"\x04"), (1, b"\x08"), (2, b"\x02\x00"), (2, b"\x04\x00"),
               (2, b"\x08\x00"), (2, b"\x04\x01"), (2, b"\x08\x01"), (3, b""), (4, b"")]
 SAMPLE_PIECE, SAMPLE_PIECES = 1 << 16, 4
+# cross-chunk dedup (writer only; readers just follow extents)
+CDC_MIN, CDC_AVG_LOG, CDC_MAX = 1 << 14, 16, 1 << 18       # segments 16 KiB .. 256 KiB, about 64 KiB on average
+CDC_READ = 1 << 23
+DEDUP_MIN = 1 << 12                                         # smaller segments (file tails) are not worth an extent
+DEDUP_MAX_SEGMENTS = 1 << 20                                # index cap: ~64 GiB of distinct data, ~200 MiB of RAM
 MIN_GAIN_DIV = 64                            # a filter must beat 'none' by more than 1/64 (~1.6%) of the estimate
 
 def _sample(raw) -> List[bytes]:
@@ -233,13 +260,13 @@ def units(pieces: List[Tuple[int, int]], total: int) -> List[Tuple[int, int]]:
     if pos < total: cov.append((pos, total - pos))
     return [u for u in cov if u[1]]
 
-def route(raw, pieces=None) -> Tuple[int, bytes, dict]:
+def route(raw, pieces=None, coder: int = 1) -> Tuple[int, bytes, dict]:
     """Choose the filter for a whole chunk: classify each unit; one filter if they agree, else filter 6 'segmented'."""
     us = units(pieces or [(0, len(raw))], len(raw))
     segs = []; seginfo = []
     mv = memoryview(raw)
     for off, ln in us:
-        fid, fp, info = classify(mv[off:off + ln])
+        fid, fp, info = classify(mv[off:off + ln], coder)
         info = {"off": off, "len": ln, "filter": filter_label(fid, fp), **info}
         if segs and segs[-1][1:] == (fid, fp):
             segs[-1] = (segs[-1][0] + ln, fid, fp); seginfo[-1]["len"] += ln; seginfo[-1]["merged"] = seginfo[-1].get("merged", 1) + 1
@@ -250,21 +277,56 @@ def route(raw, pieces=None) -> Tuple[int, bytes, dict]:
         return segs[0][1], segs[0][2], info
     return SEGMENTED, seg_pack(segs), {"why": f"{len(segs)} segments with different filters", "segments": seginfo}
 
-def classify(raw) -> Tuple[int, bytes, dict]:
-    """Pick a filter for one chunk. Returns (filter id, params, routing info). Deterministic: integer costs, ties
-    go to the earlier candidate. The estimate is order-0 (what vulp-tans codes); M4's match finder changes the
-    cost model, so the classifier will be re-measured then."""
+CLASSIFY_LZ_LEVEL = 1                        # the classifier compresses samples fast; the chunk itself uses --level
+SHORTLIST = 2                                # vulp-lz: besides 'none', try this many best order-0 candidates
+
+def _code_hints(pieces) -> List[Tuple[int, bytes]]:
+    """Filters worth an LZ trial because the sample looks like machine code (integer counts only)."""
+    n = sum(len(p) for p in pieces) or 1; out = []
+    e8 = sum(p.count(b"\xe8") + p.count(b"\xe9") for p in pieces)
+    if e8 * 250 >= n: out.append((3, b""))                          # >= 0.4% E8/E9 bytes: x86 calls/jumps
+    bl = 0
+    for p in pieces:                                                # top byte of aligned LE words: 0x94..0x97 = BL
+        top = p[3::4]; bl += sum(top.count(x) for x in (0x94, 0x95, 0x96, 0x97))
+    if bl * 4 * 50 >= n: out.append((4, b""))                       # >= 2% of words are BL: ARM64 code
+    return out
+
+def classify(raw, coder: int = 1) -> Tuple[int, bytes, dict]:
+    """Pick a filter for one unit. Returns (filter id, params, routing info). Deterministic: integer costs, ties
+    go to the earlier candidate. Every candidate gets an order-0 estimate (what vulp-tans codes). For vulp-lz the
+    order-0 statistics are not what matters (BCJ, for one, helps matches, not byte statistics), so 'none', the best
+    order-0 candidates and the code filters suggested by the sample are compressed with vulp-lz (fast level) and
+    the smallest actual output wins."""
     pieces = _sample(raw); est = {}
     for fid, params in CANDIDATES:
         c = 0
         for pc in pieces:
             c += _native.cost(_native.filter_fwd(fid, params, pc) if fid else pc)
         est[filter_label(fid, params)] = (c + (8 << 16) - 1) >> 19          # Q16 bits -> bytes, rounded up
-    base = est["none"]; best = (0, b""); best_c = base
-    for fid, params in CANDIDATES[1:]:
-        c = est[filter_label(fid, params)]
-        if c < best_c: best, best_c = (fid, params), c
     sampled = sum(len(p) for p in pieces)
+    if coder == CODER_LZ and NATIVE:
+        ranked = sorted(CANDIDATES[1:], key=lambda c: (est[filter_label(*c)], CANDIDATES.index(c)))
+        trial = [(0, b"")] + ranked[:SHORTLIST]
+        for c in _code_hints(pieces):
+            if c not in trial: trial.append(c)
+        lz = {}
+        for fid, params in trial:
+            size = 0
+            for pc in pieces:
+                data = _native.filter_fwd(fid, params, pc) if fid else pc
+                enc = _native.lz_encode(data, CLASSIFY_LZ_LEVEL)
+                size += len(enc) if enc is not None else len(pc)
+            lz[filter_label(fid, params)] = size
+        est = {"lz": lz}                          # the decision is made on these; order-0 numbers only chose the shortlist
+        base = lz["none"]; best = (0, b""); best_c = base
+        for fid, params in trial[1:]:
+            c = lz[filter_label(fid, params)]
+            if c < best_c: best, best_c = (fid, params), c
+    else:
+        base = est["none"]; best = (0, b""); best_c = base
+        for fid, params in CANDIDATES[1:]:
+            c = est[filter_label(fid, params)]
+            if c < best_c: best, best_c = (fid, params), c
     if best != (0, b"") and (base - best_c) * MIN_GAIN_DIV <= base:
         why = f"no filter beat 'none' by more than 1/{MIN_GAIN_DIV} (best {filter_label(*best)} {best_c} B vs {base} B)"
         best = (0, b"")
@@ -313,13 +375,16 @@ class Writer2:
     def __init__(self, f, *, chunk_size: int = 1 << 26, solid: bool = False, coder: int = 0, filt=0,
                  level: int = 0, dedup: bool = True, password: Optional[bytes] = None,
                  kdf: Tuple[int, int, int] = (3, 256 * 1024, 4), use_scrypt: bool = False,
-                 header_extra: bytes = b"", min_reader: int = 1, required_extra: int = 0):
+                 header_extra: bytes = b"", min_reader: int = 1, required_extra: int = 0, cdc: bool = False):
         """coder: 0 stored, 1 vulp-tans. filt: a filter id, an (id, params) tuple, or None = choose per chunk
         (classify(); needs a real coder). A chunk the coder cannot shrink is stored instead.
         header_extra / min_reader / required_extra exist so tests can write what a future VFA would."""
         if not (1 << 12) <= chunk_size <= MAX_CHUNK: raise ValueError("chunk_size must be 4 KiB .. 1 GiB")
         if coder not in CODERS or CODERS[coder].encode is None: raise ValueError(f"coder {coder} cannot encode")
         if isinstance(filt, int): filt = (filt, b"")
+        # cross-chunk dedup of content-defined segments; off when encrypting (set below). Without the C extension
+        # the pure-Python chunker gives the same cuts (slower, ~5 MB/s), so the archive does not depend on it
+        self.cdc = bool(dedup) and cdc
         if filt is not None and (filt[0] not in FILTERS or FILTERS[filt[0]].encode is None):
             raise ValueError(f"filter {filt[0]} cannot encode")
         self.routing: List[dict] = []
@@ -329,6 +394,16 @@ class Writer2:
         self.by_hash: Dict[bytes, int] = {}
         self.entries: List[dict] = []
         self.buf = bytearray(); self.pending: List[list] = []      # extents [chunk, off, len] waiting for this chunk
+        self.pending_refs: List[list] = []                          # dedup records/references into the current buffer
+        self.buf_file_starts: List[int] = []                        # buffer offsets where a file's bytes begin
+        self._last_appended = None
+        self.seg_index: Dict[bytes, list] = {}                      # segment SHA-256 -> [chunk, offset, length]
+        # segments must fit a chunk: below 256 KiB chunks they shrink with it (a quarter of a chunk on average, at
+        # least 1 KiB, where an extent's 12 bytes are still worth it). Default chunk sizes keep the constants.
+        smax = min(CDC_MAX, chunk_size); smin = max(1 << 10, min(CDC_MIN, smax >> 3))
+        self.cdc_params = (smin, min(CDC_AVG_LOG, smax.bit_length() - 3), smax)
+        self.dedup_min = min(DEDUP_MIN, smin)
+        self.dedup_segments = self.dedup_bytes = 0
         self.data_key = self.index_key = None
         req = 0; kdf_id = aead = kp = kt = km = 0; salt = b"\0" * 16
         if password is not None:
@@ -336,7 +411,8 @@ class Writer2:
             if use_scrypt or not vx.HAVE_ARGON2: kdf_id, kt, km, kp = KDF_SCRYPT, 1 << 15, 8, 1
             else: kdf_id, (kt, km, kp) = KDF_ARGON2ID, kdf
             self.data_key, self.index_key = _derive_keys(password, kdf_id, kt, km, kp, salt)
-            self.dedup = False      # identical plaintext chunks would otherwise be visible as shared ciphertext
+            self.dedup = False      # identical plaintext chunks/segments would otherwise be visible as shared data
+            self.cdc = False
         self.header_size = HEADER_SIZE + len(header_extra)
         body = HDR.pack(MAGIC, self.header_size, SPEC_VERSION, min_reader, req | required_extra, 0, kdf_id, aead, kp, 0, kt, km, salt)
         body += header_extra
@@ -363,20 +439,25 @@ class Writer2:
     def _flush(self):
         if not self.buf and not self.pending: return
         raw = bytes(self.buf); self.buf = bytearray()
-        self.piece_bounds = [(ext[1], ext[2]) for ext in self.pending]     # file boundaries inside this chunk
+        # file boundaries inside this chunk (dedup references split a file's stored bytes into several extents, but
+        # those bytes are still one contiguous run per file, so units follow files, not extents)
+        starts = sorted(set(self.buf_file_starts) | {0}); ends = starts[1:] + [len(raw)]
+        self.piece_bounds = [(a, b - a) for a, b in zip(starts, ends) if b > a]
+        self.buf_file_starts = []
         h = hashlib.sha256(raw).digest() if self.dedup else None
         if h is not None and h in self.by_hash:
             idx = self.by_hash[h]
         else:
             coder = self.coder; info = None
-            if self.filt is None and coder != 0: fid, fp, info = route(raw, self.piece_bounds)
+            if self.filt is None and coder != 0: fid, fp, info = route(raw, self.piece_bounds, coder)
             elif self.filt is None: fid, fp = 0, b""
             else: fid, fp = self.filt; info = {"why": "forced (--filter)"} if coder != 0 else None
             fparams, fdata = FILTERS[fid].encode(raw, fp)
             cparams, payload = CODERS[coder].encode(fdata, self.level)
-            if coder != 0 and len(payload) >= len(raw):              # the coder did not help: store the chunk as-is
-                info = dict(info or {}); info["why"] = (info.get("why", "") + f"; {CODERS[coder].name} gave {len(payload)} B "
-                                                        f">= {len(raw)} B raw, stored instead").lstrip("; ")
+            if coder != 0 and (payload is None or len(payload) >= len(raw)):   # the coder did not help: store the chunk
+                got = "no smaller output" if payload is None else f"{len(payload)} B >= {len(raw)} B raw"
+                info = dict(info or {}); info["why"] = (info.get("why", "") + f"; {CODERS[coder].name} gave {got}, "
+                                                        "stored instead").lstrip("; ")
                 fid, fparams, coder, cparams, payload = 0, b"", 0, b"", raw
             params = struct.pack("<H", len(fparams)) + fparams + cparams if (fparams or cparams) else b""
             c = crc32(raw)
@@ -387,7 +468,8 @@ class Writer2:
                                      "raw": len(raw), "stored": len(payload), **info})
             if h is not None: self.by_hash[h] = idx
         for ext in self.pending: ext[0] = idx
-        self.pending = []
+        for ext in self.pending_refs: ext[0] = idx      # dedup references into this chunk, and its segment records
+        self.pending = []; self.pending_refs = []
 
     def _entry(self, etype, path, mode, mtime, size=0, meta=None, mtime_ns=None):
         """mtime in seconds (int/float), or exact integer nanoseconds via mtime_ns."""
@@ -403,25 +485,73 @@ class Writer2:
     def add_link(self, path, hard: bool, mode=0o777, mtime=0, meta=None, mtime_ns=None):
         self._entry(ET_HARDLINK if hard else ET_SYMLINK, path, mode, mtime, 0, meta, mtime_ns)
 
+    def _append(self, e, mv):
+        """Append file bytes to the current chunk buffer, flushing full chunks."""
+        if e is not self._last_appended:
+            self._last_appended = e; self.buf_file_starts.append(len(self.buf))
+        while len(mv):
+            take = min(self.cs - len(self.buf), len(mv))
+            cur = e["extents"][-1] if e["extents"] else None
+            if cur is not None and cur[0] is None and cur[1] + cur[2] == len(self.buf):
+                cur[2] += take                               # same unflushed chunk: grow the extent
+            else:
+                ext = [None, len(self.buf), take]           # chunk id is filled in by _flush()
+                e["extents"].append(ext); self.pending.append(ext)
+            self.buf += mv[:take]; mv = mv[take:]; e["size"] += take
+            if len(self.buf) == self.cs: self._flush()
+            if len(mv) and not self.buf: self.buf_file_starts.append(0)
+
+    def _reference(self, e, loc):
+        """Point the file at bytes already stored (dedup): no data is written."""
+        cid, off, ln = loc
+        cur = e["extents"][-1] if e["extents"] else None
+        if cur is not None and cur[0] == cid and cur[1] + cur[2] == off:
+            cur[2] += ln                                     # contiguous with the previous extent: grow it
+        else:
+            ext = [cid, off, ln]; e["extents"].append(ext)
+            if cid is None: self.pending_refs.append(ext)   # points into the unflushed buffer
+        e["size"] += ln
+
+    def _segment(self, e, seg: memoryview):
+        """One content-defined segment: reference an identical earlier one, or store it (and remember where)."""
+        n = len(seg)
+        if n >= self.dedup_min:
+            h = hashlib.sha256(seg).digest()
+            loc = self.seg_index.get(h)
+            if loc is not None:
+                self._reference(e, loc); self.dedup_segments += 1; self.dedup_bytes += n
+                return
+            if n <= self.cs and len(self.seg_index) < DEDUP_MAX_SEGMENTS:
+                if len(self.buf) + n > self.cs: self._flush()   # a segment is never split: start the next chunk
+                loc = [None, len(self.buf), n]              # registered before the append: a flush patches it
+                self.pending_refs.append(loc); self.seg_index[h] = loc
+        self._append(e, seg)
+
     def add_file(self, path, mode, mtime, src, meta=None, piece: int = 1 << 20, mtime_ns=None) -> int:
         """src: a binary file object or bytes. Returns the number of bytes stored."""
         e = self._entry(ET_FILE, path, mode, mtime, 0, meta, mtime_ns)
         if not self.solid and self.buf: self._flush()          # non-solid: every file starts a new chunk
         if isinstance(src, (bytes, bytearray, memoryview)): src = io.BytesIO(bytes(src))
-        while True:
-            b = src.read(piece)
-            if not b: break
-            mv = memoryview(b)
-            while len(mv):
-                take = min(self.cs - len(self.buf), len(mv))
-                cur = e["extents"][-1] if e["extents"] else None
-                if cur is not None and cur[0] is None and cur[1] + cur[2] == len(self.buf):
-                    cur[2] += take                               # same unflushed chunk: grow the extent
-                else:
-                    ext = [None, len(self.buf), take]           # chunk id is filled in by _flush()
-                    e["extents"].append(ext); self.pending.append(ext)
-                self.buf += mv[:take]; mv = mv[take:]; e["size"] += take
-                if len(self.buf) == self.cs: self._flush()
+        if not self.cdc:
+            while True:
+                b = src.read(piece)
+                if not b: break
+                self._append(e, memoryview(b))
+        else:
+            # content-defined segments (cut points depend only on content, so shifted copies still line up);
+            # the last segment of each read is carried over, since its end is the read size, not content
+            carry = b""
+            while True:
+                b = src.read(CDC_READ)
+                data = carry + b if carry else b
+                if not data: break
+                cuts = _native.cdc(data, *self.cdc_params)
+                mv = memoryview(data); start = 0
+                last = len(cuts) if not b else len(cuts) - 1
+                for end in cuts[:last]:
+                    self._segment(e, mv[start:end]); start = end
+                carry = bytes(mv[start:]) if b else b""
+                if not b: break
         if not self.solid: self._flush()
         return e["size"]
 
@@ -444,7 +574,9 @@ class Writer2:
         if self.closed: return
         self._flush()
         if self.routing:                     # non-critical: readers that do not know it skip it
-            rt = json.dumps({"v": 1, "chunks": self.routing}, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            doc = {"v": 1, "chunks": self.routing}
+            if self.cdc: doc["dedup"] = {"segments": self.dedup_segments, "bytes": self.dedup_bytes}
+            rt = json.dumps(doc, separators=(",", ":"), sort_keys=True).encode("utf-8")
             records = [(XR_ROUTING, 0, rt), *records]
         raw = self._index_bytes(records)
         off = self._frame(INDEX_MAGIC, 0, 0, b"", raw, len(raw), crc32(raw), self.index_key)
@@ -468,7 +600,7 @@ class Archive2(vx.Extractable):
         try:
             self.size = os.fstat(self._f.fileno()).st_size
             self.buf = vx._FileView(self._f, 0, self.size)
-            self.entries = None; self.chunks: List[tuple] = []; self._cache = (None, None)
+            self.entries = None; self.chunks: List[tuple] = []; self._cache = collections.OrderedDict()
             self.data_key = self.index_key = None
             self._locate()
         except Exception:
@@ -591,6 +723,8 @@ class Archive2(vx.Extractable):
         if len(raw) != fh["raw_size"] or crc32(raw) != fh["raw_crc"]:
             raise VFAError("Index failed its CRC32 check (corrupted archive).")
         self._parse_index(raw)
+        if not NATIVE and any(c[3] != 0 or c[4] != 0 for c in self.chunks):
+            vx.LOGGER.warning(f"Decoding with the slow pure-Python reference codec: {NATIVE_PROBLEM}")
         return self.entries
 
     def _parse_index(self, raw: bytes):
@@ -645,7 +779,7 @@ class Archive2(vx.Extractable):
     # -- chunk access --
     def chunk_data(self, i: int) -> bytes:
         """Decode chunk i (frame -> decrypt -> coder -> inverse filter), checking size and CRC32. Caches the last one."""
-        if self._cache[0] == i: return self._cache[1]
+        if i in self._cache: self._cache.move_to_end(i); return self._cache[i]
         off, raw_size, rcrc, coder, filt = self.chunks[i]
         fh = self._read_frame_header(off, CHUNK_MAGIC, f"Chunk {i}")
         cdc = _codec(CODERS, RESERVED_CODERS, "coder", coder, f"Chunk {i}")
@@ -664,7 +798,10 @@ class Archive2(vx.Extractable):
             raise VFAError(f"Chunk {i}: {e}")
         if len(raw) != raw_size: raise VFAError(f"Chunk {i} decoded to {len(raw)} bytes, expected {raw_size} (corrupted archive).")
         if crc32(raw) != rcrc: raise VFAError(f"Chunk {i} failed its CRC32 check (corrupted archive).")
-        self._cache = (i, raw)
+        # keep the last CACHE_CHUNKS decoded chunks: a deduplicated file alternates between its own chunk and the
+        # chunk holding the shared segments, which would otherwise be decoded again for every extent
+        self._cache[i] = raw
+        while len(self._cache) > CACHE_CHUNKS: self._cache.popitem(last=False)
         return raw
 
     def iter_entry(self, e: dict) -> Iterator[bytes]:
@@ -678,12 +815,49 @@ class Archive2(vx.Extractable):
             if progress: progress(i + 1, len(self.chunks))
         return {"blocks": len(self.chunks), "bytes": total}
 
+    MAX_OPEN = 128                            # extraction: files kept open at once (the rest are reopened as needed)
+
     def _write_files(self, sel_files, start, commit, finish, check_cancel, active):
-        # in extent order, so each chunk is decoded once when files were written in order (the cache holds one chunk)
-        order = sorted(sel_files, key=lambda e: (e["extents"][0][0], e["extents"][0][1]) if e["extents"] else (-1, 0))
-        for e in order:
+        """Chunk-major extraction: every needed chunk is decoded exactly once, in order, and its bytes are written
+        at the right offset into every file that uses them. Dedup makes files share chunks, so a file-by-file order
+        would decode the same chunk again and again. Memory: one decoded chunk at a time."""
+        plan = collections.defaultdict(list)          # chunk -> [(entry, file offset, chunk offset, length)]
+        remaining = {}
+        for e in sel_files:
+            pos = 0
+            for ch, off, ln in e.get("extents", ()):
+                plan[ch].append((e, pos, off, ln)); pos += ln
+            remaining[id(e)] = pos
+        state = {}                                    # id(entry) -> [out path, handle or None]
+        lru = collections.OrderedDict()               # id(entry) -> entry, for files with an open handle
+
+        def handle(e):
+            k = id(e); st = state.get(k)
+            if st is None:
+                out, fw = start(e); st = state[k] = [out, fw, fw.name]; active.append((e, out, fw))
+            elif st[1] is None:                       # reopen a file closed to stay under MAX_OPEN
+                st[1] = open(st[2], "r+b"); active.append((e, st[0], st[1]))
+            lru[k] = e; lru.move_to_end(k)
+            while len(lru) > self.MAX_OPEN:
+                ok, oe = lru.popitem(last=False); ost = state[ok]
+                ost[1].close(); active[:] = [a for a in active if a[2] is not ost[1]]; ost[1] = None
+            return st[1]
+
+        def done(e):
+            k = id(e); out, fw, tmp = state[k]
+            if fw is None: fw = open(tmp, "r+b")
+            else: lru.pop(k, None)
+            active[:] = [a for a in active if a[2] is not fw]
+            commit(out, fw); finish(e, out)
+
+        for e in sel_files:                           # empty files first: nothing to decode
+            if remaining[id(e)] == 0:
+                check_cancel(); handle(e); done(e)
+        for ch in sorted(plan):
             check_cancel()
-            out, fw = start(e); active[:] = [(e, out, fw)]
-            for piece in self.iter_entry(e):
-                check_cancel(); fw.write(piece)
-            active.clear(); commit(out, fw); finish(e, out)
+            data = memoryview(self.chunk_data(ch))
+            for e, fpos, off, ln in plan[ch]:
+                fw = handle(e); fw.seek(fpos); fw.write(data[off:off + ln])
+                remaining[id(e)] -= ln
+                if remaining[id(e)] == 0: done(e)
+            self._cache.pop(ch, None); del data       # used once: do not keep it around

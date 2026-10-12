@@ -14,7 +14,7 @@ Linux/macOS: the system C compiler.
 import argparse, os, pathlib, shutil, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent
-SRC = [ROOT / "vulp" / "vulp.c", ROOT / "vulp" / "vulpmodule.c"]
+SRC = [ROOT / "vulp" / "vulp.c", ROOT / "vulp" / "vulp_lz.c", ROOT / "vulp" / "vulpmodule.c"]
 
 def _vcvars_env():
     """Environment of an MSVC x64 developer prompt, or None."""
@@ -80,6 +80,7 @@ def build():
     ext = Extension("_vulp", [str(p.relative_to(ROOT)) for p in SRC], include_dirs=["vulp"], extra_compile_args=flags)
     dist = Distribution({"name": "vulp", "ext_modules": [ext], "script_name": "build_vulp.py"})
     cmd = dist.get_command_obj("build_ext"); cmd.inplace = True; cmd.build_temp = str(ROOT / "build" / "vulp")
+    cmd.force = True       # setuptools tracks only the .c files, not vulp.h: never reuse an old object or module
     cwd = os.getcwd(); os.chdir(ROOT)
     try:
         dist.run_command("build_ext")
