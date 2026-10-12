@@ -670,17 +670,19 @@ def t2_paths(work):
         except Exception as e:
             check(f"vfa2 refuse: {label}", False, f"crashed: {e!r}")
     # the same through a directory symlink already at the destination: dest/x -> y, archive has "x/a" and "y"
-    if os.name != "nt":
-        arc = build2(work / "conflict2l.vfa", [("x/a", b"x"), ("y", b"y")], dirs=())
+    # (both where the directory resolves to, file "y", and the path as written, file "x")
+    for other in ("y", "x") if os.name != "nt" else ():
+        arc = build2(work / "conflict2l.vfa", [("x/a", b"x"), (other, b"y")], dirs=())
         dest = work / "conflict2l_out"; shutil.rmtree(dest, ignore_errors=True); (dest / "y").mkdir(parents=True)
         os.symlink("y", dest / "x")
+        label = f"'x/a' and file {other!r} when dest/x already links to y"
         try:
-            open_extract(arc, dest); check("vfa2 refuse: 'x/a' and 'y' with dest/x -> y", False, "was extracted")
+            open_extract(arc, dest); check(f"vfa2 refuse: {label}", False, "was extracted")
         except vx.VFAError as e:
-            check("vfa2 refuse before writing anything: 'x/a' and file 'y' when dest/x already links to y",
-                  not list((dest / "y").iterdir()) and "as a directory" in str(e), str(e))
+            check(f"vfa2 refuse before writing anything: {label}",
+                  not list((dest / "y").iterdir()) and (dest / "x").is_symlink() and "as a directory" in str(e), str(e))
         except Exception as e:
-            check("vfa2 refuse: 'x/a' and 'y' with dest/x -> y", False, f"crashed: {e!r}")
+            check(f"vfa2 refuse: {label}", False, f"crashed: {e!r}")
 
 def t2_determinism(work, corpus):
     for flags in ([], ["--solid", "--chunk-exp", "16"]):

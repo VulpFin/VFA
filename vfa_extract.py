@@ -625,8 +625,10 @@ class Extractable:
             for rel in need:
                 if rel in seen_dirs: continue
                 seen_dirs.add(rel)
-                # resolve the directory itself too: with dest/x -> y already there, "x/a" needs "y" as a directory
-                if alias_key(os.path.realpath(os.path.join(dest, *rel.split("/")))) in file_keys:
+                # both the path as written and where it resolves to: with dest/x -> y already there, "x/a" needs
+                # "y" as a directory (clash with a file "y"), and still needs "x" itself (clash with a file "x")
+                full = os.path.join(dest, *rel.split("/"))
+                if alias_key(full) in file_keys or alias_key(os.path.realpath(full)) in file_keys:
                     raise VFAError(f"Archive entry {e['path']!r} needs {rel!r} as a directory, but the archive also "
                                    f"has a file there; refusing to extract.")
         for e, p in sel_dirs:
