@@ -625,7 +625,8 @@ class Extractable:
             for rel in need:
                 if rel in seen_dirs: continue
                 seen_dirs.add(rel)
-                if alias_key(os.path.join(dest, *rel.split("/"))) in file_keys:
+                # resolve the directory itself too: with dest/x -> y already there, "x/a" needs "y" as a directory
+                if alias_key(os.path.realpath(os.path.join(dest, *rel.split("/")))) in file_keys:
                     raise VFAError(f"Archive entry {e['path']!r} needs {rel!r} as a directory, but the archive also "
                                    f"has a file there; refusing to extract.")
         for e, p in sel_dirs:

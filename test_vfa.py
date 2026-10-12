@@ -383,13 +383,13 @@ def run_fuzz(targets, want, n_cases, quick, rnd):
             jobs = [(path, op, verify, pw, want) for op in ops]
             labels = [f"truncate@{op[1]}" if op[0] == "t" else fuzz_case(path, op)[1] for op in ops]
             t0 = time.perf_counter(); res = run_jobs(jobs, labels, _fuzz_job); dt = time.perf_counter() - t0
-            bad = [(labels[i], r) for i, r in enumerate(res) if r[0] in ("WRONG", "CRASH", "HANG", "ESCAPE")]
+            bad = [(i, labels[i], r) for i, r in enumerate(res) if r[0] in ("WRONG", "CRASH", "HANG", "ESCAPE")]
             counts = {k: sum(1 for r in res if r[0] == k) for k in ("refused", "identical", "WRONG", "CRASH", "HANG", "ESCAPE")}
             tag = f"fuzz {name}, {'digest+CRC' if verify else 'CRC only (--no-verify)'}"
             if bad:
                 FAILDIR.mkdir(exist_ok=True)
-                for lab, r in bad[:20]:
-                    j = labels.index(lab); fn = FAILDIR / f"{pathlib.Path(path).stem}_{'v' if verify else 'nv'}_{j}.vfa"
+                for j, lab, r in bad[:20]:          # j: the job's own index (labels repeat, e.g. every "append")
+                    fn = FAILDIR / f"{pathlib.Path(path).stem}_{'v' if verify else 'nv'}_{j}.vfa"
                     fn.write_bytes(fuzz_case(path, ops[j])[0]); print(f"      {r[0]} {lab}: {r[1][:300]}  -> {fn.name}")
             check(f"{tag}: {len(jobs)} cases in {dt:.0f}s {counts}", not bad)
 
@@ -669,6 +669,18 @@ def t2_paths(work):
             check(f"vfa2 refuse before writing anything: {label}", not written and "as a directory" in str(e), f"{written} {e}")
         except Exception as e:
             check(f"vfa2 refuse: {label}", False, f"crashed: {e!r}")
+    # the same through a directory symlink already at the destination: dest/x -> y, archive has "x/a" and "y"
+    if os.name != "nt":
+        arc = build2(work / "conflict2l.vfa", [("x/a", b"x"), ("y", b"y")], dirs=())
+        dest = work / "conflict2l_out"; shutil.rmtree(dest, ignore_errors=True); (dest / "y").mkdir(parents=True)
+        os.symlink("y", dest / "x")
+        try:
+            open_extract(arc, dest); check("vfa2 refuse: 'x/a' and 'y' with dest/x -> y", False, "was extracted")
+        except vx.VFAError as e:
+            check("vfa2 refuse before writing anything: 'x/a' and file 'y' when dest/x already links to y",
+                  not list((dest / "y").iterdir()) and "as a directory" in str(e), str(e))
+        except Exception as e:
+            check("vfa2 refuse: 'x/a' and 'y' with dest/x -> y", False, f"crashed: {e!r}")
 
 def t2_determinism(work, corpus):
     for flags in ([], ["--solid", "--chunk-exp", "16"]):
@@ -780,10 +792,10 @@ def t2_fuzz(work, n_cases, quick):
         p = build2(work / "fz2_struct.vfa", files, index_mut=mut)
         jobs.append((p.read_bytes(), True, None, None))
     res = run_jobs(jobs, labels)
-    bad = [(labels[i], r) for i, r in enumerate(res) if r[0] in ("WRONG", "CRASH", "HANG", "ESCAPE")]
-    for lab, r in bad[:10]:
-        FAILDIR.mkdir(exist_ok=True); fn = FAILDIR / f"struct_{labels.index(lab)}.vfa"
-        fn.write_bytes(jobs[labels.index(lab)][0]); print(f"      {r[0]} {lab}: {r[1][:400]}  -> {fn.name}")
+    bad = [(i, labels[i], r) for i, r in enumerate(res) if r[0] in ("WRONG", "CRASH", "HANG", "ESCAPE")]
+    for j, lab, r in bad[:10]:
+        FAILDIR.mkdir(exist_ok=True); fn = FAILDIR / f"struct_{j}.vfa"
+        fn.write_bytes(jobs[j][0]); print(f"      {r[0]} {lab}: {r[1][:400]}  -> {fn.name}")
     counts = {k: sum(1 for r in res if r[0] == k) for k in ("refused", "accepted", "CRASH", "HANG", "ESCAPE")}
     check(f"vfa2 structure fuzz (index mutated, CRCs+digest recomputed): {len(jobs)} cases {counts}", not bad)
 
