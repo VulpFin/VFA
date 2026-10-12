@@ -31,7 +31,7 @@ Rules this reader enforces (see VFA1.md):
   - nothing is written outside the destination directory (safe_join()).
 """
 
-import sys, os, io, struct, getpass, hashlib, zlib, lzma, bz2, json, stat, tempfile, unicodedata
+import sys, os, io, struct, getpass, hashlib, zlib, lzma, bz2, json, stat, tempfile, unicodedata, shutil
 from datetime import datetime
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -475,27 +475,54 @@ def _case_insensitive(dest: str) -> bool:
         try: os.remove(probe)
         except OSError: pass
 
+def _broad_key(p: str) -> str:
+    """Folds at least as much as any volume we know (case, NFC/NFD, Windows separators): equal keys MAY be one file."""
+    return unicodedata.normalize("NFC", os.path.normcase(p)).casefold()
+
+
+def _same_on_volume(dest: str, a: str, b: str) -> bool:
+    """Ask the destination volume whether relative paths a and b name one file: create a in a scratch directory
+    at dest and look for b. The volume's own rules decide (NTFS upcase table, APFS normalization, ...)."""
+    probe = tempfile.mkdtemp(prefix=".vfaprobe-", dir=dest)
+    try:
+        pa = os.path.join(probe, a); os.makedirs(os.path.dirname(pa), exist_ok=True)
+        open(pa, "wb").close()
+        return os.path.exists(os.path.join(probe, b))
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+
+
 def _alias_key_for(dest: str):
-    """Key under which two target paths name the same file at dest. Parents are resolved first: a directory that
-    already exists at dest may be a symlink (safe_join allows ones that stay inside dest), so d1/a and d2/a can be
-    one file. Then the volume's case rule applies."""
-    # Fold no further than the volume does: merging two names it keeps apart would silently drop a file, while
-    # missing an alias only fails loudly. Hence simple lower() (NTFS/FAT keep ss and \u00df apart, casefold does
-    # not), and NFC only on macOS, where APFS/HFS+ treat composed and decomposed accents as one name.
-    if _case_insensitive(dest):
-        if sys.platform == "darwin":
-            fold = lambda p: unicodedata.normalize("NFC", p).lower()
-        else:
-            fold = lambda p: os.path.normcase(p).lower()
-    else:
-        fold = os.path.normcase
+    """Returns (key, broad): key(p) is equal for two target paths exactly when they name the same file at dest;
+    broad(p) may also merge names the volume keeps apart (fine for picking unused temporary names).
+    Parents are resolved first: a directory that already exists at dest may be a symlink (safe_join allows ones
+    that stay inside dest), so d1/a and d2/a can be one file. On a case-insensitive volume, names that fold alike
+    are then checked against the volume itself: guessing its rules either drops a file (NTFS keeps ss/\u00df,
+    NFC/NFD and I-with-dot/i+dot apart) or misses an alias."""
     real: Dict[str, str] = {}                 # one realpath per directory, not per file
-    def key(p):
+    def resolve(p):
         d, b = os.path.split(p)
         r = real.get(d)
         if r is None: r = real[d] = os.path.realpath(d)
-        return fold(os.path.join(r, b))
-    return key
+        return os.path.join(r, b)
+    broad = lambda p: _broad_key(resolve(p))
+    if not _case_insensitive(dest):
+        return (lambda p: os.path.normcase(resolve(p))), broad
+    root = os.path.realpath(dest)
+    reps: Dict[str, List[str]] = {}           # broad key -> resolved paths the volume keeps apart
+    canon: Dict[str, str] = {}
+    def key(p):
+        x = resolve(p)
+        c = canon.get(x)
+        if c is not None: return c
+        group = reps.setdefault(_broad_key(x), [])
+        for r in group:
+            ra, rb = os.path.relpath(r, root), os.path.relpath(x, root)
+            if not ra.startswith(os.pardir) and not rb.startswith(os.pardir) and _same_on_volume(dest, ra, rb):
+                canon[x] = r; return r
+        group.append(x); canon[x] = x
+        return x
+    return key, broad
 
 class Extractable:
     """Selection + safe extraction shared by every container format. A subclass provides entries (dicts with path,
@@ -578,7 +605,7 @@ class Extractable:
         # several entries may name the same file (an archive made from "a a", or a crafted one): the last one wins,
         # as with sequential extraction, and only it is written (two writers on one .vfapart would collide).
         # "Same file" follows the destination: case-insensitive volumes (Windows, default macOS) alias A and a.
-        alias_key = _alias_key_for(dest)
+        alias_key, broad_key = _alias_key_for(dest)
         last = {}
         for e in sel_files: last[alias_key(targets[id(e)])] = id(e)
         dups = [e for e in sel_files if last[alias_key(targets[id(e)])] != id(e)]
@@ -588,12 +615,13 @@ class Extractable:
             total_files = len(sel_files); total_bytes = sum(e["size"] for e in sel_files)
         # temporary names (NAME.vfapart) must not alias a final target or each other: an archive holding both
         # "a" and "a.vfapart" would otherwise have one entry's commit rename the other's half-written file
-        taken = {alias_key(targets[id(e)]) for e in sel_files}; tmps = {}
+        # (compared broadly: a temporary name that might alias something just gets a number)
+        taken = {broad_key(targets[id(e)]) for e in sel_files}; tmps = {}
         for e in sel_files:
             out = targets[id(e)]; tmp = out + ".vfapart"; n = 0
-            while alias_key(tmp) in taken:
+            while broad_key(tmp) in taken:
                 n += 1; tmp = f"{out}.{n}.vfapart"
-            taken.add(alias_key(tmp)); tmps[out] = tmp
+            taken.add(broad_key(tmp)); tmps[out] = tmp
 
         active: list = []            # (entry, out, handle) currently open - closed + cleaned up on any failure
         try:

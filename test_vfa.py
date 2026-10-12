@@ -1219,14 +1219,15 @@ def t2_dedup(work, corpus):
         except Exception as e:
             check(f"vfa2: duplicate paths spanning chunks extract, last entry wins ({'solid' if solid else 'non-solid'})", False, repr(e))
     # case aliases ("z/A" then "z/a"): kept apart on a case-sensitive destination, coalesced (last wins) on a
-    # case-insensitive one such as default macOS - simulated by forcing the probe
+    # case-insensitive one such as default macOS - simulated by forcing the probes (volume: ASCII case folds)
     p = build2(work / "dd_case.vfa", [("z/A", first), ("z/a", second)], coder=3, filt=None,
                solid=True, chunk_size=1 << 16, cdc=True)
-    real = vx._case_insensitive
+    real, real_same = vx._case_insensitive, vx._same_on_volume
     for forced in (None, True):
         out = work / "dd_case_out"; shutil.rmtree(out, ignore_errors=True); out.mkdir()
         ci = real(str(out)) if forced is None else forced
         vx._case_insensitive = (lambda d, v=ci: v)
+        if forced: vx._same_on_volume = lambda d, a, b: a.lower() == b.lower()
         try:
             open_extract(p, out)
             names = sorted(q.name for q in (out / "z").iterdir())
@@ -1239,7 +1240,7 @@ def t2_dedup(work, corpus):
         except Exception as e:
             check(f"vfa2: case-alias paths (case-{'in' if ci else ''}sensitive)", False, repr(e))
         finally:
-            vx._case_insensitive = real
+            vx._case_insensitive, vx._same_on_volume = real, real_same
     # a directory already at dest that links to another one: d1/a and d2/a are one file (last entry wins)
     if os.name != "nt":
         p = build2(work / "dd_link.vfa", [("z/d1/a", first), ("z/d2/a", second)], dirs=(), coder=3, filt=None,
@@ -1252,19 +1253,19 @@ def t2_dedup(work, corpus):
                   (out / "z/d1/a").read_bytes() == second and not list(out.rglob("*.vfapart")))
         except Exception as e:
             check("vfa2: two paths through a symlinked directory already at dest are one file (last entry wins)", False, repr(e))
-    # ...but a case-insensitive volume off macOS (NTFS, FAT) keeps "ss"/"\u00df" and composed/decomposed accents
-    # apart, so folding must not merge them and drop a file
-    if not vx._case_insensitive(str(work)) and sys.platform != "darwin":
-        names = ["ss", "\u00df", "\u00e9", "e\u0301"]
+    # ...but names that only LOOK alike (ss/\u00df, NFC/NFD, I-with-dot/i+dot) are merged only if the volume itself
+    # says so: here a case-sensitive one stands in for NTFS, which keeps them all apart; no file may be dropped
+    if not vx._case_insensitive(str(work)):
+        names = ["ss", "\u00df", "\u00e9", "e\u0301", "\u0130", "i\u0307"]
         p = build2(work / "dd_fold.vfa", [(f"z/{n}", first[:1000 + i]) for i, n in enumerate(names)], coder=3, filt=None)
         out = work / "dd_fold_out"; shutil.rmtree(out, ignore_errors=True); out.mkdir()
         real = vx._case_insensitive; vx._case_insensitive = lambda d: True
         try:
             open_extract(p, out)
-            check("vfa2: a case-insensitive volume off macOS keeps ss/\u00df and NFC/NFD names apart (no file dropped)",
+            check("vfa2: names that fold alike but the volume keeps apart (ss/\u00df, NFC/NFD, \u0130/i\u0307) all extract",
                   all((out / "z" / n).read_bytes() == first[:1000 + i] for i, n in enumerate(names)))
         except Exception as e:
-            check("vfa2: a case-insensitive volume off macOS keeps ss/\u00df and NFC/NFD names apart", False, repr(e))
+            check("vfa2: names that fold alike but the volume keeps apart all extract", False, repr(e))
         finally:
             vx._case_insensitive = real
     # a final name equal to another entry's temporary name: "a" reuses "a.vfapart"'s first chunk, so both are open at once
