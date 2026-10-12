@@ -1154,6 +1154,13 @@ def t2_lz(work, corpus):
     r = stale_vfa("c", work / "stale_new.vfa", "z", "--format", "vfa2", cwd=src)
     check("vfa2: a stale _vulp extension (API 1) makes 'vfa c' say it is out of date, not crash",
           r.returncode != 0 and "out of date" in (r.stdout + r.stderr) and "Traceback" not in r.stderr, (r.stdout + r.stderr)[-300:])
+    # an M4 build (API 2) has every function but the old level 7-9 parser: also out of date
+    (stale / "_vulp.py").write_text("from vulp_ref import *\nVERSION = 2\ndef lz_encode(data, level=6): raise AssertionError('stale encoder used')\n")
+    r = stale_vfa("c", work / "stale_new2.vfa", "z", "--format", "vfa2", "--level", "9", cwd=src)
+    check("vfa2: an M4-era _vulp extension (API 2) is out of date too: 'vfa c' says so instead of using its old parser",
+          r.returncode != 0 and "out of date" in (r.stdout + r.stderr) and "stale encoder used" not in (r.stdout + r.stderr),
+          (r.stdout + r.stderr)[-300:])
+    (stale / "_vulp.py").write_text("VERSION = 1\nfrom vulp_ref import tans_encode, tans_decode, filter_fwd, filter_inv, cost\n")
     lzarc = build2(work / "stale_lz.vfa", [("z/a.txt", b"stale extension " * 400)], coder=3, filt=(0, b""))
     out = work / "stale_out"; shutil.rmtree(out, ignore_errors=True)
     r = stale_vfa("x", lzarc, "-o", out)
