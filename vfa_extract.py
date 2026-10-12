@@ -601,11 +601,8 @@ class Extractable:
             if after_entry: after_entry(e, out_path)
             if progress: progress(done["files"], total_files, done["bytes"], total_bytes, e["path"])
 
-        for e in sel:
-            if e["entry_type"] == ET_DIR and not _is_root(e["path"]):
-                p = safe_join(dest, e["path"]); os.makedirs(p, exist_ok=True)
-                dirs.append(_norm(e["path"]))
         # validate every target before writing anything
+        sel_dirs = [(e, safe_join(dest, e["path"])) for e in sel if e["entry_type"] == ET_DIR and not _is_root(e["path"])]
         targets = {id(e): safe_join(dest, e["path"]) for e in sel_files}
         # several entries may name the same file (an archive made from "a a", or a crafted one): the last one wins,
         # as with sequential extraction, and only it is written (two writers on one .vfapart would collide).
@@ -618,6 +615,21 @@ class Extractable:
             LOGGER.warning(f"{len(dups)} duplicate path(s) in the archive (e.g. {dups[0]['path']!r}): the last entry wins")
             keep = set(last.values()); sel_files = [e for e in sel_files if id(e) in keep]
             total_files = len(sel_files); total_bytes = sum(e["size"] for e in sel_files)
+        # a path the archive needs as a directory (an entry's parent, or a directory entry) must not also be one of
+        # its files: "z" as a file next to "z/a.txt" is refused here instead of failing half-way with an OS error
+        file_keys = {alias_key(targets[id(e)]) for e in sel_files}; seen_dirs: Set[str] = set()
+        for e in sel_files + [d for d, _ in sel_dirs]:
+            parts = [x for x in _norm(e["path"]).split("/") if x]
+            need = ["/".join(parts[:i]) for i in range(1, len(parts))]
+            if e["entry_type"] == ET_DIR: need.append("/".join(parts))
+            for rel in need:
+                if rel in seen_dirs: continue
+                seen_dirs.add(rel)
+                if alias_key(os.path.join(dest, *rel.split("/"))) in file_keys:
+                    raise VFAError(f"Archive entry {e['path']!r} needs {rel!r} as a directory, but the archive also "
+                                   f"has a file there; refusing to extract.")
+        for e, p in sel_dirs:
+            os.makedirs(p, exist_ok=True); dirs.append(_norm(e["path"]))
         # temporary names (NAME.vfapart) must not alias a final target or each other: an archive holding both
         # "a" and "a.vfapart" would otherwise have one entry's commit rename the other's half-written file
         # (compared broadly: a temporary name that might alias something just gets a number)

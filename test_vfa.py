@@ -341,17 +341,35 @@ def mutate(data: bytes, rnd: random.Random) -> Tuple:
 
 FAILDIR = HERE / "fuzz_failures"
 
-def run_jobs(jobs, labels):
-    """Run fuzz jobs in a process pool; a job that takes > 60 s is a HANG (the pool is replaced)."""
-    ctx = mp.get_context("spawn")
-    res = []; pool = ctx.Pool(min(4, os.cpu_count() or 2))
+_FUZZ_SRC: dict = {}                          # per pool process: archive path -> bytes (read once)
+
+def fuzz_case(path, op):
+    """The bytes of one fuzz case, rebuilt from a small description: ("t", L) = the first L bytes of the archive,
+    ("m", seed) = one random mutation. Jobs carry only this description, so memory does not grow with the number
+    of cases (holding every truncation of a 150 KB archive at once took 10.7 GiB)."""
+    data = _FUZZ_SRC.get(path)
+    if data is None: data = _FUZZ_SRC[path] = pathlib.Path(path).read_bytes()
+    if op[0] == "t": return data[:op[1]], f"truncate@{op[1]}"
+    return mutate(data, random.Random(op[1]))
+
+def _fuzz_job(job):
+    path, op, verify, password, want = job
+    return _fuzz_worker((fuzz_case(path, op)[0], verify, password, want))
+
+def run_jobs(jobs, labels, fn=None):
+    """Run fuzz jobs in a process pool; a job that takes > 60 s is a HANG (the pool is replaced). At most a few jobs
+    per worker are in flight at a time, so memory stays bounded however many cases there are."""
+    fn = fn or _fuzz_worker
+    ctx = mp.get_context("spawn"); nproc = min(4, os.cpu_count() or 2); window = 4 * nproc
+    res = []; pool = ctx.Pool(nproc); pend = {}; nxt = 0
     try:
-        pend = [pool.apply_async(_fuzz_worker, (j,)) for j in jobs]
-        for i, a in enumerate(pend):
-            try: res.append(a.get(timeout=60))
+        for i in range(len(jobs)):
+            while nxt < len(jobs) and nxt < i + window:
+                pend[nxt] = pool.apply_async(fn, (jobs[nxt],)); nxt += 1
+            try: res.append(pend.pop(i).get(timeout=60))
             except mp.TimeoutError:
-                res.append(("HANG", labels[i])); pool.terminate(); pool = ctx.Pool(min(4, os.cpu_count() or 2))
-                pend[i + 1:] = [pool.apply_async(_fuzz_worker, (j,)) for j in jobs[i + 1:]]
+                res.append(("HANG", labels[i])); pool.terminate(); pool = ctx.Pool(nproc)
+                for k in list(pend): pend[k] = pool.apply_async(fn, (jobs[k],))
     finally:
         pool.terminate()
     return res
@@ -359,14 +377,12 @@ def run_jobs(jobs, labels):
 def run_fuzz(targets, want, n_cases, quick, rnd):
     """targets: (name, path, password, verify_modes). Every prefix truncation + n_cases random mutations each."""
     for name, path, pw, modes in targets:
-        data = pathlib.Path(path).read_bytes()
+        path = str(path); size = pathlib.Path(path).stat().st_size; _FUZZ_SRC.pop(path, None)
         for verify in modes:
-            jobs, labels = [], []
-            for L in range(0, len(data), 1 if not quick else 7):
-                jobs.append((data[:L], verify, pw, want)); labels.append(f"truncate@{L}")
-            for _ in range(n_cases):
-                m, d = mutate(data, rnd); jobs.append((m, verify, pw, want)); labels.append(d)
-            t0 = time.perf_counter(); res = run_jobs(jobs, labels); dt = time.perf_counter() - t0
+            ops = [("t", L) for L in range(0, size, 1 if not quick else 7)] + [("m", rnd.getrandbits(64)) for _ in range(n_cases)]
+            jobs = [(path, op, verify, pw, want) for op in ops]
+            labels = [f"truncate@{op[1]}" if op[0] == "t" else fuzz_case(path, op)[1] for op in ops]
+            t0 = time.perf_counter(); res = run_jobs(jobs, labels, _fuzz_job); dt = time.perf_counter() - t0
             bad = [(labels[i], r) for i, r in enumerate(res) if r[0] in ("WRONG", "CRASH", "HANG", "ESCAPE")]
             counts = {k: sum(1 for r in res if r[0] == k) for k in ("refused", "identical", "WRONG", "CRASH", "HANG", "ESCAPE")}
             tag = f"fuzz {name}, {'digest+CRC' if verify else 'CRC only (--no-verify)'}"
@@ -374,7 +390,7 @@ def run_fuzz(targets, want, n_cases, quick, rnd):
                 FAILDIR.mkdir(exist_ok=True)
                 for lab, r in bad[:20]:
                     j = labels.index(lab); fn = FAILDIR / f"{pathlib.Path(path).stem}_{'v' if verify else 'nv'}_{j}.vfa"
-                    fn.write_bytes(jobs[j][0]); print(f"      {r[0]} {lab}: {r[1][:300]}  -> {fn.name}")
+                    fn.write_bytes(fuzz_case(path, ops[j])[0]); print(f"      {r[0]} {lab}: {r[1][:300]}  -> {fn.name}")
             check(f"{tag}: {len(jobs)} cases in {dt:.0f}s {counts}", not bad)
 
 def t_fuzz(work, n_cases, quick):
@@ -641,6 +657,18 @@ def t2_paths(work):
             check(f"vfa2 path refused before writing anything: {p!r}", not outside, str(outside))
         except Exception as e:
             check(f"vfa2 path refused: {p!r}", False, f"crashed: {e!r}")
+    # one path needed both as a file and as a directory (found by the structure fuzz: a flipped entry type)
+    for label, files, dirs in (("file 'z' next to 'z/a.txt'", [("z", b"x"), ("z/a.txt", b"y")], ()),
+                               ("directory entry 'z/d' that is also a file", [("z/d", b"x")], ("z", "z/d"))):
+        arc = build2(work / "conflict2.vfa", files, dirs=dirs)
+        dest = work / "conflict2_out"; shutil.rmtree(dest, ignore_errors=True)
+        try:
+            open_extract(arc, dest); check(f"vfa2 refuse: {label}", False, "was extracted")
+        except vx.VFAError as e:
+            written = [q for q in dest.rglob("*")] if dest.exists() else []
+            check(f"vfa2 refuse before writing anything: {label}", not written and "as a directory" in str(e), f"{written} {e}")
+        except Exception as e:
+            check(f"vfa2 refuse: {label}", False, f"crashed: {e!r}")
 
 def t2_determinism(work, corpus):
     for flags in ([], ["--solid", "--chunk-exp", "16"]):
@@ -753,7 +781,9 @@ def t2_fuzz(work, n_cases, quick):
         jobs.append((p.read_bytes(), True, None, None))
     res = run_jobs(jobs, labels)
     bad = [(labels[i], r) for i, r in enumerate(res) if r[0] in ("WRONG", "CRASH", "HANG", "ESCAPE")]
-    for lab, r in bad[:10]: print(f"      {r[0]} {lab}: {r[1][:400]}")
+    for lab, r in bad[:10]:
+        FAILDIR.mkdir(exist_ok=True); fn = FAILDIR / f"struct_{labels.index(lab)}.vfa"
+        fn.write_bytes(jobs[labels.index(lab)][0]); print(f"      {r[0]} {lab}: {r[1][:400]}  -> {fn.name}")
     counts = {k: sum(1 for r in res if r[0] == k) for k in ("refused", "accepted", "CRASH", "HANG", "ESCAPE")}
     check(f"vfa2 structure fuzz (index mutated, CRCs+digest recomputed): {len(jobs)} cases {counts}", not bad)
 
