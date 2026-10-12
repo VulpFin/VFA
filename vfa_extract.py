@@ -608,6 +608,7 @@ class Extractable:
         # as with sequential extraction, and only it is written (two writers on one .vfapart would collide).
         # "Same file" follows the destination: case-insensitive volumes (Windows, default macOS) alias A and a.
         alias_key, broad_key = _alias_key_for(dest)
+        all_files = list(sel_files)   # before duplicates are dropped: a dropped entry's path still needs its parents
         last = {}
         for e in sel_files: last[alias_key(targets[id(e)])] = id(e)
         dups = [e for e in sel_files if last[alias_key(targets[id(e)])] != id(e)]
@@ -618,7 +619,7 @@ class Extractable:
         # a path the archive needs as a directory (an entry's parent, or a directory entry) must not also be one of
         # its files: "z" as a file next to "z/a.txt" is refused here instead of failing half-way with an OS error
         file_keys = {alias_key(targets[id(e)]) for e in sel_files}; seen_dirs: Set[str] = set()
-        for e in sel_files + [d for d, _ in sel_dirs]:
+        for e in all_files + [d for d, _ in sel_dirs]:
             parts = [x for x in _norm(e["path"]).split("/") if x]
             need = ["/".join(parts[:i]) for i in range(1, len(parts))]
             if e["entry_type"] == ET_DIR: need.append("/".join(parts))

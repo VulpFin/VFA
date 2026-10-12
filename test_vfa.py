@@ -671,11 +671,14 @@ def t2_paths(work):
             check(f"vfa2 refuse: {label}", False, f"crashed: {e!r}")
     # the same through a directory symlink already at the destination: dest/x -> y, archive has "x/a" and "y"
     # (both where the directory resolves to, file "y", and the path as written, file "x")
-    for other in ("y", "x") if os.name != "nt" else ():
-        arc = build2(work / "conflict2l.vfa", [("x/a", b"x"), (other, b"y")], dirs=())
+    # (and a third case where "x/a" is dropped as an alias of "y/a" but still needs "x" as a directory)
+    for other in ("y", "x", "y/a+x") if os.name != "nt" else ():
+        files = [("x/a", b"x"), ("y/a", b"z"), ("x", b"y")] if other == "y/a+x" else [("x/a", b"x"), (other, b"y")]
+        arc = build2(work / "conflict2l.vfa", files, dirs=())
         dest = work / "conflict2l_out"; shutil.rmtree(dest, ignore_errors=True); (dest / "y").mkdir(parents=True)
         os.symlink("y", dest / "x")
-        label = f"'x/a' and file {other!r} when dest/x already links to y"
+        label = ("'x/a', 'y/a' (its alias) and file 'x'" if other == "y/a+x" else f"'x/a' and file {other!r}") + \
+                " when dest/x already links to y"
         try:
             open_extract(arc, dest); check(f"vfa2 refuse: {label}", False, "was extracted")
         except vx.VFAError as e:
