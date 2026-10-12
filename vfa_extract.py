@@ -492,6 +492,11 @@ def _same_on_volume(dest: str, a: str, b: str) -> bool:
         shutil.rmtree(probe, ignore_errors=True)
 
 
+def _escapes(rel: str) -> bool:
+    """True if a relpath() result leaves its start directory: a real ".." component, not a name like "..foo"."""
+    return rel == os.pardir or rel.startswith(os.pardir + os.sep) or (os.altsep and rel.startswith(os.pardir + os.altsep))
+
+
 def _alias_key_for(dest: str):
     """Returns (key, broad): key(p) is equal for two target paths exactly when they name the same file at dest;
     broad(p) may also merge names the volume keeps apart (fine for picking unused temporary names).
@@ -518,7 +523,7 @@ def _alias_key_for(dest: str):
         group = reps.setdefault(_broad_key(x), [])
         for r in group:
             ra, rb = os.path.relpath(r, root), os.path.relpath(x, root)
-            if not ra.startswith(os.pardir) and not rb.startswith(os.pardir) and _same_on_volume(dest, ra, rb):
+            if not _escapes(ra) and not _escapes(rb) and _same_on_volume(dest, ra, rb):
                 canon[x] = r; return r
         group.append(x); canon[x] = x
         return x

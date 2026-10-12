@@ -1220,8 +1220,8 @@ def t2_dedup(work, corpus):
             check(f"vfa2: duplicate paths spanning chunks extract, last entry wins ({'solid' if solid else 'non-solid'})", False, repr(e))
     # case aliases ("z/A" then "z/a"): kept apart on a case-sensitive destination, coalesced (last wins) on a
     # case-insensitive one such as default macOS - simulated by forcing the probes (volume: ASCII case folds)
-    p = build2(work / "dd_case.vfa", [("z/A", first), ("z/a", second)], coder=3, filt=None,
-               solid=True, chunk_size=1 << 16, cdc=True)
+    p = build2(work / "dd_case.vfa", [("z/A", first), ("z/a", second), ("..z/A", first), ("..z/a", second)],
+               dirs=("z", "..z"), coder=3, filt=None, solid=True, chunk_size=1 << 16, cdc=True)
     real, real_same = vx._case_insensitive, vx._same_on_volume
     for forced in (None, True):
         out = work / "dd_case_out"; shutil.rmtree(out, ignore_errors=True); out.mkdir()
@@ -1230,11 +1230,13 @@ def t2_dedup(work, corpus):
         if forced: vx._same_on_volume = lambda d, a, b: a.lower() == b.lower()
         try:
             open_extract(p, out)
-            names = sorted(q.name for q in (out / "z").iterdir())
-            if ci:   # one file survives, holding the last entry's bytes (its name is the volume's business)
-                ok = len(names) == 1 and (out / "z" / names[0]).read_bytes() == second
-            else:
-                ok = names == ["A", "a"] and (out / "z/A").read_bytes() == first and (out / "z/a").read_bytes() == second
+            ok = True
+            for top in ("z", "..z"):     # "..z" is a name inside dest, not a parent reference
+                names = sorted(q.name for q in (out / top).iterdir())
+                if ci:   # one file survives, holding the last entry's bytes (its name is the volume's business)
+                    ok &= len(names) == 1 and (out / top / names[0]).read_bytes() == second
+                else:
+                    ok &= names == ["A", "a"] and (out / top / "A").read_bytes() == first and (out / top / "a").read_bytes() == second
             check(f"vfa2: case-alias paths on a case-{'in' if ci else ''}sensitive destination "
                   f"({'coalesced, last wins' if ci else 'kept apart'})", ok, repr(names))
         except Exception as e:
