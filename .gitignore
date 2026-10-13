@@ -211,3 +211,8 @@ sample/
 bin/
 fuzz_failures/
 *.pyd
+
+# release builds (release.py)
+release/
+.buildenv/
+*.egg-info/
