@@ -31,7 +31,7 @@ Rules this reader enforces (see VFA1.md):
   - nothing is written outside the destination directory (safe_join()).
 """
 
-import sys, os, io, struct, getpass, hashlib, zlib, lzma, bz2, json, stat, tempfile, unicodedata, shutil
+import sys, os, io, struct, getpass, hashlib, zlib, lzma, bz2, json, stat, unicodedata, shutil
 from datetime import datetime
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -140,17 +140,40 @@ try:
     import zstandard as zstd; HAVE_ZSTD = True
 except Exception:
     HAVE_ZSTD = False
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-    HAVE_AESGCM = True
-except Exception:
-    AESGCM = None; Scrypt = None; HAVE_AESGCM = False
-try:
-    import argon2.low_level as argon2ll
-    HAVE_ARGON2 = True
-except Exception:
-    argon2ll = None; HAVE_ARGON2 = False
+# Encryption libraries load on first use, not at start-up: only encrypted archives need them, and importing
+# argon2 alone costs ~0.17 s on Windows (it runs `cmd /c ver` to pick its defaults). Code here calls _crypto() /
+# _argon2(); other modules keep using vx.AESGCM, vx.Scrypt, vx.argon2ll, vx.HAVE_AESGCM, vx.HAVE_ARGON2, which
+# resolve lazily through the module __getattr__ below.
+_LAZY: dict = {}
+
+def _crypto():
+    """(AESGCM, Scrypt), or (None, None) without the 'cryptography' package."""
+    if "crypto" not in _LAZY:
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+            _LAZY["crypto"] = (AESGCM, Scrypt)
+        except Exception:
+            _LAZY["crypto"] = (None, None)
+    return _LAZY["crypto"]
+
+def _argon2():
+    """argon2.low_level, or None without argon2-cffi."""
+    if "argon2" not in _LAZY:
+        try:
+            import argon2.low_level as argon2ll
+            _LAZY["argon2"] = argon2ll
+        except Exception:
+            _LAZY["argon2"] = None
+    return _LAZY["argon2"]
+
+def __getattr__(name):
+    if name == "AESGCM": return _crypto()[0]
+    if name == "Scrypt": return _crypto()[1]
+    if name == "HAVE_AESGCM": return _crypto()[0] is not None
+    if name == "argon2ll": return _argon2()
+    if name == "HAVE_ARGON2": return _argon2() is not None
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 try:
     import lz4.frame as lz4f; HAVE_LZ4 = True
 except Exception:
@@ -171,7 +194,8 @@ def _nonce_from(prefix12: bytes, index: int) -> bytes:
     return m.digest()[:12]
 
 def _aead_decrypt(key, aead_id, nonce_prefix, index, ciphertext, aad=b""):
-    if aead_id != AEAD_AESGCM or not HAVE_AESGCM:
+    AESGCM = _crypto()[0]
+    if aead_id != AEAD_AESGCM or AESGCM is None:
         raise VFAError("Cannot decrypt: AES-GCM support unavailable (install 'cryptography').")
     try:
         return AESGCM(key).decrypt(_nonce_from(nonce_prefix, index), ciphertext, aad)
@@ -187,11 +211,13 @@ def _kdf(password: bytes, kdf_id, t, m, p, salt) -> bytes:
                                      and (t or 1 << 15) * (m or 8) * 128 <= 4 << 30):
         raise VFAError(f"scrypt parameters out of range (n={t}, r={m}, p={p}); refusing (corrupted header?).")
     if kdf_id == KDF_ARGON2ID:
-        if not HAVE_ARGON2: raise VFAError("Argon2 KDF requested but argon2-cffi not installed.")
+        argon2ll = _argon2()
+        if argon2ll is None: raise VFAError("Argon2 KDF requested but argon2-cffi not installed.")
         return argon2ll.hash_secret_raw(secret=password, salt=salt, time_cost=t or 3,
                                         memory_cost=m or (256 * 1024), parallelism=p or 4,
                                         hash_len=32, type=argon2ll.Type.ID, version=argon2ll.ARGON2_VERSION)
     if kdf_id == KDF_SCRYPT:
+        Scrypt = _crypto()[1]
         if Scrypt is None: raise VFAError("Scrypt KDF requested but 'cryptography' not installed.")
         return Scrypt(salt=salt, length=32, n=t or (1 << 15), r=m or 8, p=p or 1).derive(password)
     raise VFAError("Archive has no KDF but decryption was requested.")
@@ -463,10 +489,17 @@ def open_container(path: str):
         return vfa2.Archive2(path)
     return Container(path)
 
+def _probe_name(dest: str, tag: str) -> str:
+    """A fresh name for a scratch file/folder at dest. Probes make ONE attempt with it: tempfile.mkstemp/mkdtemp
+    treat 'access denied' as 'name taken' on Windows and retry ~10,000 times, which froze the installer on
+    Program Files (test_sfi.py guards this)."""
+    return os.path.join(dest, f".vfa{tag}-{os.getpid()}-{os.urandom(4).hex()}")
+
 def _case_insensitive(dest: str) -> bool:
     """Does the filesystem at dest treat names case-insensitively? Probed with a temporary file."""
+    probe = _probe_name(dest, "case")
     try:
-        fd, probe = tempfile.mkstemp(prefix=".vfacase-", dir=dest); os.close(fd)
+        os.close(os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
     except OSError:
         return os.name == "nt" or sys.platform == "darwin"     # cannot probe: assume the platform default
     try:
@@ -483,7 +516,9 @@ def _broad_key(p: str) -> str:
 def _same_on_volume(dest: str, a: str, b: str) -> bool:
     """Ask the destination volume whether relative paths a and b name one file: create a in a scratch directory
     at dest and look for b. The volume's own rules decide (NTFS upcase table, APFS normalization, ...)."""
-    probe = tempfile.mkdtemp(prefix=".vfaprobe-", dir=dest)
+    probe = _probe_name(dest, "probe")
+    try: os.mkdir(probe, 0o700)
+    except OSError: return False      # cannot probe: treat as distinct (a missed alias fails loudly, never drops a file)
     try:
         pa = os.path.join(probe, a); os.makedirs(os.path.dirname(pa), exist_ok=True)
         open(pa, "wb").close()

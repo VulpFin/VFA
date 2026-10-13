@@ -23,18 +23,8 @@ from datetime import datetime
 global LOGGER
 
 # ---------- Optional deps ----------
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-    HAVE_AESGCM = True
-except Exception:
-    AESGCM = None; Scrypt = None; HAVE_AESGCM = False
-
-try:
-    import argon2.low_level as argon2ll
-    HAVE_ARGON2 = True
-except Exception:
-    argon2ll = None; HAVE_ARGON2 = False
+# cryptography and argon2 load on first use (see vfa_extract._crypto / _argon2): only encryption needs them, and
+# importing argon2 costs ~0.17 s per run on Windows
 
 import zlib, lzma, hashlib, bz2
 try:
@@ -332,13 +322,15 @@ class TOC:
 def kdf_derive_key(password:bytes, header:HeaderV1)->bytes:
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("crypto func kdf derive key")
     if header.kdf_id==KDF_ARGON2ID:
-        if not HAVE_ARGON2: raise RuntimeError("argon2-cffi not installed")
+        argon2ll = vx._argon2()
+        if argon2ll is None: raise RuntimeError("argon2-cffi not installed")
         return argon2ll.hash_secret_raw(
             secret=password, salt=header.salt,
             time_cost=header.kdf_t or 3, memory_cost=header.kdf_m or (256*1024),
             parallelism=header.kdf_p or 4, hash_len=32,
             type=argon2ll.Type.ID, version=argon2ll.ARGON2_VERSION)
     if header.kdf_id==KDF_SCRYPT:
+        Scrypt = vx._crypto()[1]
         if Scrypt is None: raise RuntimeError("cryptography not installed")
         return Scrypt(salt=header.salt, length=32, n=header.kdf_t or (1<<15),
                       r=header.kdf_m or 8, p=header.kdf_p or 1).derive(password)
@@ -346,11 +338,13 @@ def kdf_derive_key(password:bytes, header:HeaderV1)->bytes:
 
 def aead_encrypt(key:bytes, header:HeaderV1, index:int, plaintext:bytes, aad:bytes=b"")->bytes:
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"crypto func aead encrypt with index {index}")
-    if header.aead_id!=AEAD_AESGCM or not HAVE_AESGCM: raise RuntimeError("AESGCM unavailable")
+    AESGCM = vx._crypto()[0]
+    if header.aead_id!=AEAD_AESGCM or AESGCM is None: raise RuntimeError("AESGCM unavailable")
     return AESGCM(key).encrypt(nonce_from(header.aead_nonce_prefix, index), plaintext, aad)
 def aead_decrypt(key:bytes, header:HeaderV1, index:int, ciphertext:bytes, aad:bytes=b"")->bytes:
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"crypto func aead decrypt with index {index}")
-    if header.aead_id!=AEAD_AESGCM or not HAVE_AESGCM: raise RuntimeError("AESGCM unavailable")
+    AESGCM = vx._crypto()[0]
+    if header.aead_id!=AEAD_AESGCM or AESGCM is None: raise RuntimeError("AESGCM unavailable")
     return AESGCM(key).decrypt(nonce_from(header.aead_nonce_prefix, index), ciphertext, aad)
 
 # ---------- Compression ----------
@@ -814,8 +808,8 @@ def cmd_create(args):
     if args.solid: header.flags |= F_SOLID
     key=None
     if _wants_password(args):
-        if not HAVE_AESGCM: raise SystemExit("cryptography not installed; cannot encrypt")
-        if HAVE_ARGON2:
+        if not vx.HAVE_AESGCM: raise SystemExit("cryptography not installed; cannot encrypt")
+        if vx.HAVE_ARGON2:
             header.kdf_id=KDF_ARGON2ID; header.kdf_t=args.kdf_time or 3; header.kdf_m=args.kdf_mem_kib or (256*1024); header.kdf_p=args.kdf_parallel or 4
         else:
             header.kdf_id=KDF_SCRYPT; header.kdf_t=args.scrypt_n or (1<<15); header.kdf_m=args.scrypt_r or 8; header.kdf_p=args.scrypt_p or 1

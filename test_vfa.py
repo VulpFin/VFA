@@ -565,6 +565,20 @@ def t2_encrypt(work, corpus):
         check(f"vfa2 wrong password -> exit 5, nothing written ({'solid' if solid else 'non-solid'})",
               r.returncode == 5 and not any(p.is_file() for p in out.rglob("*")), f"exit {r.returncode}")
     check("vfa2 encrypted list without password refuses", vfa("l", work / "v2enc_True.vfa", expect=None).returncode != 0)
+    # the encryption libraries load only when needed: importing argon2 alone costs ~0.17 s per run on Windows
+    def loaded(*argv, env=None):
+        e = dict(os.environ); e.update(env or {})
+        r = subprocess.run([PY, "-X", "importtime", str(HERE / "vfa.py"), *map(str, argv)], capture_output=True, text=True, env=e)
+        mods = {ln.split("|")[-1].strip() for ln in r.stderr.splitlines() if ln.startswith("import time:")}
+        return r.returncode, {m.split(".")[0] for m in mods} & {"argon2", "cryptography"}
+    plain = build2(work / "v2plain.vfa", [("z/a", b"plain " * 100)])
+    out = work / "v2lazy"; shutil.rmtree(out, ignore_errors=True)
+    rc, got = loaded("x", plain, "-o", out)
+    check("vfa2: extracting an unencrypted archive loads neither argon2 nor cryptography", rc == 0 and not got, f"rc={rc} {got}")
+    shutil.rmtree(out, ignore_errors=True)
+    rc, got = loaded("x", work / "v2enc_True.vfa", "-o", out, "--password-env", "VFA_TEST_PW", env=env)
+    check("vfa2: an encrypted archive still loads them on demand and extracts", rc == 0 and got == {"argon2", "cryptography"},
+          f"rc={rc} {got}")
     # the cleartext frame header (coder/filter ids, sizes) is bound into AES-GCM as associated data:
     # decrypting with any header byte changed must fail
     arc = build2(work / "v2enc_aad.vfa", [("z/a", b"x" * 5000)], password=b"pw", kdf=(1, 1024, 1))
