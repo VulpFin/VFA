@@ -635,12 +635,15 @@ def t2_refuse(work):
     with vx.open_container(str(p)) as c: c.unlock(None); off = c.chunks[0][0]
     patch_frame2(p, off, 6, 0x80)
     refused("vfa2 refuse: unknown frame flag", p, "frame flags")
-    for table, cid, needle, label in ((V2.CODERS, 2, "vulp-cm", "coder 2"), (V2.FILTERS, 5, "text", "filter 5")):
+    # ids no reader implements (coder 2 was the example until M5 implemented it); the real entry, if any, is put back
+    for table, cid, needle, label in ((V2.CODERS, 9, "coder id 9", "coder 9"), (V2.FILTERS, 5, "text", "filter 5")):
         # the test coder must shrink its input, or the writer (correctly) stores the chunk with coder 0 instead
         enc = (lambda raw, level=0: (b"", bytes(raw)[:8])) if table is V2.CODERS else (lambda raw, params=b"": (b"", bytes(raw)))
-        table[cid] = V2.Codec(cid, "test-only", enc, None)
+        prev = table.get(cid); table[cid] = V2.Codec(cid, "test-only", enc, None)
         try: p = build2(work / f"r_c{cid}.vfa", f, **({"coder": cid} if table is V2.CODERS else {"filt": cid}))
-        finally: del table[cid]
+        finally:
+            if prev is None: del table[cid]
+            else: table[cid] = prev
         refused(f"vfa2 refuse: unimplemented {label} is named ({needle})", p, needle)
     # what an M1 build (stored only) does with an M3 archive: names the coder/filter it lacks, writes nothing
     p = build2(work / "r_m3.vfa", [("z/a.txt", b"payload " * 100), ("z/b.bin", bytes(range(256)) * 64)], coder=1, filt=(1, b"\x01"))

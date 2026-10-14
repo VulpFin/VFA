@@ -501,7 +501,7 @@ class Writer2:
             off = self._frame(CHUNK_MAGIC, coder, fid, params, payload, len(raw), c, self.data_key)
             idx = len(self.chunks); self.chunks.append((off, len(raw), c, coder, fid))
             if info is not None:
-                self.routing.append({"chunk": idx, "filter": filter_label(fid, fparams), "coder": CODER_NAMES[coder],
+                self.routing.append({"chunk": idx, "filter": filter_label(fid, fparams), "coder": CODERS[coder].name,
                                      "raw": len(raw), "stored": len(payload), **info})
             if h is not None: self.by_hash[h] = idx
         for ext in self.pending: ext[0] = idx
