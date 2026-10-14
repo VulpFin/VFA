@@ -491,8 +491,8 @@ class Writer2:
                 def written(cp, pay): return len(pay) + (2 + len(fparams) + len(cp) if (fparams or cp) else 0)
                 if lpay is not None and (payload is None or written(lp, lpay) <= written(cparams, payload)):
                     coder, cparams, payload = CODER_LZ, lp, lpay
-                elif payload is not None and written(cparams, payload) >= len(raw):
-                    payload = None                  # the params would eat the gain: store the chunk
+                if payload is not None and written(cparams, payload) >= len(raw):
+                    payload = None                  # whichever won, its params would eat the gain: store the chunk
                 info = dict(info or {})
                 info["why"] = (info.get("why", "") + f"; vulp-cm {cm_size if cm_size is not None else 'no gain'} B, vulp-lz "
                                f"{len(lpay) if lpay is not None else 'no gain'} B: kept {CODERS[coder].name}").lstrip("; ")
