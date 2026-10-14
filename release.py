@@ -31,7 +31,9 @@ IS_WIN = platform.system() == "Windows"; IS_LINUX = platform.system() == "Linux"
 OS_TAG = "windows" if IS_WIN else "linux" if IS_LINUX else "macos"
 OUT = ROOT / "release" / VERSION
 
-def log(msg): print(f"[release] {msg}", flush=True)
+def clock(t=None): return time.strftime("%H:%M:%S", time.localtime(t))
+
+def log(msg): print(f"[{clock()}] [release] {msg}", flush=True)
 
 def run(cmd, check=True, **kw):
     log("$ " + " ".join(str(c) for c in cmd))
@@ -56,17 +58,21 @@ class Status:
         self.spin = self.SPIN_U if ok(self.SPIN_U) and (not IS_WIN or os.environ.get("WT_SESSION")) else self.SPIN_A
         self.full, self.empty = ("█", "░") if fancy else ("#", ".")
         self.ok_mark, self.bad_mark = ("✓", "✗") if fancy else ("ok", "FAILED")
+        self.arrow = "→" if ok("→") else "->"
         self.thread = threading.Thread(target=self._tick, daemon=True)
     def __enter__(self): self.thread.start(); return self
     def __exit__(self, *exc): self.stop.set(); self.thread.join()
     def _elapsed(self):
-        s = int(time.time() - self.t0); return f"{s // 60}:{s % 60:02d}"
+        s = int(time.time() - self.t0); return f"{s // 60}:{s % 60:02d}".rjust(5)
+    def _when(self, end=None):
+        """[start → end], with the end blank while running so finished and running lines line up."""
+        return f"[{clock(self.t0)} {self.arrow} {clock(end) if end else ' ' * 8}]"
     def _line(self):
         bar = ""
         if self.total:
             frac = min(1.0, self.done / self.total); n = 20
             bar = f" {self.full * int(frac * n)}{self.empty * (n - int(frac * n))} {frac * 100:3.0f}%"
-        return f"  {self.spin[self.i % len(self.spin)]} {self.label}  {self._elapsed()}{bar}  {self.note}"
+        return f"{self._when()} {self._elapsed()}  {self.spin[self.i % len(self.spin)]} {self.label}{bar}  {self.note}"
     def _draw(self):
         width = shutil.get_terminal_size((100, 20)).columns - 1
         print("\r" + self._line()[:width].ljust(width), end="", flush=True)
@@ -85,12 +91,12 @@ class Status:
         """A line that stays (a failure), printed above the status line."""
         with self.lock:
             if self.tty: print("\r" + " " * (shutil.get_terminal_size((100, 20)).columns - 1) + "\r", end="")
-            print(text, flush=True)
+            print(f"[{clock()}] {text.strip()}", flush=True)
     def finish(self, ok, note=""):
         with self.lock:
             self.stop.set()
             mark = self.ok_mark if ok else self.bad_mark
-            text = f"  {mark} {self.label}  {self._elapsed()}  {note}".rstrip()
+            text = f"{self._when(time.time())} {self._elapsed()}  {mark} {self.label}  {note}".rstrip()
             if self.tty: print("\r" + text.ljust(shutil.get_terminal_size((100, 20)).columns - 1), flush=True)
             else: print(text, flush=True)
 
@@ -142,7 +148,8 @@ def find_python(ver):
     if shutil.which("uv"):
         r = subprocess.run(["uv", "python", "find", ver], capture_output=True, text=True)
         if r.returncode != 0:
-            run(["uv", "python", "install", ver], check=False)
+            run_status(["uv", "python", "install", ver], f"py{ver}: download Python {ver} (uv)",
+                       f"{OS_TAG}-py{ver}-uv.log")
             r = subprocess.run(["uv", "python", "find", ver], capture_output=True, text=True)
         if r.returncode == 0: return r.stdout.strip()
     return None
