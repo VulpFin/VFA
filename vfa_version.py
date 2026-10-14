@@ -28,7 +28,11 @@ def show(text: str, title: str = "VFA") -> None:
 
 def route_output(ap, title: str) -> None:
     """Send everything argparse prints (--help, --version, usage errors) through show(), so a windowless build
-    answers them in a message box instead of saying nothing."""
+    answers them in a message box instead of saying nothing. Call it before add_subparsers(): subcommand parsers
+    are made from the parent's class, so they route their output too."""
     import sys
     if sys.stdout is None and sys.stderr is None:
-        ap._print_message = lambda message, file=None: message and show(message, title)
+        class Routed(type(ap)):
+            def _print_message(self, message, file=None):
+                if message: show(message, title)
+        ap.__class__ = Routed
