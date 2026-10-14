@@ -758,14 +758,18 @@ def _collect_items(args, solid: bool):
 
 # ---------- Commands ----------
 def cmd_create_v2(args):
-    """VFA2 (see VFA2.md). Coders: lz (default), tans or stored; filter per chunk: auto (default) or forced with
+    """VFA2 (see VFA2.md). Coders: lz (default), cm (vulp-cm where it beats lz), tans or stored; filter per chunk: auto (default) or forced with
     --filter; content-defined dedup across chunks unless --no-dedup or encrypting."""
     import vfa2
-    if args.method not in (None, "lz", "tans", "none", "stored"):
-        raise SystemExit(f"VFA2 has the coders 'lz' (default), 'tans' and 'stored'/'none'; --method {args.method} is a VFA1 method")
-    coder = {"none": 0, "stored": 0, "tans": 1}.get(args.method, vfa2.CODER_LZ)
-    if coder == vfa2.CODER_LZ and not vfa2.NATIVE:
-        raise SystemExit(f"--method lz needs the C codec: {vfa2.NATIVE_PROBLEM}. (--method tans works without it, slowly.)")
+    if args.method not in (None, "lz", "cm", "tans", "none", "stored"):
+        raise SystemExit(f"VFA2 has the coders 'lz' (default), 'cm', 'tans' and 'stored'/'none'; --method {args.method} is a VFA1 method")
+    coder = {"none": 0, "stored": 0, "tans": 1, "cm": vfa2.CODER_CM}.get(args.method, vfa2.CODER_LZ)
+    if coder in (vfa2.CODER_LZ, vfa2.CODER_CM) and not vfa2.NATIVE:
+        raise SystemExit(f"--method {args.method or 'lz'} needs the C codec: {vfa2.NATIVE_PROBLEM}. "
+                         "(--method tans works without it, slowly.)")
+    if coder == vfa2.CODER_CM:
+        LOGGER.info(f"vulp-cm: maximum compression; each chunk keeps vulp-lz where CM does not win. CM chunks "
+                    f"decode at about 1 MB/s and need about {13 << vfa2.cm_bits(args.level) >> 20} MiB to decode.")
     try: filt = vfa2.parse_filter(args.filter)
     except ValueError as e: raise SystemExit(str(e))
     if coder == 0 and filt is None: filt = (0, b"")
@@ -795,7 +799,7 @@ def cmd_create_v2(args):
 def cmd_create(args):
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd create")
     if args.format == "vfa2": return cmd_create_v2(args)
-    if args.method in ("tans", "lz"): raise SystemExit(f"--method {args.method} is a VFA2 coder; add --format vfa2")
+    if args.method in ("tans", "lz", "cm"): raise SystemExit(f"--method {args.method} is a VFA2 coder; add --format vfa2")
     if args.filter != "auto": raise SystemExit("--filter applies to --format vfa2 only")
     if args.method is None: args.method = "zstd" if HAVE_ZSTD else "zlib"
     if args.method == "stored": args.method = "none"
@@ -1093,9 +1097,12 @@ def cmd_append(args):
 # ---------- CLI ----------
 def build_argparser():
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa cli func build argparser")
+    from vfa_version import __version__, version_text, route_output
     ap = argparse.ArgumentParser(
-        prog="vfa", description="Vulpfin Archive (.vfa) — Python Prototype"
+        prog="vfa", description=f"VulpFin Archive (.vfa) {__version__}"
     )
+    route_output(ap, "VFA")
+    ap.add_argument("-V", "--version", action="version", version=version_text("vfa"))
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     # --- Create ---
@@ -1105,8 +1112,9 @@ def build_argparser():
     ap_c.add_argument(
         "--method",
         default=None,
-        choices=list(NAME_TO_METHOD.keys()) + ["stored", "tans", "lz"],
-        help="Compression method, default zstd (VFA1) / lz (VFA2: lz, tans or stored/none; --level 0-9 for lz)",
+        choices=list(NAME_TO_METHOD.keys()) + ["stored", "tans", "lz", "cm"],
+        help="Compression method, default zstd (VFA1) / lz (VFA2: lz, cm, tans or stored/none; --level 0-9 for lz; "
+             "cm = maximum compression, decodes ~100x slower than lz, used per chunk only where it wins)",
     )
     ap_c.add_argument("--format", choices=["vfa1", "vfa2"], default="vfa1",
                       help="Container format (default vfa1; vfa2 is the new chunked format, see VFA2.md)")
@@ -1262,7 +1270,10 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):    # a legacy console code page must not crash `vfa l` on a Unicode name
         try: stream.reconfigure(errors="backslashreplace")
         except Exception: pass
-    ap=build_argparser(); args, extra = ap.parse_known_args(argv)
+    ap=build_argparser()
+    if not (sys.argv[1:] if argv is None else argv):    # bare `vfa`: what this is and how to use it, not an error
+        ap.print_help(); return
+    args, extra = ap.parse_known_args(argv)
     # `vfa x a.vfa -o out some/member` - argparse cannot put positionals after options on its own
     if extra and args.cmd == "x" and not any(x.startswith("-") for x in extra): args.members += extra
     elif extra: ap.error("unrecognized arguments: " + " ".join(extra))

@@ -182,6 +182,8 @@ def all_tools():
         vfa_tool("vfa2-lz", "lz", 6, False, ("--format", "vfa2")),                 # VFA2 M4: vulp-lz + dedup (default)
         vfa_tool("vfa2-lz-solid", "lz", 6, True, ("--format", "vfa2")),
         vfa_tool("vfa2-lz9-solid", "lz", 9, True, ("--format", "vfa2")),
+        vfa_tool("vfa2-cm-solid", "cm", 5, True, ("--format", "vfa2")),            # VFA2 M5: vulp-cm where it wins
+        vfa_tool("vfa2-cm9-solid", "cm", 9, True, ("--format", "vfa2")),           # 2^24 tables (~220 MiB each way)
         stream_tool("xz-9e", "xz -9e -T1", XZ, ["-9e", "-T1", "-c"], ["-d", "-c"], ".xz", "xz not found on PATH"),
         stream_tool("zstd-ultra22", "zstd --ultra -22", ZSTD, ["--ultra", "-22", "-c", "-q"], ["-d", "-c", "-q"], ".zst",
                     "zstd CLI not found (install it, e.g. `winget install Facebook.zstd` or `choco install zstandard`)"),

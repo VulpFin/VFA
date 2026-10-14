@@ -635,12 +635,15 @@ def t2_refuse(work):
     with vx.open_container(str(p)) as c: c.unlock(None); off = c.chunks[0][0]
     patch_frame2(p, off, 6, 0x80)
     refused("vfa2 refuse: unknown frame flag", p, "frame flags")
-    for table, cid, needle, label in ((V2.CODERS, 2, "vulp-cm", "coder 2"), (V2.FILTERS, 5, "text", "filter 5")):
+    # ids no reader implements (coder 2 was the example until M5 implemented it); the real entry, if any, is put back
+    for table, cid, needle, label in ((V2.CODERS, 9, "coder id 9", "coder 9"), (V2.FILTERS, 5, "text", "filter 5")):
         # the test coder must shrink its input, or the writer (correctly) stores the chunk with coder 0 instead
         enc = (lambda raw, level=0: (b"", bytes(raw)[:8])) if table is V2.CODERS else (lambda raw, params=b"": (b"", bytes(raw)))
-        table[cid] = V2.Codec(cid, "test-only", enc, None)
+        prev = table.get(cid); table[cid] = V2.Codec(cid, "test-only", enc, None)
         try: p = build2(work / f"r_c{cid}.vfa", f, **({"coder": cid} if table is V2.CODERS else {"filt": cid}))
-        finally: del table[cid]
+        finally:
+            if prev is None: del table[cid]
+            else: table[cid] = prev
         refused(f"vfa2 refuse: unimplemented {label} is named ({needle})", p, needle)
     # what an M1 build (stored only) does with an M3 archive: names the coder/filter it lacks, writes nothing
     p = build2(work / "r_m3.vfa", [("z/a.txt", b"payload " * 100), ("z/b.bin", bytes(range(256)) * 64)], coder=1, filt=(1, b"\x01"))
@@ -982,7 +985,7 @@ def t2_codec(work, corpus):
 
 # ---- native builds
 
-NATIVE_SRC = ["vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulpcli.c"]
+NATIVE_SRC = ["vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulp_cm.c", "vulp/vulpcli.c"]
 FP_TYPES = re.compile(r"\b(float|double|_Float\d+|__fp16|_Complex|fenv_t)\b|#\s*include\s*<(math|fenv|tgmath|complex)\.h>|\b(fabs|sqrt|pow|exp|log|log2|floor|ceil|round)\s*\(")
 # x86 floating-point arithmetic/conversion (SSE/AVX scalar+packed, x87). Plain moves/bitwise (movaps, pxor) are integer-safe.
 FP_INSN = re.compile(r"\b(v?(add|sub|mul|div|sqrt|min|max|rcp|rsqrt|round|cmp|comi|ucomi|h?addsub|hadd|hsub|dp)(ss|sd|ps|pd)|"
@@ -1024,7 +1027,7 @@ def t2_native(work, corpus):
     srcs = [str(HERE / s) for s in NATIVE_SRC]
     # 1. source lint: no floating-point types or math in the codec (C) ...
     hits = []
-    for f in ["vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulp.h", "vulp/vulpcli.c", "vulp/vulpmodule.c"]:
+    for f in ["vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulp_cm.c", "vulp/vulp.h", "vulp/vulpcli.c", "vulp/vulpmodule.c"]:
         for ln, line in enumerate(strip_c_comments((HERE / f).read_text()).splitlines(), 1):
             if FP_TYPES.search(line): hits.append(f"{f}:{ln}: {line.strip()}")
     check("native: no float/double/<math.h> in the C codec sources", not hits, str(hits[:5]))
@@ -1036,7 +1039,8 @@ def t2_native(work, corpus):
     targets = {"vulp_ref.py": None, "vfa2.py": {"classify", "route", "units", "_sample", "_hint", "seg_pack", "seg_unpack",
                                                 "_seg_apply", "_tans_encode", "_tans_decode", "_filter_codec", "_stored_encode",
                                                 "_stored_decode", "_flush", "chunk_data", "filter_label", "parse_filter",
-                                                "_lz_encode", "_lz_decode", "_code_hints", "_segment", "_reference",
+                                                "_lz_encode", "_lz_decode", "_cm_encode", "_cm_decode", "cm_bits",
+                                                "_code_hints", "_segment", "_reference",
                                                 "_append", "add_file"}}
     hits = []
     for fname, funcs in targets.items():
@@ -1103,7 +1107,10 @@ def t2_native(work, corpus):
                 h = zlib.crc32(lz9 if lz9 is not None else b"", h)
                 cuts = C.cdc(d, 2048, 13, 65536)
                 h = zlib.crc32(b"".join(struct.pack("<Q", c) for c in cuts), h)
-                lines.append(f"size={len(d)} tans={tl} lz={len(lz)} cdc={len(cuts)} digest={h:08x}")
+                cm = C.cm_encode(d[:65536], 16)        # vulp-cm on a prefix (vulpcli CM_DIGEST, CM_BITS)
+                cm = cm if cm is not None else b""
+                h = zlib.crc32(cm, h)
+                lines.append(f"size={len(d)} tans={tl} lz={len(lz)} cdc={len(cuts)} cm={len(cm)} digest={h:08x}")
             check("native: the _vulp extension (as bundled into the stubs) matches the standalone builds", "\n".join(lines) + "\n" == ref[1],
                   f"{lines[:2]} vs {ref[1].splitlines()[:2]}")
         except ImportError:
@@ -1112,7 +1119,7 @@ def t2_native(work, corpus):
     objs = []
     for label, mk in comps:
         if "O0" in label or "Od" in label: continue
-        for src in ("vulp/vulp.c", "vulp/vulp_lz.c"):
+        for src in ("vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulp_cm.c"):
             obj = work / ("obj_" + re.sub(r"\W+", "_", label + "_" + src) + ".o")
             argv, env = mk([str(HERE / src)], obj)
             r = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=work)
@@ -1271,6 +1278,122 @@ def t2_lz(work, corpus):
     finally:
         V2.CODERS[3] = saved[0]; V2.RESERVED_CODERS.clear(); V2.RESERVED_CODERS.update(saved[1])
 
+# ================================================================ VFA2 M5: vulp-cm (context mixing)
+
+def t2_cm(work, corpus, quick):
+    import vfa2 as V2, vulp_ref as R
+    try:
+        import _vulp as C
+    except ImportError:
+        check("vfa2 cm: the _vulp C extension is built", False, "not importable"); return
+    rnd = random.Random(5150)
+    cases = codec_cases(corpus)
+    # 1. C == pure-Python reference, bit for bit (the reference is ~3 KB/s, so small inputs and the smallest tables)
+    small = {"empty": b"", "one byte": b"Z", "text": b"the quick brown fox jumps over the lazy dog\n" * 40,
+             "random 1500": rnd.randbytes(1500), "two symbols": bytes(rnd.choice(b"ab") for _ in range(2500)),
+             "lines + columns": b"".join(b"%5d | %-12s | %08x\n" % (i, b"row%d" % (i * 7 % 13), i * i) for i in range(120))}
+    for nm, d in list(cases.items())[:4 if quick else 8]: small[nm[:40]] = d[:3000]
+    mism = []
+    for nm, d in small.items():
+        for bits in ((16,) if quick else (16, 17)):
+            e = C.cm_encode(d, bits); r = R.cm_encode(d, bits)
+            if e != r: mism.append(f"encode {nm} bits {bits}: C {len(e or b'')} B vs reference {len(r or b'')} B")
+            elif e is not None and R.cm_decode(e, len(d), bits) != d: mism.append(f"reference decode {nm}")
+    check(f"vfa2 cm: C encoder == pure-Python reference bit for bit, and the reference decodes it ({len(small)} inputs)",
+          not mism, str(mism[:4]))
+    # 2. C round trips at the real table sizes, on everything the codec tests use
+    bad = []; n = 0; ratio = {}
+    for nm, d in cases.items():
+        d = d[:262144]
+        for bits in ((22,) if quick else (16, 22)):
+            e = C.cm_encode(d, bits)
+            if e is None: continue
+            n += 1
+            if C.cm_decode(e, len(d), bits) != d: bad.append(f"{nm} bits {bits}")
+            if bits == 22: ratio[nm] = (len(e), len(C.lz_encode(d, 9) or d))
+    check(f"vfa2 cm: {n} encodings decode byte-identically (C)", not bad, str(bad[:4]))
+    text = [k for k in ratio if "csv" in k or "text" in k or "json" in k or ".py" in k]
+    beats = [k for k in text if ratio[k][0] < ratio[k][1]]
+    check(f"vfa2 cm: smaller than vulp-lz -9 on the text-like inputs ({len(beats)}/{len(text)}: "
+          + ", ".join(f"{k[:18]} {ratio[k][0]}<{ratio[k][1]}" for k in text[:3]) + ")", text and len(beats) == len(text), str(ratio)[:300])
+    # 3. strict decoding: the payload must be used up exactly; bad sizes refused; corrupt data never crashes, C and
+    #    the reference agree on what they accept and what they return
+    src = cases["random 5000"][:400] + b"context mixing " * 40
+    enc = C.cm_encode(src, 16)
+    strict = []
+    for what, payload, size, bits in (("truncated by 1", enc[:-1], len(src), 16), ("one trailing byte", enc + b"\0", len(src), 16),
+                                      ("empty payload", b"", len(src), 16), ("3 bytes", enc[:3], 0, 16),
+                                      ("table bits 15", enc, len(src), 15), ("table bits 25", enc, len(src), 25)):
+        for impl in (C, R):
+            try: impl.cm_decode(payload, size, bits); strict.append(f"{impl.__name__} accepted {what}")
+            except ValueError: pass
+    check("vfa2 cm: truncated, padded and empty payloads and table bits outside 16..24 are refused (C and reference)", not strict, str(strict))
+    crash = []; disagree = []; stats = {"refused": 0, "identical": 0, "different": 0}
+    for k in range(60 if quick else 200):
+        m, _ = mutate(enc, rnd); size = len(src) if k % 4 else rnd.randrange(len(src) + 2)
+        res = []
+        for impl in ((C, R) if k % 5 == 0 else (C,)):
+            try: out = impl.cm_decode(m, size, 16); res.append(out); stats["identical" if out == src else "different"] += 1
+            except ValueError: res.append("refused"); stats["refused"] += 1
+            except Exception as e: crash.append(f"{impl.__name__}: {e!r}")
+        if len(res) == 2 and res[0] != res[1]: disagree.append(k)
+    check(f"vfa2 cm: corrupted payloads never crash either decoder {stats}", not crash, str(crash[:3]))
+    check("vfa2 cm: C and reference decoders agree on corrupted payloads (accept/refuse and bytes)", not disagree, str(disagree[:5]))
+    # 4. the archive: --method cm keeps vulp-cm only where it beats vulp-lz, stores what neither shrinks, round-trips
+    src_dir = work / "cm_src"; shutil.rmtree(src_dir, ignore_errors=True); (src_dir / "m").mkdir(parents=True)
+    (src_dir / "m/text.txt").write_bytes(b"".join(b"line %d: the archive keeps context mixing where it wins\n" % (i * 37 % 1000)
+                                                  for i in range(4000)))
+    (src_dir / "m/noise.bin").write_bytes(rnd.randbytes(300_000))
+    (src_dir / "m/code.py").write_bytes((HERE / "vfa2.py").read_bytes())
+    arc = work / "cm.vfa"
+    r = vfa("c", arc, "m", "--format", "vfa2", "--method", "cm", "--chunk-exp", "18", cwd=src_dir)
+    if check("vfa2 cm: 'vfa c --method cm' creates an archive", r.returncode == 0, r.stderr[-300:]):
+        with vx.open_container(str(arc)) as c:
+            c.unlock(None); rt = c.routing() or []
+            coders = {ch[3] for ch in c.chunks}
+            check(f"vfa2 cm: text/code chunks use vulp-cm, noise is stored (coders {sorted(coders)})",
+                  V2.CODER_CM in coders and 0 in coders and all("vulp-cm" in x.get("why", "") for x in rt), str(rt)[:400])
+            # every chunk that kept vulp-cm saved at least CM_MIN_GAIN_PCT % over vulp-lz (sizes from the ROUTING record)
+            short = []
+            for x in rt:
+                m = re.search(r"vulp-cm (\d+) B, vulp-lz (\d+|no gain) B: kept vulp-cm", x.get("why", ""))
+                if m and m.group(2) != "no gain" and int(m.group(1)) * 100 > int(m.group(2)) * (100 - V2.CM_MIN_GAIN_PCT):
+                    short.append(x.get("why"))
+            check(f"vfa2 cm: vulp-cm is kept only where it saves >= {V2.CM_MIN_GAIN_PCT}% over vulp-lz", not short, str(short[:2]))
+        check("vfa2 cm: 'vfa t' passes", vfa("t", arc).returncode == 0)
+        ok, why = extract_cmp(arc, src_dir / "m", work)
+        check("vfa2 cm: archive extracts byte-identically", ok, why)
+        arc2 = work / "cm2.vfa"; vfa("c", arc2, "m", "--format", "vfa2", "--method", "cm", "--chunk-exp", "18", cwd=src_dir)
+        check("vfa2 cm: same input -> byte-identical archive", arc.read_bytes() == arc2.read_bytes())
+    # 5. without the C extension a CM archive still opens (pure-Python reference; slow, so a small one)
+    p = build2(work / "cm_ref.vfa", [("z/a.txt", b"pure python fallback " * 120)], coder=V2.CODER_CM, filt=(0, b""), level=1)
+    with vx.open_container(str(p)) as c: c.unlock(None); used = {ch[3] for ch in c.chunks}
+    saved = V2._native; V2._native = R
+    try:
+        out = work / "cm_ref_out"; shutil.rmtree(out, ignore_errors=True); open_extract(p, out)
+        check("vfa2 cm: the pure-Python reference decoder extracts a C-encoded vulp-cm archive",
+              used == {V2.CODER_CM} and (out / "z/a.txt").read_bytes() == b"pure python fallback " * 120, str(used))
+    finally: V2._native = saved
+    # 6. readers refuse what they do not know, by name: an M4 reader (no coder 2), and a future CM model
+    saved = (V2.CODERS.pop(2), dict(V2.RESERVED_CODERS)); V2.RESERVED_CODERS[2] = "vulp-cm (M5)"
+    try:
+        try: open_extract(p, work / "cm_m4_out"); check("vfa2 refuse: a reader without vulp-cm names it", False, "accepted")
+        except vx.VFAError as e: check("vfa2 refuse: a reader without vulp-cm names it (simulated M4 reader)", "coder id 2 (vulp-cm" in str(e), str(e))
+    finally:
+        V2.CODERS[2] = saved[0]; V2.RESERVED_CODERS.clear(); V2.RESERVED_CODERS.update(saved[1])
+    for params, what in ((bytes((2, 16)), "model 2"), (bytes((1, 30)), "table bits 30"), (bytes((1,)), "1 byte")):
+        try: V2._cm_decode(params, b"\0" * 8, 4); check(f"vfa2 cm: params {what} refused", False, "accepted")
+        except vx.VFAError as e: check(f"vfa2 cm: params {what} refused with a reason ({str(e)[:60]})", True)
+    # 7. a stale extension without vulp-cm (API 3) is out of date for 'vfa c --method cm'
+    stale = work / "stale_cm"; stale.mkdir(exist_ok=True)
+    (stale / "_vulp.py").write_text("from vulp_ref import *\nVERSION = 3\n")
+    (stale / "launch.py").write_text("import sys, runpy\nsys.path[:0] = [%r, %r]\nsys.argv = sys.argv[1:]\n"
+                                     "runpy.run_path(sys.argv[0], run_name='__main__')\n" % (str(stale), str(HERE)))
+    r = subprocess.run([PY, str(stale / "launch.py"), str(HERE / "vfa.py"), "c", str(work / "stale_cm.vfa"), "m/text.txt",
+                        "--format", "vfa2", "--method", "cm"], capture_output=True, text=True, cwd=src_dir)
+    check("vfa2: an M4.1-era _vulp extension (API 3) makes 'vfa c --method cm' say it is out of date",
+          r.returncode != 0 and "out of date" in (r.stdout + r.stderr) and "Traceback" not in r.stderr, (r.stdout + r.stderr)[-300:])
+
 def t2_dedup(work, corpus):
     import vfa2 as V2
     if not V2.NATIVE: skip("vfa2 dedup", "needs the _vulp extension"); return
@@ -1424,7 +1547,7 @@ def main():
     ap.add_argument("--fuzz", type=int, default=None); ap.add_argument("--only"); ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
     groups = set(a.only.split(",")) if a.only else {"roundtrip", "sample", "encrypt", "append", "ra", "refuse", "paths",
-                                                     "fuzz", "determinism", "sfx", "signed", "codec", "native", "lz", "dedup"}
+                                                     "fuzz", "determinism", "sfx", "signed", "codec", "native", "lz", "cm", "dedup"}
     if a.big: groups.add("big")
     n = a.fuzz if a.fuzz is not None else (150 if a.quick else 600)
     work = pathlib.Path(tempfile.mkdtemp(prefix="vfa-test-"))
@@ -1442,6 +1565,7 @@ def main():
                  ("determinism", lambda c: t2_determinism(work, c)), ("sfx", lambda c: t2_sfx(work, c)),
                  ("signed", lambda c: t_signed(work, c, "vfa2")), ("codec", lambda c: t2_codec(work, c)),
                  ("native", lambda c: t2_native(work, c)), ("lz", lambda c: t2_lz(work, c)),
+                 ("cm", lambda c: t2_cm(work, c, a.quick)),
                  ("dedup", lambda c: t2_dedup(work, c)), ("fuzz", lambda c: t2_fuzz(work, n, a.quick)),
                  ("big", lambda c: t_big(work, "vfa2"))],
     }

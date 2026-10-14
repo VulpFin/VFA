@@ -33,6 +33,16 @@ vfa x mydata.vfa -o ./restore
 # Create an encrypted archive
 vfa c secret.vfa ./docs --method lzma --level 9 --solid --password
 
+# VFA2 (the new chunked format, VFA2.md): vulp-lz by default, auto filters, dedup across files
+vfa c data.vfa ./data --format vfa2 --solid --level 9
+
+# VFA2 maximum compression: context mixing where it wins (about 20% smaller than xz -9e on text and code),
+# vulp-lz elsewhere. Slow both ways (about 1 MB/s to create and to extract).
+vfa c data.vfa ./data --format vfa2 --solid --method cm
+
+# Which version is this?
+vfa --version
+
 # Build executables for your platform.
 
 # Windows (PowerShell)

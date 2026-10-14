@@ -1,2 +1,2 @@
 include LICENSE README.md VFA1.md VFA2.md
-include vulp/vulp.h vulp/vulp.c vulp/vulp_lz.c vulp/vulpmodule.c
+include vulp/vulp.h vulp/vulp.c vulp/vulp_lz.c vulp/vulp_cm.c vulp/vulpmodule.c

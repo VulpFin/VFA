@@ -305,3 +305,216 @@ def cdc(data, min_size, avg_log, max_size):
             cuts.append(i + 1); start = i + 1; h = 0
     if len(d) > start: cuts.append(len(d))
     return cuts
+
+# ---------------------------------------------------------------- vulp-cm (coder 2, M5): context mixing
+# A line-by-line transcription of vulp/vulp_cm.c (read that file for the description). Python's >> on a negative
+# number is a floor, like asr32/asr64 there; 32-bit products are masked. Very slow (a few KB/s): it exists to check
+# the C code bit for bit and to read small archives without the extension.
+
+CM_NH = 9; CM_NI = CM_NH + 3; CM_MINLEN = 6; CM_MINBITS = 16; CM_MAXBITS = 24; CM_MODEL = 1
+_SQ_T = (1, 2, 3, 6, 10, 16, 27, 45, 73, 120, 194, 310, 488, 747, 1101, 1546, 2047, 2549, 2994, 3348, 3607,
+         3785, 3901, 3975, 4022, 4050, 4068, 4079, 4085, 4089, 4092, 4093, 4094)
+_M32 = 0xFFFFFFFF
+P_INIT = 1 << 31
+
+def _squash(d):
+    if d > 2047: d = 2047
+    if d < -2047: d = -2047
+    x = d + 2048; i = x >> 7; w = x & 127
+    return (_SQ_T[i] * (128 - w) + _SQ_T[i + 1] * w + 64) >> 7
+
+def _cm_tables():
+    st = [0] * 4096; pi = 0
+    for i in range(-2047, 2048):
+        v = _squash(i)
+        for j in range(pi, v + 1): st[j] = i
+        pi = v + 1
+    for j in range(pi, 4096): st[j] = 2047
+    dt = [131072 // (2 * i + 3) for i in range(1024)]
+    return st, dt
+
+_CM_TABLES = None
+
+def _hmix(a, b):
+    h = ((a * 0x9E3779B1) ^ (((b + 0x7F4A7C15) & _M32) * 0x85EBCA6B)) & _M32
+    h ^= h >> 15; h = (h * 0x2C1B3C6D) & _M32; h ^= h >> 13; h = (h * 0x297A2D39) & _M32; h ^= h >> 16
+    return h
+
+def _hist_n(s): return (s & 7) + ((s >> 3) & 7)
+
+def _hist_up(s, bit):
+    n0 = s & 7; n1 = (s >> 3) & 7
+    if bit:
+        if n1 < 7: n1 += 1
+        if n0 > 2: n0 = n0 // 2 + 1
+    else:
+        if n0 < 7: n0 += 1
+        if n1 > 2: n1 = n1 // 2 + 1
+    return n0 | n1 << 3 | bit << 6
+
+def _len_bucket(l): return l if l < 16 else 16 + min((l - 16) >> 3, 47)
+
+def _wclamp(w): return (1 << 23) if w > (1 << 23) else -(1 << 23) if w < -(1 << 23) else w
+
+class _CM:
+    def __init__(self, tbits, buf):
+        global _CM_TABLES
+        if _CM_TABLES is None: _CM_TABLES = _cm_tables()
+        self.st, self.dt = _CM_TABLES
+        self.tbits = tbits; self.buf = buf
+        self.t = [bytearray(1 << tbits) for _ in range(CM_NH)]
+        self.smap = [[P_INIT] * 256 for _ in range(CM_NH)]
+        self.base = [0] * CM_NH; self.h = [0] * CM_NH; self.spi = [0] * CM_NH
+        self.o0 = [P_INIT] * 256; self.msm = [P_INIT] * 128
+        self.mm = [0] * (1 << tbits)
+        self.pos = 0; self.mptr = 0; self.mlen = 0; self.mexp = -1
+        self.w = [[1 << 14] * CM_NI for _ in range(1024)]; self.w2 = [[1 << 14] * CM_NI for _ in range(256 * 8)]
+        self.x = [0] * CM_NI; self.wsel = self.wsel2 = self.pm1 = self.pm2 = self.pmix = 0
+        row = [_squash((j - 16) * 128) * 16 for j in range(33)]
+        self.a1 = row * 256; self.a2 = row * 65536; self.a1i = self.a2i = 0
+        self.c0 = 1; self.bitpos = 0; self.nib = 1
+        self.c4 = self.c8 = self.word = self.word1 = 0; self.line0 = self.line1 = 0
+
+    def slot_up(self, arr, i, bit, limit):
+        v = arr[i]; n = v & 1023; p = v >> 10
+        d = ((1 << 22) - 1 if bit else 0) - p
+        if d >= 0: p += (d * self.dt[n]) >> 16
+        else: p -= ((-d) * self.dt[n]) >> 16
+        if n < limit: n += 1
+        arr[i] = ((p << 10) | n) & _M32
+
+    def set_bases(self):
+        mask = ((1 << self.tbits) - 1) & ~15
+        for i in range(CM_NH):
+            h = _hmix(self.h[i], self.c0); chk = (h >> 24) | 1
+            b0 = h & mask; b1 = b0 ^ 16; t = self.t[i]
+            if t[b0] == chk: self.base[i] = b0; continue
+            if t[b1] == chk: self.base[i] = b1; continue
+            b = b0 if _hist_n(t[b0 + 1]) <= _hist_n(t[b1 + 1]) else b1
+            t[b] = chk; t[b + 1:b + 16] = bytes(15)
+            self.base[i] = b
+
+    def byte_update(self, c):
+        pos = self.pos; buf = self.buf
+        self.c8 = ((self.c8 << 8) | (self.c4 >> 24)) & _M32
+        self.c4 = ((self.c4 << 8) | c) & _M32
+        c4 = self.c4; c8 = self.c8
+        if 97 <= c <= 122 or 65 <= c <= 90: self.word = ((self.word ^ (c | 32)) * 0x01000193) & _M32
+        elif self.word: self.word1 = self.word; self.word = 0
+        if c == 10: self.line1 = self.line0; self.line0 = pos
+        h = self.h
+        h[0] = _hmix(c4 & 0xff, 1); h[1] = _hmix(c4 & 0xffff, 2); h[2] = _hmix(c4 & 0xffffff, 3)
+        h[3] = _hmix(c4, 4); h[4] = _hmix(_hmix(c4, c8 & 0xffff), 5); h[5] = _hmix(self.word, 6)
+        h[6] = _hmix(_hmix(self.word, self.word1), 7); h[7] = _hmix(_hmix(c4, c8 & 0xff), 8)
+        col = pos - self.line0; above = self.line1 + col
+        ab = buf[above] if above < self.line0 else 0
+        h[8] = _hmix(_hmix(ab, col if col < 255 else 255), (c4 & 0xff) | 0x900)
+        if self.mlen:
+            if buf[self.mptr] == c: self.mlen += 1; self.mptr += 1
+            else: self.mlen = 0
+        if pos >= CM_MINLEN:
+            hh = _hmix(c4, c8 & 0xffff) >> (32 - self.tbits)
+            if not self.mlen:
+                p = self.mm[hh]; l = 0
+                if p:
+                    while l < 64 and l < p and buf[p - 1 - l] == buf[pos - 1 - l]: l += 1
+                    if l >= CM_MINLEN: self.mlen = l; self.mptr = p
+            self.mm[hh] = pos
+        if self.mlen > 65535: self.mlen = 65535
+
+    def apm_p(self, t, pr, cx):
+        s = self.st[pr] + 2048; lo = s >> 7; w = s & 127
+        return cx * 33 + lo + (w >> 6), (t[cx * 33 + lo] * (128 - w) + t[cx * 33 + lo + 1] * w) >> 11
+
+    def predict(self):
+        st = self.st; x = self.x; lb = 0
+        for i in range(CM_NH):
+            si = self.base[i] + self.nib; self.spi[i] = si
+            x[i] = st[self.smap[i][self.t[i][si]] >> 20]
+        x[CM_NH] = st[self.o0[self.c0] >> 20]
+        self.mexp = -1; x[CM_NH + 1] = 0
+        if self.mlen:
+            eb = self.buf[self.mptr] | 256
+            if (eb >> (8 - self.bitpos)) == self.c0:
+                self.mexp = (eb >> (7 - self.bitpos)) & 1
+                lb = _len_bucket(self.mlen)
+                x[CM_NH + 1] = st[self.msm[lb * 2 + self.mexp] >> 20]
+        x[CM_NH + 2] = 256
+        self.wsel = self.c0 + 256 * (0 if self.mexp < 0 else 1 if lb < 16 else 2 if lb < 32 else 3)
+        self.wsel2 = (self.c4 & 0xff) * 8 + self.bitpos
+        w = self.w[self.wsel]; w2 = self.w2[self.wsel2]
+        s = sum(x[i] * w[i] for i in range(CM_NI)) >> 16
+        s2 = sum(x[i] * w2[i] for i in range(CM_NI)) >> 16
+        s = max(-2047, min(2047, s)); s2 = max(-2047, min(2047, s2))
+        self.pm1 = _squash(s); self.pm2 = _squash(s2)
+        self.pmix = _squash((s + s2) >> 1)
+        self.a1i, p1 = self.apm_p(self.a1, self.pmix, self.c0)
+        self.a2i, p2 = self.apm_p(self.a2, self.pmix, self.c0 | ((self.c4 & 0xff) << 8))
+        p = (2 * self.pmix + p1 + p2 + 2) >> 2
+        p = (p + p2 + 1) >> 1
+        return 1 if p < 1 else 4095 if p > 4095 else p
+
+    def update(self, bit):
+        for i in range(CM_NH):
+            t = self.t[i]; si = self.spi[i]; s = t[si]
+            self.slot_up(self.smap[i], s, bit, 1023)
+            t[si] = _hist_up(s, bit)
+        self.slot_up(self.o0, self.c0, bit, 1023)
+        if self.mexp >= 0:
+            self.slot_up(self.msm, _len_bucket(self.mlen) * 2 + self.mexp, bit, 1023)
+            if self.mexp != bit: self.mlen = 0
+        err = ((bit << 12) - self.pm1) * 7; err2 = ((bit << 12) - self.pm2) * 7
+        w = self.w[self.wsel]; w2 = self.w2[self.wsel2]; x = self.x
+        for i in range(CM_NI):
+            w[i] = _wclamp(w[i] + ((x[i] * err) >> 14)); w2[i] = _wclamp(w2[i] + ((x[i] * err2) >> 14))
+        g = 65535 if bit else 0
+        self.a1[self.a1i] += (g - self.a1[self.a1i]) >> 7
+        self.a2[self.a2i] += (g - self.a2[self.a2i]) >> 7
+        self.c0 = (self.c0 << 1) | bit; self.nib = (self.nib << 1) | bit; self.bitpos += 1
+        if self.bitpos == 8:
+            c = self.c0 & 255; self.pos += 1
+            self.byte_update(c)
+            self.c0 = 1; self.bitpos = 0; self.nib = 1; self.set_bases()
+        elif self.bitpos == 4:
+            self.nib = 1; self.set_bases()
+
+def _cm_check(tbits, n):
+    if not (CM_MINBITS <= tbits <= CM_MAXBITS) or n > _M32: raise ValueError("bad parameters")
+
+def cm_encode(data, tbits=22):
+    """Same output as the C encoder; None if it would not fit in len(data) + 4096 bytes (like _vulp.cm_encode)."""
+    d = bytes(data); _cm_check(tbits, len(d)); m = _CM(tbits, d); m.set_bases()
+    x1 = 0; x2 = _M32; out = bytearray(); cap = len(d) + 4096
+    for byte in d:
+        for b in range(7, -1, -1):
+            bit = (byte >> b) & 1; p = m.predict()
+            r = (x2 - x1) & _M32; xm = (x1 + (r >> 12) * p + (((r & 0xfff) * p) >> 12)) & _M32
+            if bit: x2 = xm
+            else: x1 = (xm + 1) & _M32
+            m.update(bit)
+            while ((x1 ^ x2) & 0xff000000) == 0:
+                out.append(x2 >> 24); x1 = (x1 << 8) & _M32; x2 = ((x2 << 8) | 255) & _M32
+    for _ in range(4): out.append(x1 >> 24); x1 = (x1 << 8) & _M32
+    return bytes(out) if len(out) <= cap else None
+
+def cm_decode(payload, n: int, tbits: int) -> bytes:
+    p = bytes(payload); _cm_check(tbits, n)
+    if len(p) < 4: raise ValueError("corrupt encoded data")
+    out = bytearray(n); m = _CM(tbits, out); m.set_bases()
+    x1 = 0; x2 = _M32; x = int.from_bytes(p[:4], "big"); ip = 4
+    for i in range(n):
+        c = 0
+        for b in range(7, -1, -1):
+            pr = m.predict()
+            r = (x2 - x1) & _M32; xm = (x1 + (r >> 12) * pr + (((r & 0xfff) * pr) >> 12)) & _M32
+            bit = 1 if x <= xm else 0
+            if bit: x2 = xm
+            else: x1 = (xm + 1) & _M32
+            c = (c << 1) | bit
+            if b == 0: out[i] = c
+            m.update(bit)
+            while ((x1 ^ x2) & 0xff000000) == 0:
+                if ip >= len(p): raise ValueError("corrupt encoded data")
+                x1 = (x1 << 8) & _M32; x2 = ((x2 << 8) | 255) & _M32; x = ((x << 8) | p[ip]) & _M32; ip += 1
+    if ip != len(p): raise ValueError("corrupt encoded data")
+    return bytes(out)
