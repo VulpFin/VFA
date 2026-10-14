@@ -24,6 +24,7 @@ import argparse, hashlib, os, pathlib, platform, re, shutil, subprocess, sys, ta
 
 ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+import build                       # this repo's build.py (TOOLS, arch_tag)
 from vfa_version import __version__ as VERSION
 
 IS_WIN = platform.system() == "Windows"; IS_LINUX = platform.system() == "Linux"
@@ -234,10 +235,12 @@ def git_state():
                            capture_output=True, text=True).stdout.strip()
     return r.stdout.strip() + ("+dirty" if dirty else "")
 
-def read_commit(rep):
-    """The 'Commit: ...' line of a RESULTS report (None for a report written before reports recorded it)."""
-    m = re.search(r"^Commit: (\S+)", rep.read_text(encoding="utf-8"), re.M)
+def read_field(rep, name):
+    """A 'Name: value' line of a RESULTS report (None if absent or 'unknown': reports from before it was recorded)."""
+    m = re.search(rf"^{name}: (\S+)", rep.read_text(encoding="utf-8"), re.M)
     return m.group(1) if m and m.group(1) != "unknown" else None
+
+def read_commit(rep): return read_field(rep, "Commit")
 
 def read_results(rep):
     """RESULTS-<os>.md -> [{"python", "tests", "wheel", "exes"}], one per Python row."""
@@ -250,7 +253,6 @@ def read_results(rep):
 
 def expected_executables(os_name, arch):
     """(portable files, install-folder archives, installers) that build.build_matrix makes for os_name."""
-    import build
     exe = ".exe" if os_name == "windows" else ""
     suffixes = ("",) if os_name == "linux" else ("", "-windowless")     # build_matrix: no windowless on Linux
     portable = [f"{t}{s}{exe}" for t in build.TOOLS for s in suffixes]
@@ -275,12 +277,27 @@ def assemble(out=OUT, commit=None):
     --commit) stands in for reports that predate the Commit line. Returns the problems."""
     up = out / "upload"; gh = up / "github"; pp = up / "pypi"
     shutil.rmtree(up, ignore_errors=True); gh.mkdir(parents=True); pp.mkdir(parents=True)
-    problems, readme, lic = [], ROOT / "README.md", ROOT / "LICENSE"
+    problems = []
     pypi_src = out / "pypi"
 
     oses = ["windows", "linux"] + (["macos"] if (out / "RESULTS-macos.md").exists() else [])
     reports = {o: read_results(out / f"RESULTS-{o}.md") for o in oses if (out / f"RESULTS-{o}.md").exists()}
     all_versions = sorted({r["python"] for rows in reports.values() for r in rows}, key=lambda v: tuple(map(int, v.split("."))))
+    built = {o: read_commit(out / f"RESULTS-{o}.md") or commit for o in reports}
+    for o, c in built.items():
+        if not c: problems.append(f"{o}: RESULTS-{o}.md records no commit (re-run it, or pass --commit <sha> "
+                                  f"if you know which commit it was built from)")
+        elif c.endswith("+dirty"): problems.append(f"{o}: built with uncommitted changes (from {c[:-6][:12]})")
+    commits = {c.removesuffix("+dirty") for c in built.values() if c}
+    if len(commits) > 1:
+        problems.append("built from different commits: " + ", ".join(f"{o} {c[:12]}" for o, c in built.items() if c))
+    git = shutil.which("git")
+    src = next(iter(commits)) if len(commits) == 1 and git else None
+    if not git: problems.append("source: git not found, no source archives or bundled README/LICENSE")
+    def at_commit(path):
+        """A file's bytes at the build commit (README and LICENSE in the bundles match the binaries, not HEAD)."""
+        r = subprocess.run([git, "show", f"{src}:{path}"], cwd=ROOT, capture_output=True)
+        return r.stdout if r.returncode == 0 else None
     wheels = []
     for os_name in oses:
         rows = reports.get(os_name)
@@ -299,9 +316,15 @@ def assemble(out=OUT, commit=None):
             problems.append(f"{os_name}: no executables built in its last run"); continue
 
         d = out / os_name
-        setups = sorted((d / "installers").glob(f"*-{VERSION}-{os_name}-*-setup*"))
-        m = re.search(rf"-{re.escape(VERSION)}-{os_name}-(\w+)-setup", setups[0].name) if setups else None
-        portable, archives, installers = expected_executables(os_name, m.group(1) if m else "x64")
+        arch = read_field(out / f"RESULTS-{os_name}.md", "Arch")
+        if not arch:   # a report from before the Arch line: only an unambiguous set of installers will do
+            found = {mm.group(1) for f in (d / "installers").glob(f"*-{VERSION}-{os_name}-*-setup*")
+                     if (mm := re.search(rf"-{re.escape(VERSION)}-{os_name}-(\w+)-setup", f.name))}
+            if len(found) != 1:
+                problems.append(f"{os_name}: report records no architecture and installers for "
+                                f"{', '.join(sorted(found)) or 'none'} are present"); continue
+            arch = found.pop()
+        portable, archives, installers = expected_executables(os_name, arch)
         missing = [f"portable/{n}" for n in portable if not (d / "portable" / n).is_file()] + \
                   [f"archives/{n}" for n in archives if not (d / "archives" / n).is_file()] + \
                   [f"installers/{n}" for n in installers if not (d / "installers" / n).is_file()]
@@ -310,9 +333,11 @@ def assemble(out=OUT, commit=None):
         stage = ROOT / "build" / "upload" / os_name
         shutil.rmtree(stage, ignore_errors=True); stage.mkdir(parents=True)
         for n in portable: shutil.copy2(d / "portable" / n, stage / n)
-        for f in (readme, lic):
-            if f.exists(): shutil.copy2(f, stage / (f.name + (".txt" if f.name == "LICENSE" else "")))
-        top = f"vfa-{VERSION}-{os_name}-{m.group(1) if m else 'x64'}-portable"
+        for name, dest in (("README.md", "README.md"), ("LICENSE", "LICENSE.txt")):
+            data = at_commit(name) if src else None
+            if data is None: problems.append(f"{os_name}: {name} not bundled (no single build commit to take it from)")
+            else: (stage / dest).write_bytes(data)
+        top = f"vfa-{VERSION}-{os_name}-{arch}-portable"
         if os_name == "windows": _zip_dir(stage, gh / f"{top}.zip", top)
         else: _tar_dir(stage, gh / f"{top}.tar.gz", top)
         for n in archives: shutil.copy2(d / "archives" / n, gh / n)
@@ -323,24 +348,13 @@ def assemble(out=OUT, commit=None):
     else: problems.append(f"pypi: no sdist (vfvfa-{VERSION}.tar.gz)")
     for f in wheels: shutil.copy2(f, pp / f.name)
 
-    built = {o: read_commit(out / f"RESULTS-{o}.md") or commit for o in reports}
-    for o, c in built.items():
-        if not c: problems.append(f"{o}: RESULTS-{o}.md records no commit (re-run it, or pass --commit <sha> "
-                                  f"if you know which commit it was built from)")
-        elif c.endswith("+dirty"): problems.append(f"{o}: built with uncommitted changes (from {c[:-6][:12]})")
-    commits = {c.removesuffix("+dirty") for c in built.values() if c}
-    if len(commits) > 1:
-        problems.append("built from different commits: " + ", ".join(f"{o} {c[:12]}" for o, c in built.items() if c))
     git = shutil.which("git")
-    if len(commits) == 1 and git:
-        src = commits.pop()
+    if src:
         for fmt, ext in (("zip", "zip"), ("tar.gz", "tar.gz")):
             r = subprocess.run([git, "archive", f"--format={fmt}", f"--prefix=vfa-{VERSION}/",
                                 "-o", str(gh / f"vfa-{VERSION}-source.{ext}"), src], cwd=ROOT,
                                capture_output=True, text=True)
             if r.returncode: problems.append(f"source {ext}: git archive {src[:12]} failed: {r.stderr.strip()[:200]}")
-    elif not git:
-        problems.append("source: git not found, no source archives")
 
     assets = sorted(f for f in gh.iterdir() if f.is_file())
     with zipfile.ZipFile(gh / f"vfa-{VERSION}-all.zip", "w", zipfile.ZIP_STORED) as z:   # already compressed
@@ -408,6 +422,7 @@ def main(argv=None):
                               f"py{ver}: sdist", f"{OS_TAG}-sdist.log", cwd=pypi)
                 def step(line, st):   # build.py's own "[build] ..." lines say what it is doing
                     if line.startswith("[build]"): st.update(note=line[len("[build]"):].strip())
+                shutil.rmtree(OUT / OS_TAG, ignore_errors=True)   # nothing left over from an earlier build
                 run_quiet([py, ROOT / "build.py", "--matrix", "--out", OUT / OS_TAG],
                           f"py{ver}: executables, installers, archives", f"{OS_TAG}-exes.log", cwd=ROOT, on_line=step)
                 row["exes"] = f"release/{VERSION}/{OS_TAG}"
@@ -420,7 +435,7 @@ def main(argv=None):
     report = OUT / f"RESULTS-{OS_TAG}.md"
     lines = [f"# VFA {VERSION} release, {OS_TAG} ({platform.platform()}), {time.strftime('%Y-%m-%d %H:%M')}", "",
              f"Tests: test_vfa.py ({a.tests}). Executables built with Python {a.exe_python}.", "",
-             f"Commit: {commit or 'unknown'}", "",
+             f"Commit: {commit or 'unknown'}", f"Arch: {build.arch_tag()}", "",
              "| Python | tests | wheel | executables |", "|---|---|---|---|"]
     lines += [f"| {r['python']} | {r['tests']} | {r['wheel']} | {r['exes']} |" for r in rows]
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")

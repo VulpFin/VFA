@@ -76,8 +76,9 @@ archives, the installers, the source as zip and tar.gz, and `vfa-<version>-all.z
 files), `pypi/` the wheels and sdist for `twine upload release/<version>/upload/pypi/*`, and `SHA256SUMS.txt`
 covers both. Only what the `RESULTS-<os>.md` reports say was built goes in; it ends with a list of anything missing (an OS's
 report, a Python version one OS skipped, an untested or failed row, a wheel, any of the expected executables,
-a build from uncommitted changes, reports from different commits). Each report records the commit it was
-built from, and the source archives are made from that commit, not from whatever is checked out later.
+a build from uncommitted changes, reports from different commits). Each report records the commit and architecture it was
+built from; the source archives and the README/LICENSE in the bundles come from that commit, not from whatever is
+checked out later.
 Publish only when it says complete.
 
 Each step shows one live status line (elapsed time, test counts, a progress bar once an earlier run's count is known);
