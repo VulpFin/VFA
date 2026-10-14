@@ -224,38 +224,87 @@ def _tar_dir(src, tpath, top):
     with tarfile.open(tpath, "w:gz", compresslevel=9) as t:
         t.add(src, arcname=top, filter=fix)
 
+def read_results(rep):
+    """RESULTS-<os>.md -> [{"python", "tests", "wheel", "exes"}], one per Python row."""
+    rows = []
+    for line in rep.read_text(encoding="utf-8").splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) == 4 and re.fullmatch(r"\d+\.\d+", cells[0]):
+            rows.append(dict(zip(("python", "tests", "wheel", "exes"), cells)))
+    return rows
+
+def expected_executables(os_name, arch):
+    """(portable files, install-folder archives, installers) that build.build_matrix makes for os_name."""
+    import build
+    exe = ".exe" if os_name == "windows" else ""
+    suffixes = ("",) if os_name == "linux" else ("", "-windowless")     # build_matrix: no windowless on Linux
+    portable = [f"{t}{s}{exe}" for t in build.TOOLS for s in suffixes]
+    inst = [f"{t}{s}" for t, spec in build.TOOLS.items() if spec["install"] for s in suffixes]
+    tag = f"{VERSION}-{os_name}-{arch}"
+    archives = [f"{n}-{tag}.{'zip' if os_name == 'windows' else 'tar.gz'}" for n in inst]
+    installers = [f"{n}-{tag}-setup{exe}" for n in inst]
+    return portable, archives, installers
+
 def assemble(out=OUT):
-    """release/<ver>/upload/: what goes where, from whatever the runs produced.
+    """release/<ver>/upload/: what goes where, taken only from what the RESULTS reports say the runs built.
 
         github/   one asset per download: each OS's portable archive (all its executables + LICENSE + README),
                   install-folder archives and installers, the source (zip, tar.gz), and vfa-<ver>-all.zip with
                   all of those plus the PyPI files
-        pypi/     the wheels and the sdist (twine upload release/<ver>/upload/pypi/*)
+        pypi/     the wheels named in the reports, and the sdist (twine upload release/<ver>/upload/pypi/*)
         SHA256SUMS.txt  for every file in github/ and pypi/
 
-    Returns a list of problems (missing OS, missing wheels, failed tests); empty means complete."""
+    Complete means: a report for Windows and Linux (and macOS if it has one), the same Python versions in each,
+    every row tested and PASS with its wheel present, and each OS's full executable set. Returns the problems."""
     up = out / "upload"; gh = up / "github"; pp = up / "pypi"
     shutil.rmtree(up, ignore_errors=True); gh.mkdir(parents=True); pp.mkdir(parents=True)
     problems, readme, lic = [], ROOT / "README.md", ROOT / "LICENSE"
+    pypi_src = out / "pypi"
 
-    for os_name in ("windows", "linux", "macos"):
+    oses = ["windows", "linux"] + (["macos"] if (out / "RESULTS-macos.md").exists() else [])
+    reports = {o: read_results(out / f"RESULTS-{o}.md") for o in oses if (out / f"RESULTS-{o}.md").exists()}
+    all_versions = sorted({r["python"] for rows in reports.values() for r in rows}, key=lambda v: tuple(map(int, v.split("."))))
+    wheels = []
+    for os_name in oses:
+        rows = reports.get(os_name)
+        if rows is None: problems.append(f"{os_name}: no RESULTS-{os_name}.md (run release.py there)"); continue
+        have = {r["python"] for r in rows}
+        for v in all_versions:
+            if v not in have: problems.append(f"{os_name}: no result for Python {v} (the last {os_name} run skipped it)")
+        for r in rows:
+            where = f"{os_name} Python {r['python']}"
+            if r["tests"] == "-": problems.append(f"{where}: not tested")
+            elif not r["tests"].startswith("PASS"): problems.append(f"{where}: {r['tests'][:120]}")
+            if r["wheel"] == "-": problems.append(f"{where}: no wheel")
+            elif not (pypi_src / r["wheel"]).is_file(): problems.append(f"{where}: wheel {r['wheel']} missing from pypi/")
+            else: wheels.append(pypi_src / r["wheel"])
+        if not any(r["exes"] != "-" for r in rows):
+            problems.append(f"{os_name}: no executables built in its last run"); continue
+
         d = out / os_name
-        if not (d / "portable").is_dir() or not any((d / "portable").iterdir()):
-            if os_name != "macos": problems.append(f"{os_name}: no executables (release/{VERSION}/{os_name}/portable)")
-            continue
-        names = [f.name for f in (d / "installers").glob("*")] + [f.name for f in (d / "archives").glob("*")]
-        m = next((re.search(rf"-{re.escape(VERSION)}-{os_name}-(\w+)", n) for n in names if f"-{os_name}-" in n), None)
-        arch = m.group(1) if m else "x64"
+        setups = sorted((d / "installers").glob(f"*-{VERSION}-{os_name}-*-setup*"))
+        m = re.search(rf"-{re.escape(VERSION)}-{os_name}-(\w+)-setup", setups[0].name) if setups else None
+        portable, archives, installers = expected_executables(os_name, m.group(1) if m else "x64")
+        missing = [f"portable/{n}" for n in portable if not (d / "portable" / n).is_file()] + \
+                  [f"archives/{n}" for n in archives if not (d / "archives" / n).is_file()] + \
+                  [f"installers/{n}" for n in installers if not (d / "installers" / n).is_file()]
+        if missing:
+            problems.append(f"{os_name}: missing {', '.join(missing)}"); continue
         stage = ROOT / "build" / "upload" / os_name
-        shutil.rmtree(stage, ignore_errors=True); shutil.copytree(d / "portable", stage)
+        shutil.rmtree(stage, ignore_errors=True); stage.mkdir(parents=True)
+        for n in portable: shutil.copy2(d / "portable" / n, stage / n)
         for f in (readme, lic):
             if f.exists(): shutil.copy2(f, stage / (f.name + (".txt" if f.name == "LICENSE" else "")))
-        top = f"vfa-{VERSION}-{os_name}-{arch}-portable"
+        top = f"vfa-{VERSION}-{os_name}-{m.group(1) if m else 'x64'}-portable"
         if os_name == "windows": _zip_dir(stage, gh / f"{top}.zip", top)
         else: _tar_dir(stage, gh / f"{top}.tar.gz", top)
-        for sub in ("archives", "installers"):
-            for f in sorted((d / sub).glob("*")):
-                if f.is_file(): shutil.copy2(f, gh / f.name)
+        for n in archives: shutil.copy2(d / "archives" / n, gh / n)
+        for n in installers: shutil.copy2(d / "installers" / n, gh / n)
+
+    sdist = pypi_src / f"vfvfa-{VERSION}.tar.gz"
+    if sdist.is_file(): wheels.append(sdist)
+    else: problems.append(f"pypi: no sdist (vfvfa-{VERSION}.tar.gz)")
+    for f in wheels: shutil.copy2(f, pp / f.name)
 
     git = shutil.which("git")
     if git:
@@ -270,22 +319,6 @@ def assemble(out=OUT):
             if r.returncode: problems.append(f"source {ext}: git archive failed: {r.stderr.strip()[:200]}")
     else:
         problems.append("source: git not found, no source archives")
-
-    pypi_src = out / "pypi"
-    files = sorted(pypi_src.glob(f"vfvfa-{VERSION}*")) if pypi_src.is_dir() else []
-    for f in files: shutil.copy2(f, pp / f.name)
-    have = {f.name for f in files}
-    for py in ("310", "312", "313", "314"):
-        for plat, pat in (("windows", "win_amd64"), ("linux", "manylinux")):
-            if not any(f"-cp{py}-cp{py}-" in n and pat in n for n in have):
-                problems.append(f"pypi: no {plat} wheel for Python {py[0]}.{py[1:]}")
-    if not any(n.endswith(".tar.gz") for n in have): problems.append("pypi: no sdist")
-
-    for rep in sorted(out.glob("RESULTS-*.md")):
-        for line in rep.read_text(encoding="utf-8").splitlines():
-            cells = [c.strip() for c in line.strip("|").split("|")]
-            if len(cells) == 4 and re.fullmatch(r"\d+\.\d+", cells[0]) and not cells[1].startswith(("PASS", "-")):
-                problems.append(f"{rep.stem[8:]} Python {cells[0]}: {cells[1][:120]}")
 
     assets = sorted(f for f in gh.iterdir() if f.is_file())
     with zipfile.ZipFile(gh / f"vfa-{VERSION}-all.zip", "w", zipfile.ZIP_STORED) as z:   # already compressed
@@ -307,7 +340,7 @@ def assemble(out=OUT):
         log("NOT COMPLETE - do not publish yet:")
         for pr in problems: print("    - " + pr)
     else:
-        log("complete: every OS, every wheel, all tests passed")
+        log(f"complete: {', '.join(oses)}; Python {', '.join(all_versions)}; every row tested and PASS")
     return problems
 
 def main(argv=None):
