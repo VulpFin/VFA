@@ -354,7 +354,8 @@ test harness requires the two to agree bit for bit. In outline:
 - **Coder:** `--method lz` (default), `--method cm`, `--method tans` or `--method stored`. A chunk that the coder does
   not make smaller is stored, and the ROUTING record says so.
 - **`--method cm`** is the maximum-compression tier. Each chunk is filtered as for vulp-lz, then coded with both
-  vulp-cm and vulp-lz, and the smaller one is kept (ties go to vulp-lz, which decodes about 100× faster). So text,
+  vulp-cm and vulp-lz. vulp-cm is kept only if it writes at least 1% less (payload and parameters) than vulp-lz, or
+  than the raw chunk when vulp-lz cannot shrink it; otherwise vulp-lz (about 100× faster to decode) is kept. So text,
   code and other modelled data get vulp-cm, while already-compressed data stays on vulp-lz or stored. The ROUTING
   record gives both sizes. `--level` picks the table size: 0–3 → 20 bits, 4–6 → 22 (the default), 7–9 → 24.
 - **Filter:** `--filter auto` (default) or a forced filter (`none`, `delta:N`, `shuffle:K`, `bitshuffle:K`,

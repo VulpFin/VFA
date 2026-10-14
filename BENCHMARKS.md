@@ -941,8 +941,10 @@ Python 3.13 stdlib .py files concatenated (the same inputs as the M4.1 table abo
   bigger tables add only 0.1–0.6%, for 2.6× the memory.
 - **sample\ (mostly compressed installers):** 0.3970, the smallest of all tools (xz -9e 0.3975), because the writer
   keeps vulp-cm only for chunks where it beats vulp-lz. Here that gain is 0.3%, and it costs the whole archive's
-  decode speed: 0.9 MB/s instead of 102 MB/s. A minimum-gain rule (keep CM only if it saves, say, 1%) would avoid
-  that trade on data like this. That is a policy choice, not a format change.
+  decode speed: 0.9 MB/s instead of 102 MB/s. **Since then `--method cm` keeps vulp-cm only where it writes at least
+  1% less than vulp-lz.** Measured after that change: \`vfa c sample --format vfa2 --solid --method cm --level 9\` keeps
+  vulp-lz for every chunk: 16,494,972 bytes (vulp-lz -9: 16,494,918), extracted in 0.38 s instead of about 45 s.
+  Text keeps vulp-cm (the harness checks that every kept vulp-cm chunk saves at least 1%).
 - **Cost:** about 0.5–1 MB/s to compress *and* to decompress (CM decodes by running the same model), and 80–90 MiB
   peak RSS at the default level (210–290 MiB at level 9). It is opt-in: `vfa c --format vfa2` still defaults to vulp-lz.
 - **Determinism:** vulp-cm is in the cross-compiler digest. gcc and clang at -O0, -O3 and -O3 -march=native

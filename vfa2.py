@@ -135,6 +135,8 @@ def _lz_decode(params, data, raw_size):
 
 CM_MODEL = 1                                 # vulp-cm params: u8 model (1), u8 table bits (16..24)
 CM_MINBITS, CM_MAXBITS = 16, 24
+CM_MIN_GAIN_PCT = 1                          # --method cm keeps vulp-cm only if it writes >= 1% less than vulp-lz:
+                                             # below that, ~100x slower extraction is not worth it
 
 def cm_bits(level) -> int:
     """--level -> vulp-cm table bits. Encoder and decoder each need about 13 * 2^bits bytes: 20 -> 14 MiB,
@@ -487,9 +489,11 @@ class Writer2:
                 lp, lpay = _lz_encode(fdata, self.level)
                 cm_size = len(payload) if payload is not None else None
                 # compare what each choice writes: payload + params (vulp-cm's 2 coder bytes, and the 2-byte
-                # filter-params length that any params need); ties go to vulp-lz
+                # filter-params length that any params need). vulp-cm must write at least CM_MIN_GAIN_PCT % less than
+                # vulp-lz (or than the raw chunk, when vulp-lz cannot shrink it); otherwise vulp-lz is kept
                 def written(cp, pay): return len(pay) + (2 + len(fparams) + len(cp) if (fparams or cp) else 0)
-                if lpay is not None and (payload is None or written(lp, lpay) <= written(cparams, payload)):
+                lz_w = written(lp, lpay) if lpay is not None else len(raw)
+                if payload is None or written(cparams, payload) * 100 > lz_w * (100 - CM_MIN_GAIN_PCT):
                     coder, cparams, payload = CODER_LZ, lp, lpay
                 if payload is not None and written(cparams, payload) >= len(raw):
                     payload = None                  # whichever won, its params would eat the gain: store the chunk

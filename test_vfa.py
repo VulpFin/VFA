@@ -1353,6 +1353,13 @@ def t2_cm(work, corpus, quick):
             coders = {ch[3] for ch in c.chunks}
             check(f"vfa2 cm: text/code chunks use vulp-cm, noise is stored (coders {sorted(coders)})",
                   V2.CODER_CM in coders and 0 in coders and all("vulp-cm" in x.get("why", "") for x in rt), str(rt)[:400])
+            # every chunk that kept vulp-cm saved at least CM_MIN_GAIN_PCT % over vulp-lz (sizes from the ROUTING record)
+            short = []
+            for x in rt:
+                m = re.search(r"vulp-cm (\d+) B, vulp-lz (\d+|no gain) B: kept vulp-cm", x.get("why", ""))
+                if m and m.group(2) != "no gain" and int(m.group(1)) * 100 > int(m.group(2)) * (100 - V2.CM_MIN_GAIN_PCT):
+                    short.append(x.get("why"))
+            check(f"vfa2 cm: vulp-cm is kept only where it saves >= {V2.CM_MIN_GAIN_PCT}% over vulp-lz", not short, str(short[:2]))
         check("vfa2 cm: 'vfa t' passes", vfa("t", arc).returncode == 0)
         ok, why = extract_cmp(arc, src_dir / "m", work)
         check("vfa2 cm: archive extracts byte-identically", ok, why)
