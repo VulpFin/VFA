@@ -224,6 +224,21 @@ def _tar_dir(src, tpath, top):
     with tarfile.open(tpath, "w:gz", compresslevel=9) as t:
         t.add(src, arcname=top, filter=fix)
 
+def git_state():
+    """'<commit>' for a clean checkout, '<commit>+dirty' with uncommitted changes to tracked files, None without git."""
+    git = shutil.which("git")
+    if not git: return None
+    r = subprocess.run([git, "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True)
+    if r.returncode: return None
+    dirty = subprocess.run([git, "status", "--porcelain", "--untracked-files=no"], cwd=ROOT,
+                           capture_output=True, text=True).stdout.strip()
+    return r.stdout.strip() + ("+dirty" if dirty else "")
+
+def read_commit(rep):
+    """The 'Commit: ...' line of a RESULTS report (None for a report written before reports recorded it)."""
+    m = re.search(r"^Commit: (\S+)", rep.read_text(encoding="utf-8"), re.M)
+    return m.group(1) if m and m.group(1) != "unknown" else None
+
 def read_results(rep):
     """RESULTS-<os>.md -> [{"python", "tests", "wheel", "exes"}], one per Python row."""
     rows = []
@@ -245,7 +260,7 @@ def expected_executables(os_name, arch):
     installers = [f"{n}-{tag}-setup{exe}" for n in inst]
     return portable, archives, installers
 
-def assemble(out=OUT):
+def assemble(out=OUT, commit=None):
     """release/<ver>/upload/: what goes where, taken only from what the RESULTS reports say the runs built.
 
         github/   one asset per download: each OS's portable archive (all its executables + LICENSE + README),
@@ -255,7 +270,9 @@ def assemble(out=OUT):
         SHA256SUMS.txt  for every file in github/ and pypi/
 
     Complete means: a report for Windows and Linux (and macOS if it has one), the same Python versions in each,
-    every row tested and PASS with its wheel present, and each OS's full executable set. Returns the problems."""
+    every row tested and PASS with its wheel present, each OS's full executable set, and one clean commit that
+    every report was built from; the source archives are made from that commit, not from HEAD. `commit` (from
+    --commit) stands in for reports that predate the Commit line. Returns the problems."""
     up = out / "upload"; gh = up / "github"; pp = up / "pypi"
     shutil.rmtree(up, ignore_errors=True); gh.mkdir(parents=True); pp.mkdir(parents=True)
     problems, readme, lic = [], ROOT / "README.md", ROOT / "LICENSE"
@@ -306,18 +323,23 @@ def assemble(out=OUT):
     else: problems.append(f"pypi: no sdist (vfvfa-{VERSION}.tar.gz)")
     for f in wheels: shutil.copy2(f, pp / f.name)
 
+    built = {o: read_commit(out / f"RESULTS-{o}.md") or commit for o in reports}
+    for o, c in built.items():
+        if not c: problems.append(f"{o}: RESULTS-{o}.md records no commit (re-run it, or pass --commit <sha> "
+                                  f"if you know which commit it was built from)")
+        elif c.endswith("+dirty"): problems.append(f"{o}: built with uncommitted changes (from {c[:-6][:12]})")
+    commits = {c.removesuffix("+dirty") for c in built.values() if c}
+    if len(commits) > 1:
+        problems.append("built from different commits: " + ", ".join(f"{o} {c[:12]}" for o, c in built.items() if c))
     git = shutil.which("git")
-    if git:
-        dirty = subprocess.run([git, "status", "--porcelain", "--untracked-files=no"], cwd=ROOT,
-                               capture_output=True, text=True).stdout.strip()
-        if dirty: problems.append("source: the checkout has uncommitted changes; the source archives are HEAD, "
-                                  "the binaries were built from the working tree")
+    if len(commits) == 1 and git:
+        src = commits.pop()
         for fmt, ext in (("zip", "zip"), ("tar.gz", "tar.gz")):
             r = subprocess.run([git, "archive", f"--format={fmt}", f"--prefix=vfa-{VERSION}/",
-                                "-o", str(gh / f"vfa-{VERSION}-source.{ext}"), "HEAD"], cwd=ROOT,
+                                "-o", str(gh / f"vfa-{VERSION}-source.{ext}"), src], cwd=ROOT,
                                capture_output=True, text=True)
-            if r.returncode: problems.append(f"source {ext}: git archive failed: {r.stderr.strip()[:200]}")
-    else:
+            if r.returncode: problems.append(f"source {ext}: git archive {src[:12]} failed: {r.stderr.strip()[:200]}")
+    elif not git:
         problems.append("source: git not found, no source archives")
 
     assets = sorted(f for f in gh.iterdir() if f.is_file())
@@ -356,8 +378,14 @@ def main(argv=None):
     ap.add_argument("--no-assemble", action="store_true", help="Skip collecting release/<version>/upload/ at the end")
     ap.add_argument("--assemble-only", action="store_true",
                     help="Only (re)collect release/<version>/upload/ from what earlier runs built")
+    ap.add_argument("--commit", help="With --assemble-only: the commit that reports without a Commit line were "
+                                     "built from (they predate it)")
+    ap.add_argument("--build-commit", help=argparse.SUPPRESS)   # set by the Windows side for the WSL run
     a = ap.parse_args(argv)
-    if a.assemble_only: return 1 if assemble() else 0
+    if a.assemble_only: return 1 if assemble(commit=a.commit) else 0
+    # the commit the binaries come from, taken before building; WSL gets it from Windows (its own git would see the
+    # Windows checkout as foreign or, through line endings and file modes, as modified)
+    commit = a.build_commit or git_state()
     global VERBOSE; VERBOSE = a.verbose
 
     pythons = [v.strip() for v in a.pythons.split(",") if v.strip()]
@@ -392,6 +420,7 @@ def main(argv=None):
     report = OUT / f"RESULTS-{OS_TAG}.md"
     lines = [f"# VFA {VERSION} release, {OS_TAG} ({platform.platform()}), {time.strftime('%Y-%m-%d %H:%M')}", "",
              f"Tests: test_vfa.py ({a.tests}). Executables built with Python {a.exe_python}.", "",
+             f"Commit: {commit or 'unknown'}", "",
              "| Python | tests | wheel | executables |", "|---|---|---|---|"]
     lines += [f"| {r['python']} | {r['tests']} | {r['wheel']} | {r['exes']} |" for r in rows]
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -406,6 +435,7 @@ def main(argv=None):
                 "          sudo mkdir -p /mnt/u && sudo mount -t drvfs U: /mnt/u")
             return 1
         rest = [x for x in (argv if argv is not None else sys.argv[1:]) if x != "--wsl"]
+        if commit: rest += ["--build-commit", commit]
         quoted = " ".join("'" + x.replace("'", "'\\''") + "'" for x in rest)
         r = run(["wsl", "-e", "bash", "-lc", f"cd '{wp}' && python3 release.py {quoted} --no-assemble"], check=False)
         ok_all &= r.returncode == 0
