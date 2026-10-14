@@ -38,13 +38,29 @@ PYI_MAGIC = b"MEI\x0c\x0b\x0a\x0b\x0e"
 PYI_COOKIE_LEN = 88
 
 def pyi_trailer(stub: bytes, at: int) -> bytes:
-    """The stub's PyInstaller cookie, re-based to sit at file offset `at`; b"" for a stub that is not PyInstaller."""
+    """The stub's PyInstaller cookie, re-based to sit at file offset `at`; b"" for a stub that is not PyInstaller.
+    Raises ValueError when the re-based length does not fit the cookie's 32-bit field (the stub's launcher could not
+    reach its data past a payload that large anyway)."""
     i = stub.rfind(PYI_MAGIC)
     if i < 0 or i + PYI_COOKIE_LEN > len(stub): return b""
     cookie = bytearray(stub[i:i + PYI_COOKIE_LEN])
     (length,) = struct.unpack(">I", cookie[8:12])
+    if length + (at - i) > 0xFFFFFFFF:
+        raise ValueError(f"payload too large ({at - i:,} bytes after the stub's data) for a PyInstaller stub whose "
+                         f"payload contains another PyInstaller program; split the payload below 4 GiB")
     cookie[8:12] = struct.pack(">I", length + (at - i))
     return bytes(cookie)
+
+def contains_pyi_magic(path: str) -> bool:
+    """Does the file contain PyInstaller's cookie magic? Only then is a trailer needed (streamed, so a multi-GiB
+    archive is not read into memory)."""
+    tail = b""
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(1 << 20)
+            if not block: return False
+            if PYI_MAGIC in tail + block: return True
+            tail = block[-(len(PYI_MAGIC) - 1):]
 ARCHIVE_MAGICS = {b"VFA1": b"/VFA1", b"VFA2": b"/VFA2"}   # head -> tail
 
 def main(argv=None):
@@ -94,11 +110,17 @@ def main(argv=None):
         ap.error(f"{a.archive} is not a VFA archive (bad magic).")
     blob = json.dumps(m, ensure_ascii=False).encode("utf-8")
     with open(a.stub, "rb") as f: stub = f.read()
+    trailer = b""
+    if contains_pyi_magic(a.archive):     # only then would the stub's launcher find the wrong cookie
+        at = len(stub) + (0 if a.sfx else len(blob) + 4 + len(MANIFEST_MAGIC)) + os.path.getsize(a.archive)
+        try: trailer = pyi_trailer(stub, at)
+        except ValueError as e: ap.error(str(e))          # before anything is written
     with open(a.output, "wb") as out:
         out.write(stub)
         if not a.sfx: out.write(blob); out.write(struct.pack("<I", len(blob))); out.write(MANIFEST_MAGIC)
         with open(a.archive, "rb") as f: shutil.copyfileobj(f, out, 1 << 20)
-        out.write(pyi_trailer(stub, out.tell()))
+        if trailer and out.tell() != at: raise RuntimeError(f"archive changed while packing ({out.tell()} != {at})")
+        out.write(trailer)
     if os.name != "nt": os.chmod(a.output, 0o755)
     print(f"[pack_sfi] {a.output}  ({os.path.getsize(a.output):,} bytes)" + (f"  name={m['name']!r}" if not a.sfx else "  (sfx)"))
     return 0

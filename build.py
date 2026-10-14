@@ -254,6 +254,7 @@ def pyi_build(tool, onedir, console, icon_path, debug=False):
     base = ROOT / "build" / "pyi" / os_tag()
     args = PYI + base_pyinstaller_args(debug=debug)
     if onedir: args[args.index("--onefile")] = "--onedir"
+    if "--noconfirm" not in args: args.append("--noconfirm")   # --debug omits it; onefile and onedir share dist names
     args += ["--paths", str(ROOT), *spec["extra"], "-n", name,
              "--distpath", str(base / "dist"), "--workpath", str(base / "work"), "--specpath", str(base / "spec")]
     if not console: args += ["--noconsole"]
@@ -279,6 +280,8 @@ def make_installer(folder, tool, sfi_stub, out_file, version):
            "--description", "VulpFin Archive tools" if tool == "vfa" else "VulpFin Archive viewer"]
     if tool == "vfa":
         cmd += ["--path-add", "."] if is_windows() else ["--bin-link", f"vfa:{folder.name}{exe}"]
+    elif is_macos():      # the SFI stub creates no Start-menu entries on macOS: give the viewer a command instead
+        cmd += ["--bin-link", f"vfa-viewer:{folder.name}"]
     else:
         cmd += ["--shortcut", f"startmenu:{folder.name}{exe}:{title}"]
     run(cmd)

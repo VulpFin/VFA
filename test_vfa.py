@@ -753,6 +753,16 @@ def t2_sfx(work, corpus):
         check(f"{mode.upper()} with a PyInstaller program in the payload: the stub's cookie comes last and points at its "
               f"own data, and the archive still extracts", ok_trailer and r2.returncode == 0
               and (ex / "app/inner.exe").read_bytes() == (src / "inner.exe").read_bytes(), f"{r.stderr[-200:]} {r2.stderr[-300:]}")
+    # no PyInstaller program in the payload -> no trailer: stub + archive, byte for byte (as copy /b gives)
+    plain = work / "v2pyi_plain.exe"
+    r = subprocess.run([PY, str(HERE / "pack_sfi.py"), "--sfx", "--stub", str(pstub), "--archive", str(arc), "-o", str(plain)],
+                       capture_output=True, text=True)
+    check("SFX without a PyInstaller program in the payload: no trailer (stub + archive, as copy /b)",
+          r.returncode == 0 and plain.read_bytes() == pstub.read_bytes() + arc.read_bytes(), r.stderr[-200:])
+    # a trailer whose 32-bit length cannot reach the stub's data is refused, not written truncated
+    try: PS.pyi_trailer(pstub.read_bytes(), 5 << 30); refused = False
+    except ValueError: refused = True
+    check("pack_sfi refuses a PyInstaller trailer past 4 GiB (its length field is 32-bit)", refused)
     b = bytearray(exe.read_bytes()); b[len(b) // 2] ^= 0x10; exe.write_bytes(bytes(b))
     out2 = work / "v2sfx_out2"; shutil.rmtree(out2, ignore_errors=True)
     r = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(exe), "-o", str(out2)], capture_output=True, text=True)
