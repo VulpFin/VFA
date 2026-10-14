@@ -12,3 +12,23 @@ def version_text(tool: str) -> str:
         return f"{tool} {__version__} (VFA2 spec {vfa2.SPEC_VERSION}, {native})"
     except Exception:
         return f"{tool} {__version__}"
+
+def show(text: str, title: str = "VFA") -> None:
+    """Print text; a windowless build (PyInstaller --noconsole: no stdout or stderr) shows it in a message box."""
+    import sys
+    out = sys.stdout or sys.stderr
+    if out is not None:
+        out.write(text if text.endswith("\n") else text + "\n"); out.flush(); return
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text.rstrip("\n"), title, 0x40)   # MB_ICONINFORMATION
+        except Exception:
+            pass
+
+def route_output(ap, title: str) -> None:
+    """Send everything argparse prints (--help, --version, usage errors) through show(), so a windowless build
+    answers them in a message box instead of saying nothing."""
+    import sys
+    if sys.stdout is None and sys.stderr is None:
+        ap._print_message = lambda message, file=None: message and show(message, title)

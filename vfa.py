@@ -1093,10 +1093,11 @@ def cmd_append(args):
 # ---------- CLI ----------
 def build_argparser():
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa cli func build argparser")
-    from vfa_version import __version__, version_text
+    from vfa_version import __version__, version_text, route_output
     ap = argparse.ArgumentParser(
         prog="vfa", description=f"VulpFin Archive (.vfa) {__version__}"
     )
+    route_output(ap, "VFA")
     ap.add_argument("-V", "--version", action="version", version=version_text("vfa"))
     sub = ap.add_subparsers(dest="cmd", required=True)
 

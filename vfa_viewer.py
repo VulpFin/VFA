@@ -7,7 +7,7 @@ import os, io, sys, struct, time, json, stat, hashlib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from vfa_version import __version__, version_text
+from vfa_version import __version__, version_text, show
 import vfa_extract as vx                      # the shared, validated reader (also used by vfa.py and the stubs)
 from vfa_extract import METHOD_NAMES, VFAError
 
@@ -221,7 +221,7 @@ class Viewer(ttk.Frame):
 
 def main():
     if sys.argv[1:2] in (["--version"], ["-V"]):
-        print(version_text("vfa-viewer")); return
+        show(version_text("vfa-viewer"), "VFA Viewer"); return
     root = tk.Tk()
     root.geometry("900x520")
     app = Viewer(root)
