@@ -20,7 +20,7 @@ Finding Python X: Windows uses the py launcher (py -X), elsewhere pythonX on PAT
 (and `uv python install X` if uv is there and X is missing). Linux wheels are repaired with auditwheel to a
 manylinux tag, which PyPI requires; the tag follows the glibc of the machine that builds them.
 """
-import argparse, os, pathlib, platform, re, shutil, subprocess, sys, threading, time
+import argparse, hashlib, os, pathlib, platform, re, shutil, subprocess, sys, tarfile, threading, time, zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -208,6 +208,108 @@ def to_wsl_path(p):
     r = subprocess.run(["wsl", "wslpath", "-a", str(p).replace("\\", "/")], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
 
+def _zip_dir(src, zpath, top):
+    """src folder -> zpath, its files under top/ in the archive."""
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for f in sorted(src.rglob("*")):
+            if f.is_file(): z.write(f, f"{top}/{f.relative_to(src).as_posix()}")
+
+def _tar_dir(src, tpath, top):
+    """src folder -> tpath (.tar.gz), every file executable: the Linux binaries may be packed on Windows (after
+    --wsl), where the file system has no execute bit to copy."""
+    def fix(ti):
+        ti.uid = ti.gid = 0; ti.uname = ti.gname = ""
+        ti.mode = 0o755 if ti.isdir() or not ti.name.endswith((".txt", ".md")) else 0o644
+        return ti
+    with tarfile.open(tpath, "w:gz", compresslevel=9) as t:
+        t.add(src, arcname=top, filter=fix)
+
+def assemble(out=OUT):
+    """release/<ver>/upload/: what goes where, from whatever the runs produced.
+
+        github/   one asset per download: each OS's portable archive (all its executables + LICENSE + README),
+                  install-folder archives and installers, the source (zip, tar.gz), and vfa-<ver>-all.zip with
+                  all of those plus the PyPI files
+        pypi/     the wheels and the sdist (twine upload release/<ver>/upload/pypi/*)
+        SHA256SUMS.txt  for every file in github/ and pypi/
+
+    Returns a list of problems (missing OS, missing wheels, failed tests); empty means complete."""
+    up = out / "upload"; gh = up / "github"; pp = up / "pypi"
+    shutil.rmtree(up, ignore_errors=True); gh.mkdir(parents=True); pp.mkdir(parents=True)
+    problems, readme, lic = [], ROOT / "README.md", ROOT / "LICENSE"
+
+    for os_name in ("windows", "linux", "macos"):
+        d = out / os_name
+        if not (d / "portable").is_dir() or not any((d / "portable").iterdir()):
+            if os_name != "macos": problems.append(f"{os_name}: no executables (release/{VERSION}/{os_name}/portable)")
+            continue
+        names = [f.name for f in (d / "installers").glob("*")] + [f.name for f in (d / "archives").glob("*")]
+        m = next((re.search(rf"-{re.escape(VERSION)}-{os_name}-(\w+)", n) for n in names if f"-{os_name}-" in n), None)
+        arch = m.group(1) if m else "x64"
+        stage = ROOT / "build" / "upload" / os_name
+        shutil.rmtree(stage, ignore_errors=True); shutil.copytree(d / "portable", stage)
+        for f in (readme, lic):
+            if f.exists(): shutil.copy2(f, stage / (f.name + (".txt" if f.name == "LICENSE" else "")))
+        top = f"vfa-{VERSION}-{os_name}-{arch}-portable"
+        if os_name == "windows": _zip_dir(stage, gh / f"{top}.zip", top)
+        else: _tar_dir(stage, gh / f"{top}.tar.gz", top)
+        for sub in ("archives", "installers"):
+            for f in sorted((d / sub).glob("*")):
+                if f.is_file(): shutil.copy2(f, gh / f.name)
+
+    git = shutil.which("git")
+    if git:
+        dirty = subprocess.run([git, "status", "--porcelain", "--untracked-files=no"], cwd=ROOT,
+                               capture_output=True, text=True).stdout.strip()
+        if dirty: problems.append("source: the checkout has uncommitted changes; the source archives are HEAD, "
+                                  "the binaries were built from the working tree")
+        for fmt, ext in (("zip", "zip"), ("tar.gz", "tar.gz")):
+            r = subprocess.run([git, "archive", f"--format={fmt}", f"--prefix=vfa-{VERSION}/",
+                                "-o", str(gh / f"vfa-{VERSION}-source.{ext}"), "HEAD"], cwd=ROOT,
+                               capture_output=True, text=True)
+            if r.returncode: problems.append(f"source {ext}: git archive failed: {r.stderr.strip()[:200]}")
+    else:
+        problems.append("source: git not found, no source archives")
+
+    pypi_src = out / "pypi"
+    files = sorted(pypi_src.glob(f"vfvfa-{VERSION}*")) if pypi_src.is_dir() else []
+    for f in files: shutil.copy2(f, pp / f.name)
+    have = {f.name for f in files}
+    for py in ("310", "312", "313", "314"):
+        for plat, pat in (("windows", "win_amd64"), ("linux", "manylinux")):
+            if not any(f"-cp{py}-cp{py}-" in n and pat in n for n in have):
+                problems.append(f"pypi: no {plat} wheel for Python {py[0]}.{py[1:]}")
+    if not any(n.endswith(".tar.gz") for n in have): problems.append("pypi: no sdist")
+
+    for rep in sorted(out.glob("RESULTS-*.md")):
+        for line in rep.read_text(encoding="utf-8").splitlines():
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) == 4 and re.fullmatch(r"\d+\.\d+", cells[0]) and not cells[1].startswith(("PASS", "-")):
+                problems.append(f"{rep.stem[8:]} Python {cells[0]}: {cells[1][:120]}")
+
+    assets = sorted(f for f in gh.iterdir() if f.is_file())
+    with zipfile.ZipFile(gh / f"vfa-{VERSION}-all.zip", "w", zipfile.ZIP_STORED) as z:   # already compressed
+        for f in assets: z.write(f, f"vfa-{VERSION}/{f.name}")
+        for f in sorted(pp.iterdir()): z.write(f, f"vfa-{VERSION}/pypi/{f.name}")
+
+    def sha(f):
+        h = hashlib.sha256()
+        with open(f, "rb") as fh:
+            for b in iter(lambda: fh.read(1 << 20), b""): h.update(b)
+        return h.hexdigest()
+    sums = [f"{sha(f)}  {f.parent.name}/{f.name}" for d in (gh, pp) for f in sorted(d.iterdir()) if f.is_file()]
+    (up / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n", encoding="utf-8")
+
+    log(f"{up} assembled:")
+    for d in (gh, pp):
+        for f in sorted(d.iterdir()): print(f"    {d.name}/{f.name}  ({f.stat().st_size / 1e6:.1f} MB)")
+    if problems:
+        log("NOT COMPLETE - do not publish yet:")
+        for pr in problems: print("    - " + pr)
+    else:
+        log("complete: every OS, every wheel, all tests passed")
+    return problems
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Build and test a full VFA release")
     ap.add_argument("--pythons", default="3.10,3.12,3.13,3.14", help="Python versions for tests and wheels")
@@ -218,7 +320,11 @@ def main(argv=None):
     ap.add_argument("--keep-going", action="store_true", help="Continue with the next Python if one fails")
     ap.add_argument("--verbose", action="store_true", help="Show every command's full output (always saved to "
                                                           "release/<version>/logs/ either way)")
+    ap.add_argument("--no-assemble", action="store_true", help="Skip collecting release/<version>/upload/ at the end")
+    ap.add_argument("--assemble-only", action="store_true",
+                    help="Only (re)collect release/<version>/upload/ from what earlier runs built")
     a = ap.parse_args(argv)
+    if a.assemble_only: return 1 if assemble() else 0
     global VERBOSE; VERBOSE = a.verbose
 
     pythons = [v.strip() for v in a.pythons.split(",") if v.strip()]
@@ -268,8 +374,9 @@ def main(argv=None):
             return 1
         rest = [x for x in (argv if argv is not None else sys.argv[1:]) if x != "--wsl"]
         quoted = " ".join("'" + x.replace("'", "'\\''") + "'" for x in rest)
-        r = run(["wsl", "-e", "bash", "-lc", f"cd '{wp}' && python3 release.py {quoted}"], check=False)
+        r = run(["wsl", "-e", "bash", "-lc", f"cd '{wp}' && python3 release.py {quoted} --no-assemble"], check=False)
         ok_all &= r.returncode == 0
+    if not a.no_assemble and assemble(): ok_all = False
     return 0 if ok_all else 1
 
 if __name__ == "__main__":
