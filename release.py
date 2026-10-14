@@ -119,7 +119,8 @@ def main(argv=None):
             run([py, ROOT / "build_vulp.py"], cwd=ROOT)                    # _vulp for this Python, in place
             if a.tests != "none":
                 ok, summary = run_tests(py, a.tests); row["tests"] = ("PASS " if ok else "FAIL ") + summary
-                ok_all &= ok
+                if not ok:   # never package code that fails its tests (--keep-going moves on to the next Python)
+                    raise RuntimeError(f"test_vfa.py failed on Python {ver}; not packaging it")
             if not a.no_wheels: row["wheel"] = build_wheel(py, pypi).name
             if ver == a.exe_python and not a.no_exes:
                 if not a.no_wheels:   # not from ROOT: "-m build" would find this repo's build.py first
