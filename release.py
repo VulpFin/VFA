@@ -226,14 +226,19 @@ def _tar_dir(src, tpath, top):
         t.add(src, arcname=top, filter=fix)
 
 def git_state():
-    """'<commit>' for a clean checkout, '<commit>+dirty' with uncommitted changes to tracked files, None without git."""
+    """'<commit>' for a clean checkout, '<commit>+dirty' with uncommitted changes to tracked files or untracked
+    code files, None without git."""
     git = shutil.which("git")
     if not git: return None
     r = subprocess.run([git, "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True)
     if r.returncode: return None
     dirty = subprocess.run([git, "status", "--porcelain", "--untracked-files=no"], cwd=ROOT,
                            capture_output=True, text=True).stdout.strip()
-    return r.stdout.strip() + ("+dirty" if dirty else "")
+    # untracked code counts too: with the repo root on the import path, a stray module can end up in the tests
+    # and the executables while git archive leaves it out (other untracked files, e.g. sample data, do not)
+    stray = subprocess.run([git, "ls-files", "--others", "--exclude-standard", "--", "*.py", "*.c", "*.h"],
+                           cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    return r.stdout.strip() + ("+dirty" if dirty or stray else "")
 
 def read_field(rep, name):
     """A 'Name: value' line of a RESULTS report (None if absent or 'unknown': reports from before it was recorded)."""
