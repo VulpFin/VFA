@@ -7,6 +7,7 @@ import os, io, sys, struct, time, json, stat, hashlib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+from vfa_version import __version__, version_text
 import vfa_extract as vx                      # the shared, validated reader (also used by vfa.py and the stubs)
 from vfa_extract import METHOD_NAMES, VFAError
 
@@ -53,7 +54,7 @@ class Viewer(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
         self.pack(fill="both", expand=True)
-        self.master.title("VFA Viewer")
+        self.master.title(f"VFA Viewer {__version__}")
         self.archive = None
         self.create_widgets()
 
@@ -219,6 +220,8 @@ class Viewer(ttk.Frame):
 # ... keep the rest of vfa_viewer.py as-is ...
 
 def main():
+    if sys.argv[1:2] in (["--version"], ["-V"]):
+        print(version_text("vfa-viewer")); return
     root = tk.Tk()
     root.geometry("900x520")
     app = Viewer(root)

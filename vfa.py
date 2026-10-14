@@ -1093,9 +1093,11 @@ def cmd_append(args):
 # ---------- CLI ----------
 def build_argparser():
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa cli func build argparser")
+    from vfa_version import __version__, version_text
     ap = argparse.ArgumentParser(
-        prog="vfa", description="Vulpfin Archive (.vfa) — Python Prototype"
+        prog="vfa", description=f"VulpFin Archive (.vfa) {__version__}"
     )
+    ap.add_argument("-V", "--version", action="version", version=version_text("vfa"))
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     # --- Create ---
@@ -1262,7 +1264,10 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):    # a legacy console code page must not crash `vfa l` on a Unicode name
         try: stream.reconfigure(errors="backslashreplace")
         except Exception: pass
-    ap=build_argparser(); args, extra = ap.parse_known_args(argv)
+    ap=build_argparser()
+    if not (sys.argv[1:] if argv is None else argv):    # bare `vfa`: what this is and how to use it, not an error
+        ap.print_help(); return
+    args, extra = ap.parse_known_args(argv)
     # `vfa x a.vfa -o out some/member` - argparse cannot put positionals after options on its own
     if extra and args.cmd == "x" and not any(x.startswith("-") for x in extra): args.members += extra
     elif extra: ap.error("unrecognized arguments: " + " ".join(extra))

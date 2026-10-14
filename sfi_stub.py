@@ -684,7 +684,10 @@ def do_uninstall(install_dir: str, opts: Options) -> dict:
 # ---------------- CLI ----------------
 
 def build_parser():
-    ap = argparse.ArgumentParser(description="VFA self-finishing installer", add_help=True)
+    from vfa_version import __version__, version_text
+    ap = argparse.ArgumentParser(description=f"VFA self-finishing installer (VFA {__version__}; --info shows the "
+                                             f"version of what it installs)", add_help=True)
+    ap.add_argument("-V", "--version", action="version", version=version_text("vfa-sfi"))
     g = ap.add_argument_group("mode")
     g.add_argument("--gui", action="store_true", help="Force the graphical wizard")
     g.add_argument("--cli", action="store_true", help="Interactive terminal installer")
