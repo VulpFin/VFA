@@ -74,12 +74,20 @@ def env_python(ver, exe_python):
 def run_tests(py, mode):
     """test_vfa.py with this Python; returns (ok, summary line)."""
     args = [py, ROOT / "test_vfa.py"] + (["--quick"] if mode == "quick" else [])
-    r = run(args, check=False, capture_output=True, text=True, cwd=ROOT)
-    lines = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+    log("$ " + " ".join(str(c) for c in args))
+    # shown live (a quick run takes several minutes and would otherwise look hung), and kept for the summary
+    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+    p = subprocess.Popen([str(c) for c in args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=ROOT, env=env,
+                         text=True, encoding="utf-8", errors="replace")
+    lines = []
+    for l in p.stdout:
+        print("    " + l.rstrip(), flush=True)
+        if l.strip(): lines.append(l.rstrip())
+    rc = p.wait()
     summary = next((l for l in reversed(lines) if "failed" in l and "skipped" in l), lines[-1] if lines else "no output")
     fails = [l for l in lines if l.startswith("FAIL ")]
     for l in fails[:20]: log("  " + l)
-    return r.returncode == 0, summary.strip()
+    return rc == 0, summary.strip()
 
 def build_wheel(py, pypi):
     """Wheel for this Python into release/<ver>/pypi (Linux: repaired to manylinux by auditwheel)."""
