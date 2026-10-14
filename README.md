@@ -70,6 +70,10 @@ With Python 3.13 (`--exe-python`), it then builds the executables:
 | `installers/` | each folder build as a VFA self-finishing installer (checked to start with `--info`) |
 | `pypi/` | wheels for every OS and Python, plus the sdist (upload with `twine upload release/<version>/pypi/*`) |
 
+Each step shows one live status line (elapsed time, test counts, a progress bar once an earlier run's count is known);
+its full output goes to `release/<version>/logs/`, and a failing step prints its last lines. `--verbose` shows
+everything as it runs.
+
 Results per OS: `release/<version>/RESULTS-<os>.md`. Python versions come from the `py` launcher on Windows, and from
 `pythonX.Y` on PATH or [uv](https://docs.astral.sh/uv/) elsewhere. With `--wsl`, WSL needs a `python3` and either the
 Python versions or uv. A mapped network drive must first be mounted in WSL (`sudo mount -t drvfs U: /mnt/u`).
