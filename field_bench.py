@@ -1,0 +1,170 @@
+# Copyright (C) 2025 TG11  -  AGPL-3.0-or-later (see LICENSE)
+#!/usr/bin/env python3
+"""
+field_bench.py - measure VFA's coders on your own files, privately.
+
+    python field_bench.py D:\\Projects E:\\SteamLibrary C:\\Users\\me\\Documents --out field_results.md
+
+Walks the given folders, sorts files into kinds (text, source code, Postgres data, raw / compressed images and audio,
+video, executables, game data, archives, other), takes a repeatable sample of each kind (--budget-mb, default 200 MB
+per kind), and compresses each sample with vulp-lz -9, vulp-cm, xz -9e and zstd -19 in 64 MiB pieces, checking that
+every one decodes back exactly. The results file holds only totals per kind (bytes, file counts, compressed sizes,
+speeds): no file names, paths or contents. Nothing is written anywhere else and nothing is sent anywhere.
+
+It needs the _vulp extension (python build_vulp.py) and reads files only. vulp-cm is slow (about 0.5-1 MB/s each
+way), so the default budget takes roughly 2-4 hours; --budget-mb 50 gives a first look in well under an hour.
+A Postgres data folder is best read with the server stopped (a live one still works; pages may just be mid-write).
+"""
+import argparse, os, pathlib, platform, random, sys, time, lzma
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+KINDS = {
+    "text": {".txt", ".md", ".log", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".yaml", ".yml", ".ini", ".cfg",
+             ".conf", ".toml", ".rst", ".tex", ".srt", ".sql"},
+    "source": {".py", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".java", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs",
+               ".rb", ".php", ".swift", ".kt", ".lua", ".sh", ".ps1", ".bat", ".css", ".scss", ".vue", ".gd", ".shader",
+               ".hlsl", ".glsl"},
+    "image-raw": {".bmp", ".tif", ".tiff", ".dng", ".cr2", ".cr3", ".nef", ".arw", ".psd", ".tga", ".dds", ".exr", ".hdr"},
+    "image-compressed": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic"},
+    "audio-raw": {".wav", ".aif", ".aiff", ".pcm"},
+    "audio-compressed": {".mp3", ".ogg", ".opus", ".m4a", ".aac", ".flac", ".wma"},
+    "video": {".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".m4v", ".bk2", ".bik", ".usm"},
+    "executable": {".exe", ".dll", ".so", ".dylib", ".sys", ".pyd", ".node"},
+    "game-data": {".pak", ".vpk", ".assets", ".resource", ".ress", ".bundle", ".dat", ".bin", ".bsa", ".ba2", ".wad",
+                  ".upk", ".uasset", ".umap", ".gcf", ".arc", ".big", ".pck", ".sav", ".esm", ".esp"},
+    "archive": {".zip", ".7z", ".rar", ".gz", ".xz", ".zst", ".bz2", ".cab", ".msi", ".jar", ".apk", ".vfa"},
+}
+EXT_KIND = {e: k for k, exts in KINDS.items() for e in exts}
+PIECE = 1 << 26                              # 64 MiB, the VFA2 default chunk size
+SKIP_DIRS = {"$recycle.bin", "system volume information", ".git", "node_modules", "__pycache__", "windows", "winsxs"}
+
+def kind_of(path: pathlib.Path, pg_roots) -> str:
+    if any(r in path.parents for r in pg_roots): return "postgres"
+    return EXT_KIND.get(path.suffix.lower(), "other")
+
+def walk(roots, max_file):
+    """(kind, size, path) for every readable regular file; Postgres data folders (with PG_VERSION) are their own kind."""
+    files = []; pg_roots = set()
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+            dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+            if "PG_VERSION" in filenames and "base" in dirnames: pg_roots.add(pathlib.Path(dirpath))
+            for fn in filenames:
+                p = pathlib.Path(dirpath) / fn
+                try:
+                    st = p.stat()
+                    if not p.is_file() or st.st_size == 0: continue
+                except OSError:
+                    continue
+                files.append((p, st.st_size))
+    out = []
+    for p, size in files: out.append((kind_of(p, pg_roots), min(size, max_file), p))
+    return out
+
+def sample(files, budget, seed=1):
+    """Repeatable random sample per kind, up to budget bytes each (a large file contributes its first max_file bytes)."""
+    by = {}
+    for k, size, p in files: by.setdefault(k, []).append((size, p))
+    rnd = random.Random(seed); picked = {}
+    for k, lst in sorted(by.items()):
+        lst.sort(key=lambda t: str(t[1])); rnd.shuffle(lst); total = 0; sel = []
+        for size, p in lst:
+            if total >= budget: break
+            sel.append((p, min(size, budget - total))); total += min(size, budget - total)
+        picked[k] = (sel, len(lst), sum(s for s, _ in lst))
+    return picked
+
+def read_blob(sel):
+    out = bytearray(); n = 0
+    for p, take in sel:
+        try:
+            with open(p, "rb") as f: data = f.read(take)
+        except OSError:
+            continue
+        out += data; n += 1
+    return bytes(out), n
+
+def codecs(level_cm):
+    import _vulp as C
+    try: import zstandard as zs
+    except Exception: zs = None
+    filt = lambda d, k: C.filter_fwd(3, b"", d) if k == "executable" else d      # what VFA's router picks for x86 code
+    unf = lambda d, k: C.filter_inv(3, b"", d) if k == "executable" else d
+    out = {
+        "vulp-lz -9": (lambda d, k: C.lz_encode(filt(d, k), 9), lambda e, n, k: unf(C.lz_decode(e, n), k)),
+        "vulp-cm": (lambda d, k: C.cm_encode(filt(d, k), level_cm), lambda e, n, k: unf(C.cm_decode(e, n, level_cm), k)),
+        "xz -9e": (lambda d, k: lzma.compress(d, preset=9 | lzma.PRESET_EXTREME), lambda e, n, k: lzma.decompress(e)),
+    }
+    if zs:
+        out["zstd -19"] = (lambda d, k: zs.ZstdCompressor(level=19).compress(d),
+                           lambda e, n, k: zs.ZstdDecompressor().decompress(e, max_output_size=n))
+    return out
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("roots", nargs="+", help="folders to sample from (read only)")
+    ap.add_argument("--budget-mb", type=int, default=200, help="sample size per kind of file (default 200 MB)")
+    ap.add_argument("--max-file-mb", type=int, default=64, help="at most this much of any one file (default 64 MB)")
+    ap.add_argument("--kinds", help="only these kinds, comma-separated (default: all found)")
+    ap.add_argument("--cm-bits", type=int, default=22, help="vulp-cm table bits (default 22 = VFA's default level)")
+    ap.add_argument("--out", default="field_results.md")
+    a = ap.parse_args()
+    try:
+        import _vulp
+        if getattr(_vulp, "VERSION", 0) < 4: raise ImportError("old")
+    except ImportError:
+        sys.exit("field_bench needs the current _vulp extension: python build_vulp.py")
+    t0 = time.time()
+    print("scanning ...", flush=True)
+    files = walk(a.roots, a.max_file_mb << 20)
+    picked = sample(files, a.budget_mb << 20)
+    if a.kinds: picked = {k: v for k, v in picked.items() if k in a.kinds.split(",")}
+    print(f"{len(files)} files in {len(picked)} kinds ({time.time() - t0:.0f} s); sampling up to {a.budget_mb} MB each", flush=True)
+    cods = codecs(a.cm_bits)
+    rows = []
+    for k, (sel, nfiles, total) in picked.items():
+        blob, nread = read_blob(sel)
+        if not blob: continue
+        res = {}
+        for name, (enc, dec) in cods.items():
+            sizes = []; te = td = 0.0; ok = True
+            for off in range(0, len(blob), PIECE):
+                piece = blob[off:off + PIECE]
+                t = time.perf_counter(); e = enc(piece, k); te += time.perf_counter() - t
+                if e is None: sizes.append(len(piece)); continue    # would not shrink: VFA stores it
+                t = time.perf_counter(); back = dec(e, len(piece), k); td += time.perf_counter() - t
+                ok &= back == piece; sizes.append(min(len(e), len(piece)))
+            size = sum(sizes)
+            res[name] = (size, te, td, ok, sizes)
+            print(f"  {k:17} {name:11} {len(blob) >> 20:5} MB -> {size / len(blob):.4f}  "
+                  f"{len(blob) / 1e6 / max(te, 1e-9):6.1f} / {len(blob) / 1e6 / max(td, 1e-9):6.1f} MB/s  {'ok' if ok else 'MISMATCH'}", flush=True)
+        rows.append((k, nfiles, total, nread, len(blob), res))
+        write(a.out, rows, time.time() - t0, a)
+    write(a.out, rows, time.time() - t0, a)
+    print(f"done in {(time.time() - t0) / 60:.0f} min -> {a.out}")
+
+def write(path, rows, secs, a):
+    names = list(rows[0][5]) if rows else []
+    lines = ["# VFA field benchmark", "",
+             f"{time.strftime('%Y-%m-%d %H:%M')}, {platform.platform()}, {os.cpu_count()} CPUs, python {platform.python_version()}; "
+             f"sample up to {a.budget_mb} MB per kind, files capped at {a.max_file_mb} MB, vulp-cm table bits {a.cm_bits}; "
+             f"{secs / 60:.0f} min. Only totals: no names or contents.", "",
+             "Ratio = compressed / original (lower is better); 'vfa --method cm' keeps the smaller of vulp-lz and vulp-cm "
+             "per 64 MiB piece. MB/s = compress / decompress. Executables get VFA's bcj-x86 filter before vulp-lz and "
+             "vulp-cm (as VFA's router would pick); xz and zstd see them unfiltered.", "",
+             "| kind | files found | found GB | sampled MB | " + " | ".join(names) + " | VFA cm (best of lz, cm) | vs xz |",
+             "|---|---:|---:|---:|" + "---:|" * len(names) + "---:|---:|"]
+    for k, nfiles, total, nread, n, res in rows:
+        cells = []
+        for nm in names:
+            size, te, td, ok, _ = res[nm]
+            cells.append(f"{size / n:.4f} ({n / 1e6 / max(te, 1e-9):.1f} / {n / 1e6 / max(td, 1e-9):.1f}){'' if ok else ' MISMATCH'}")
+        best = sum(map(min, res["vulp-lz -9"][4], res["vulp-cm"][4])); xz = res["xz -9e"][0]   # per 64 MiB piece
+        lines.append(f"| {k} | {nfiles} | {total / 1e9:.1f} | {n / 1e6:.0f} | " + " | ".join(cells)
+                     + f" | {best / n:.4f} | {(best - xz) * 100 / max(xz, 1):+.1f}% |")
+    pathlib.Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+if __name__ == "__main__":
+    main()

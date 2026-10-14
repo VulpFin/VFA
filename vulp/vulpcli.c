@@ -7,9 +7,10 @@
  *                                 output (cost as u64 LE, filtered bytes, encoded bytes). Builds must print identical
  *                                 lines; test_vfa.py recomputes the same CRC through the _vulp extension.
  *                                 Also decodes everything back and exits 1 on any mismatch.
- *                                 Then vulp-lz (levels 6 and 9) and content-defined chunking are hashed into the same line.
- *   vulpcli fuzz FILE N SEED      encode FILE (tANS, then vulp-lz), then decode N corrupted/truncated variants of
- *                                 each. Built with sanitizers,
+ *                                 Then vulp-lz (levels 6 and 9), content-defined chunking and vulp-cm (the first
+ *                                 CM_DIGEST bytes, table bits 16) are hashed into the same line.
+ *   vulpcli fuzz FILE N SEED      encode FILE (tANS, vulp-lz, and vulp-cm on its first CM_FUZZ bytes), then decode N
+ *                                 corrupted/truncated variants (every 16th one vulp-cm). Built with sanitizers,
  *                                 the oracle is "no crash, no sanitizer report"; prints how many were refused.
  */
 #include "vulp.h"
@@ -23,6 +24,9 @@ static const struct { int id; uint8_t p[2]; size_t plen; } CONFIGS[] = {
     {VULP_F_SHUFFLE, {8, 1}, 2}, {VULP_F_SHUFFLE, {16, 1}, 2}, {VULP_F_BCJ_X86, {0, 0}, 0}, {VULP_F_BCJ_ARM64, {0, 0}, 0},
 };
 #define NCONF (sizeof CONFIGS / sizeof CONFIGS[0])
+#define CM_DIGEST 65536     /* vulp-cm is ~0.5 MB/s (optimised), so the digest covers a prefix of each input */
+#define CM_FUZZ   1024
+#define CM_BITS   16
 
 static uint32_t crc(uint32_t c, const uint8_t *p, size_t n)    /* zlib CRC-32, bitwise: same as zlib.crc32 */
 {
@@ -99,6 +103,18 @@ static int digest(const char *path)
         }
         free(lz); free(cuts);
     }
+    if (!bad) {                     /* vulp-cm on a prefix; output that would not fit in m+4096 counts as empty */
+        size_t m = n < CM_DIGEST ? n : CM_DIGEST, clen = 0, ccap = vulp_cm_bound(m);
+        uint8_t *cm = (uint8_t *)malloc(ccap);
+        if (!cm || vulp_cm_encode(in, m, CM_BITS, cm, ccap, &clen) != VULP_OK) bad = 1;
+        else {
+            if (vulp_cm_decode(cm, clen, CM_BITS, dec, m) != VULP_OK || memcmp(dec, in, m)) bad = 1;
+            if (clen > m + 4096) clen = 0;
+            h = crc(h, cm, clen);
+            printf(" cm=%lu", (unsigned long)clen);
+        }
+        free(cm);
+    }
     printf(" digest=%08lx%s\n", (unsigned long)h, bad ? " ROUNDTRIP-FAIL" : "");
     free(in); free(flt); free(enc); free(dec); free(back);
     return bad;
@@ -113,8 +129,8 @@ static uint32_t rnd(void)                       /* xorshift64* */
 
 static int fuzz(const char *path, long iters, unsigned long seed)
 {
-    size_t n, len[2], i;
-    uint8_t *in = slurp(path, &n), *enc[2], *mut, *out;
+    size_t n, len[3], i, ncm;
+    uint8_t *in = slurp(path, &n), *enc[3], *mut, *out;
     long it, refused = 0, same = 0, differ = 0;
     if (!in) { fprintf(stderr, "cannot read %s\n", path); return 1; }
     if (n > (1u << 20)) n = 1u << 20;
@@ -122,17 +138,20 @@ static int fuzz(const char *path, long iters, unsigned long seed)
     if (!enc[0] || !enc[1] || !out) return 1;
     if (vulp_tans_encode(in, n, enc[0], vulp_tans_bound(n), &len[0]) != VULP_OK) return 1;
     if (vulp_lz_encode(in, n, 6, enc[1], vulp_lz_bound(n), &len[1]) != VULP_OK) return 1;
+    ncm = n < CM_FUZZ ? n : CM_FUZZ;
+    enc[2] = (uint8_t *)malloc(vulp_cm_bound(ncm));
+    if (!enc[2] || vulp_cm_encode(in, ncm, CM_BITS, enc[2], vulp_cm_bound(ncm), &len[2]) != VULP_OK) return 1;
     rng_state = seed * 0x9E3779B97F4A7C15ULL + 1;
     for (it = 0; it < iters; it++) {
-        int k = (int)(it & 1);                     /* even: tANS payload, odd: vulp-lz payload */
-        size_t elen = len[k], mlen = elen, j, flips, outn = n;
+        int k = (it & 15) == 15 ? 2 : (int)(it & 1);  /* tANS / vulp-lz alternately; every 16th: vulp-cm */
+        size_t ref_n = k == 2 ? ncm : n, elen = len[k], mlen = elen, j, flips, outn = ref_n;
         uint32_t how = rnd() % 4;
         int rc;
         mut = (uint8_t *)malloc(elen + 1);
         if (!mut) return 1;
         memcpy(mut, enc[k], elen);
         if (how == 0 && elen) mlen = rnd() % elen;                               /* truncate */
-        else if (how == 3) outn = n ? rnd() % (n + 1) : 0;                       /* wrong expected size */
+        else if (how == 3) outn = ref_n ? rnd() % (ref_n + 1) : 0;               /* wrong expected size */
         else {
             flips = 1 + rnd() % 8;                                               /* flip / set bytes */
             for (j = 0; j < flips && elen; j++) {
@@ -140,15 +159,16 @@ static int fuzz(const char *path, long iters, unsigned long seed)
                 if (how == 1) mut[i] ^= (uint8_t)(1u << (rnd() % 8)); else mut[i] = (uint8_t)rnd();
             }
         }
-        rc = k ? vulp_lz_decode(mut, mlen, out, outn) : vulp_tans_decode(mut, mlen, out, outn);
+        rc = k == 2 ? vulp_cm_decode(mut, mlen, CM_BITS, out, outn)
+           : k ? vulp_lz_decode(mut, mlen, out, outn) : vulp_tans_decode(mut, mlen, out, outn);
         if (rc != VULP_OK) refused++;
-        else if (outn == n && !memcmp(out, in, n)) same++;
+        else if (outn == ref_n && !memcmp(out, in, ref_n)) same++;
         else differ++;
         free(mut);
     }
     /* "differ" is not a format failure by itself: VFA2 checks every decoded chunk against its CRC32 */
-    printf("fuzz %s: %ld cases (tANS + vulp-lz), refused %ld, identical %ld, decoded-but-different %ld\n", path, iters, refused, same, differ);
-    free(in); free(enc[0]); free(enc[1]); free(out);
+    printf("fuzz %s: %ld cases (tANS + vulp-lz + vulp-cm), refused %ld, identical %ld, decoded-but-different %ld\n", path, iters, refused, same, differ);
+    free(in); free(enc[0]); free(enc[1]); free(enc[2]); free(out);
     return 0;
 }
 

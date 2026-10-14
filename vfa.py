@@ -758,14 +758,18 @@ def _collect_items(args, solid: bool):
 
 # ---------- Commands ----------
 def cmd_create_v2(args):
-    """VFA2 (see VFA2.md). Coders: lz (default), tans or stored; filter per chunk: auto (default) or forced with
+    """VFA2 (see VFA2.md). Coders: lz (default), cm (vulp-cm where it beats lz), tans or stored; filter per chunk: auto (default) or forced with
     --filter; content-defined dedup across chunks unless --no-dedup or encrypting."""
     import vfa2
-    if args.method not in (None, "lz", "tans", "none", "stored"):
-        raise SystemExit(f"VFA2 has the coders 'lz' (default), 'tans' and 'stored'/'none'; --method {args.method} is a VFA1 method")
-    coder = {"none": 0, "stored": 0, "tans": 1}.get(args.method, vfa2.CODER_LZ)
-    if coder == vfa2.CODER_LZ and not vfa2.NATIVE:
-        raise SystemExit(f"--method lz needs the C codec: {vfa2.NATIVE_PROBLEM}. (--method tans works without it, slowly.)")
+    if args.method not in (None, "lz", "cm", "tans", "none", "stored"):
+        raise SystemExit(f"VFA2 has the coders 'lz' (default), 'cm', 'tans' and 'stored'/'none'; --method {args.method} is a VFA1 method")
+    coder = {"none": 0, "stored": 0, "tans": 1, "cm": vfa2.CODER_CM}.get(args.method, vfa2.CODER_LZ)
+    if coder in (vfa2.CODER_LZ, vfa2.CODER_CM) and not vfa2.NATIVE:
+        raise SystemExit(f"--method {args.method or 'lz'} needs the C codec: {vfa2.NATIVE_PROBLEM}. "
+                         "(--method tans works without it, slowly.)")
+    if coder == vfa2.CODER_CM:
+        LOGGER.info(f"vulp-cm: maximum compression; each chunk keeps vulp-lz where CM does not win. CM chunks "
+                    f"decode at about 1 MB/s and need about {13 << vfa2.cm_bits(args.level) >> 20} MiB to decode.")
     try: filt = vfa2.parse_filter(args.filter)
     except ValueError as e: raise SystemExit(str(e))
     if coder == 0 and filt is None: filt = (0, b"")
@@ -795,7 +799,7 @@ def cmd_create_v2(args):
 def cmd_create(args):
     if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd create")
     if args.format == "vfa2": return cmd_create_v2(args)
-    if args.method in ("tans", "lz"): raise SystemExit(f"--method {args.method} is a VFA2 coder; add --format vfa2")
+    if args.method in ("tans", "lz", "cm"): raise SystemExit(f"--method {args.method} is a VFA2 coder; add --format vfa2")
     if args.filter != "auto": raise SystemExit("--filter applies to --format vfa2 only")
     if args.method is None: args.method = "zstd" if HAVE_ZSTD else "zlib"
     if args.method == "stored": args.method = "none"
@@ -1108,8 +1112,9 @@ def build_argparser():
     ap_c.add_argument(
         "--method",
         default=None,
-        choices=list(NAME_TO_METHOD.keys()) + ["stored", "tans", "lz"],
-        help="Compression method, default zstd (VFA1) / lz (VFA2: lz, tans or stored/none; --level 0-9 for lz)",
+        choices=list(NAME_TO_METHOD.keys()) + ["stored", "tans", "lz", "cm"],
+        help="Compression method, default zstd (VFA1) / lz (VFA2: lz, cm, tans or stored/none; --level 0-9 for lz; "
+             "cm = maximum compression, decodes ~100x slower than lz, used per chunk only where it wins)",
     )
     ap_c.add_argument("--format", choices=["vfa1", "vfa2"], default="vfa1",
                       help="Container format (default vfa1; vfa2 is the new chunked format, see VFA2.md)")

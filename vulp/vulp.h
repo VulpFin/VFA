@@ -12,8 +12,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define VULP_VERSION 3               /* bump when the API grows or encoder output changes (2: vulp-lz, cdc;
-                                        3: optimal parser at levels 7-9) */
+#define VULP_VERSION 4               /* bump when the API grows or encoder output changes (2: vulp-lz, cdc;
+                                        3: optimal parser at levels 7-9; 4: vulp-cm) */
 
 #define VULP_OK          0
 #define VULP_E_CORRUPT  -1           /* the encoded data is invalid; never "best effort" output */
@@ -59,6 +59,16 @@ int vulp_filter_inv(int id, const uint8_t *params, size_t plen, const uint8_t *i
 size_t vulp_lz_bound(size_t n);
 int vulp_lz_encode(const uint8_t *in, size_t n, int level, uint8_t *out, size_t cap, size_t *out_len);
 int vulp_lz_decode(const uint8_t *in, size_t in_len, uint8_t *out, size_t n);
+
+/* CM ("vulp-cm", coder 2, M5): bit-wise context mixing (vulp_cm.c). tbits sets the size of each context table
+ * (2^tbits bytes, 9 tables, plus a 4 * 2^tbits match table); decoding needs the same tbits and as much memory as
+ * encoding, and is as slow (about 0.5-1 MB/s). The payload must be used up exactly. */
+#define VULP_CM_MODEL    1
+#define VULP_CM_MINBITS  16
+#define VULP_CM_MAXBITS  24
+size_t vulp_cm_bound(size_t n);
+int vulp_cm_encode(const uint8_t *in, size_t n, int tbits, uint8_t *out, size_t cap, size_t *out_len);
+int vulp_cm_decode(const uint8_t *in, size_t in_len, int tbits, uint8_t *out, size_t n);
 
 /* Content-defined chunking (gear rolling hash) for the writer's cross-chunk dedup. Writes segment END offsets to
  * cuts (at most max_cuts) and returns how many; the last cut is always n (for n > 0). Encoder only. */
