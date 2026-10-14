@@ -151,14 +151,14 @@ def main():
             sizes = []; te = td = 0.0; ok = True; decoded = 0
             for piece, (r, rt) in zip(pieces, routed):
                 t = time.perf_counter(); e = enc(piece, r); te += time.perf_counter() - t + (rt if filtered else 0)
-                if e is None or len(e) >= len(piece): sizes.append(len(piece)); continue   # VFA stores it
+                if e is None or len(e) >= len(piece): sizes.append(None); continue   # VFA stores it
                 t = time.perf_counter(); back = dec(e, len(piece), r); td += time.perf_counter() - t
                 ok &= back == piece; sizes.append(len(e)); decoded += len(piece)
-            size = sum(sizes)
+            size = sum(len(pc) if sz is None else sz for pc, sz in zip(pieces, sizes))
             res[name] = (size, te, td, ok, sizes, decoded)
             print(f"  {k:17} {name:11} {len(blob) >> 20:5} MB -> {size / len(blob):.4f}  "
                   f"{len(blob) / 1e6 / max(te, 1e-9):6.1f} / {rate(decoded, td)} MB/s  {'ok' if ok else 'MISMATCH'}", flush=True)
-        rows.append((k, nfiles, total, nread, len(blob), res))
+        rows.append((k, nfiles, total, nread, len(blob), res, vfa_cm_size(pieces, routed, res)))
         write(a.out, rows, time.time() - t0, a)
     write(a.out, rows, time.time() - t0, a)
     print(f"done in {(time.time() - t0) / 60:.0f} min -> {a.out}")
@@ -167,24 +167,42 @@ def rate(nbytes, secs) -> str:
     """MB/s over the bytes a decoder actually decoded; '-' when every piece was stored (nothing to decode)."""
     return f"{nbytes / 1e6 / max(secs, 1e-9):.1f}" if nbytes else "-"
 
+def vfa_cm_size(pieces, routed, res):
+    """What 'vfa c --method cm' writes for these pieces, by the writer's own rule (vfa2.Writer2._flush): written size
+    = payload + params (2 + filter params + coder params, if there are any params); vulp-cm is kept only if it writes
+    at least CM_MIN_GAIN_PCT % less than vulp-lz (or than the raw piece when vulp-lz cannot shrink it); a choice
+    that is not smaller than the raw piece is stored."""
+    import vfa2
+    total = 0
+    for i, (pc, (r, _)) in enumerate(zip(pieces, routed)):
+        fparams = r[1]
+        def written(payload_len, cparams_len):
+            return payload_len + (2 + len(fparams) + cparams_len if (fparams or cparams_len) else 0)
+        lz, cm = res["vulp-lz"][4][i], res["vulp-cm"][4][i]
+        lz_w = written(lz, 0) if lz is not None else len(pc)
+        pick = lz_w
+        if cm is not None and written(cm, 2) * 100 <= lz_w * (100 - vfa2.CM_MIN_GAIN_PCT): pick = written(cm, 2)
+        total += min(pick, len(pc))
+    return total
+
 def write(path, rows, secs, a):
     names = list(rows[0][5]) if rows else []
     lines = ["# VFA field benchmark", "",
              f"{time.strftime('%Y-%m-%d %H:%M')}, {platform.platform()}, {os.cpu_count()} CPUs, python {platform.python_version()}; "
              f"sample up to {a.budget_mb} MB per kind, files capped at {a.max_file_mb} MB, --level {a.level}; "
              f"{secs / 60:.0f} min. Only totals: no names or contents.", "",
-             "Ratio = compressed / original (lower is better); 'vfa --method cm' keeps the smaller of vulp-lz and vulp-cm "
-             "per 64 MiB piece. MB/s = compress / decompress (decompress counts only pieces that were compressed; '-' = all stored). vulp-lz "
+             "Ratio = compressed / original (lower is better); the VFA cm column applies the writer's rule per 64 MiB piece: "
+             "vulp-cm only where it writes at least 1% less than vulp-lz, params included, else vulp-lz or stored. MB/s = compress / decompress (decompress counts only pieces that were compressed; '-' = all stored). vulp-lz "
              "and vulp-cm see each piece through the filter VFA's own router picks for it (none, delta, bcj-x86, ...); "
              "xz and zstd see the raw bytes.", "",
              "| kind | files found | found GB | sampled MB | " + " | ".join(names) + " | VFA cm (best of lz, cm) | vs xz |",
              "|---|---:|---:|---:|" + "---:|" * len(names) + "---:|---:|"]
-    for k, nfiles, total, nread, n, res in rows:
+    for k, nfiles, total, nread, n, res, vfa_cm in rows:
         cells = []
         for nm in names:
             size, te, td, ok, _, decoded = res[nm]
             cells.append(f"{size / n:.4f} ({n / 1e6 / max(te, 1e-9):.1f} / {rate(decoded, td)}){'' if ok else ' MISMATCH'}")
-        best = sum(map(min, res["vulp-lz"][4], res["vulp-cm"][4])); xz = res["xz -9e"][0]   # per 64 MiB piece
+        best = vfa_cm; xz = res["xz -9e"][0]
         lines.append(f"| {k} | {nfiles} | {total / 1e9:.1f} | {n / 1e6:.0f} | " + " | ".join(cells)
                      + f" | {best / n:.4f} | {(best - xz) * 100 / max(xz, 1):+.1f}% |")
     pathlib.Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
