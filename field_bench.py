@@ -76,14 +76,15 @@ def sample(files, budget, seed=1):
     return picked
 
 def read_blob(sel):
-    out = bytearray(); n = 0
+    """The sampled files back to back, the offset where each starts, and how many could be read."""
+    out = bytearray(); n = 0; starts = []
     for p, take in sel:
         try:
             with open(p, "rb") as f: data = f.read(take)
         except OSError:
             continue
-        out += data; n += 1
-    return bytes(out), n
+        if data: starts.append(len(out)); out += data; n += 1
+    return bytes(out), starts, n
 
 def codecs(level):
     """The coders at one --level, exactly as 'vfa c --format vfa2 --method cm --level N' runs them."""
@@ -104,12 +105,12 @@ def codecs(level):
                            lambda e, n, r: zs.ZstdDecompressor().decompress(e, max_output_size=n))
     return out
 
-def route(piece):
-    """The filter 'vfa c --format vfa2' would choose for this piece (vfa2.route, as for vulp-lz and vulp-cm), applied.
-    Returns ((fid, fparams, filtered), seconds)."""
+def route(piece, bounds):
+    """The filter 'vfa c --format vfa2' would choose for this piece (vfa2.route with the files' boundaries, as the
+    writer passes them, so mixed files can get a segmented filter), applied. Returns ((fid, fparams, filtered), s)."""
     import vfa2
     t = time.perf_counter()
-    fid, fp, _ = vfa2.route(piece, None, vfa2.CODER_LZ)
+    fid, fp, _ = vfa2.route(piece, bounds, vfa2.CODER_LZ)
     fparams, data = vfa2.FILTERS[fid].encode(piece, fp)
     return (fid, fparams, data), time.perf_counter() - t
 
@@ -138,18 +139,21 @@ def main():
     cods = codecs(a.level)
     rows = []
     for k, (sel, nfiles, total) in picked.items():
-        blob, nread = read_blob(sel)
+        blob, starts, nread = read_blob(sel)
         if not blob: continue
         res = {}
-        pieces = [blob[off:off + PIECE] for off in range(0, len(blob), PIECE)]
-        routed = [route(pc) for pc in pieces]            # filter choice + filtering count as vulp encode time
+        pieces, routed = [], []
+        for off in range(0, len(blob), PIECE):         # filter choice + filtering count as vulp encode time
+            pc = blob[off:off + PIECE]
+            cuts = sorted({0} | {s - off for s in starts if off < s < off + len(pc)}) + [len(pc)]
+            pieces.append(pc); routed.append(route(pc, [(a, b - a) for a, b in zip(cuts, cuts[1:]) if b > a]))
         for name, (filtered, enc, dec) in cods.items():
             sizes = []; te = td = 0.0; ok = True; decoded = 0
             for piece, (r, rt) in zip(pieces, routed):
                 t = time.perf_counter(); e = enc(piece, r); te += time.perf_counter() - t + (rt if filtered else 0)
-                if e is None: sizes.append(len(piece)); continue    # would not shrink: VFA stores it
+                if e is None or len(e) >= len(piece): sizes.append(len(piece)); continue   # VFA stores it
                 t = time.perf_counter(); back = dec(e, len(piece), r); td += time.perf_counter() - t
-                ok &= back == piece; sizes.append(min(len(e), len(piece))); decoded += len(piece)
+                ok &= back == piece; sizes.append(len(e)); decoded += len(piece)
             size = sum(sizes)
             res[name] = (size, te, td, ok, sizes, decoded)
             print(f"  {k:17} {name:11} {len(blob) >> 20:5} MB -> {size / len(blob):.4f}  "

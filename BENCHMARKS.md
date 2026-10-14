@@ -877,3 +877,74 @@ VFA rows include Python interpreter start-up (~0.3-1 s per run); on small inputs
   drive), outside VFA. The argon2 import was VFA's: it ran on every `vfa x`, and in the SFX stub, though only
   encrypted archives use it. Since this change, cryptography and argon2 load on first use (`vfa_extract._crypto`,
   `_argon2`). Expected saving is about 0.18 s per run on that machine; not yet re-measured on Windows.
+
+## 2026-10-14 06:53 M5 vulp-cm, Linux
+
+Machine: Linux-6.18.44-fc-v114-x86_64-with-glibc2.39, x86_64, 4 logical CPUs. Tools: python 3.13.16; xz xz (XZ Utils) 5.4.5; zstd *** Zstandard CLI (64-bit) v1.5.5, by Yann Collet ***; 7z 7-Zip 23.01 (x64) : Copyright (c) 1999-2023 Igor Pavlov : 2023-06-20; python-zstandard 0.25.0
+
+Ratio = compressed / original (lower is better). MB/s are of original data. RSS = peak resident memory of the process. Stub = size of the self-extractor the format needs ("-" = none exists for that tool).
+
+### licenses.txt (303,076 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa2-lz9-solid | 0.1540 | 46,659 | 1.1 | 3.1 | 31.2 MiB | 24.9 MiB | - | ok |
+| vfa2-cm-solid | 0.1125 | 34,086 | 0.5 | 0.5 | 81.1 MiB | 78.1 MiB | - | ok |
+| vfa2-cm9-solid | 0.1123 (best) | 34,042 | 0.3 | 0.4 | 214.2 MiB | 213.5 MiB | - | ok |
+| xz-9e | 0.1443 | 43,736 | 2.8 | 51.7 | 31.0 MiB | 2.3 MiB | - | ok |
+| zstd-ultra22 | 0.1489 | 45,115 | 0.6 | 60.7 | 651.8 MiB | 2.9 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.1446 | 43,812 | 5.3 | 33.6 | 14.3 MiB | 5.8 MiB | - | ok |
+
+### repo.txt (623,371 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa2-lz9-solid | 0.2428 | 151,371 | 1.5 | 6.4 | 33.2 MiB | 25.5 MiB | - | ok |
+| vfa2-cm-solid | 0.1843 | 114,891 | 0.5 | 0.6 | 82.0 MiB | 79.6 MiB | - | ok |
+| vfa2-cm9-solid | 0.1840 (best) | 114,694 | 0.4 | 0.5 | 225.1 MiB | 223.9 MiB | - | ok |
+| xz-9e | 0.2291 | 142,808 | 2.1 | 53.0 | 62.2 MiB | 2.7 MiB | - | ok |
+| zstd-ultra22 | 0.2349 | 146,403 | 1.0 | 117.6 | 652.7 MiB | 3.4 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.2291 | 142,791 | 7.1 | 42.5 | 18.1 MiB | 6.2 MiB | - | ok |
+
+### stdlib.txt (4,590,540 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa2-lz9-solid | 0.2047 | 939,759 | 1.0 | 36.4 | 58.0 MiB | 34.0 MiB | - | ok |
+| vfa2-cm-solid | 0.1494 | 685,901 | 0.6 | 0.7 | 88.4 MiB | 83.9 MiB | - | ok |
+| vfa2-cm9-solid | 0.1485 (best) | 681,567 | 0.3 | 0.5 | 233.1 MiB | 228.8 MiB | - | ok |
+| xz-9e | 0.1913 | 878,068 | 1.5 | 81.5 | 104.5 MiB | 6.4 MiB | - | ok |
+| zstd-ultra22 | 0.1952 | 895,882 | 1.4 | 298.8 | 657.3 MiB | 7.8 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.1915 | 879,090 | 3.4 | 55.7 | 66.3 MiB | 10.6 MiB | - | ok |
+
+### sample (41,430,058 bytes)
+
+| tool | ratio | compressed | comp MB/s | decomp MB/s | RSS comp | RSS decomp | stub | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| vfa2-lz9-solid | 0.3981 | 16,494,918 | 3.5 | 102.4 | 128.0 MiB | 114.7 MiB | - | ok |
+| vfa2-cm-solid | 0.3970 | 16,449,447 | 1.0 | 0.9 | 137.2 MiB | 114.4 MiB | - | ok |
+| vfa2-cm9-solid | 0.3970 (best) | 16,447,439 | 0.7 | 0.8 | 292.6 MiB | 268.7 MiB | - | ok |
+| xz-9e | 0.3975 | 16,466,920 | 2.6 | 127.6 | 422.5 MiB | 41.5 MiB | - | ok |
+| zstd-ultra22 | 0.3975 | 16,469,958 | 8.2 | 827.4 | 707.9 MiB | 43.0 MiB | - | ok |
+| 7z-lzma2-mx9 | 0.4488 | 18,595,617 | 6.8 | 117.4 | 390.2 MiB | 56.8 MiB | - | ok |
+
+VFA rows include Python interpreter start-up (~0.3-1 s per run); on small inputs that dominates MB/s.
+
+Text sets: licenses.txt = /usr/share/common-licenses concatenated; repo.txt = this repo's *.py + *.md; stdlib.txt = 155
+Python 3.13 stdlib .py files concatenated (the same inputs as the M4.1 table above). vfa2-cm = `--method cm` (level 5,
+2^22 tables), vfa2-cm9 = `--method cm --level 9` (2^24 tables).
+
+### M5: what vulp-cm buys (measured)
+
+- **Text and code:** 20–23% smaller than xz -9e (licenses 34,086 vs 43,736; repo 114,891 vs 142,808; stdlib 685,901 vs
+  878,068) and 27% smaller than vulp-lz -9. That closes the M4 gap to xz and passes it by a wide margin. Level 9's
+  bigger tables add only 0.1–0.6%, for 2.6× the memory.
+- **sample\ (mostly compressed installers):** 0.3970, the smallest of all tools (xz -9e 0.3975), because the writer
+  keeps vulp-cm only for chunks where it beats vulp-lz. Here that gain is 0.3%, and it costs the whole archive's
+  decode speed: 0.9 MB/s instead of 102 MB/s. A minimum-gain rule (keep CM only if it saves, say, 1%) would avoid
+  that trade on data like this. That is a policy choice, not a format change.
+- **Cost:** about 0.5–1 MB/s to compress *and* to decompress (CM decodes by running the same model), and 80–90 MiB
+  peak RSS at the default level (210–290 MiB at level 9). It is opt-in: `vfa c --format vfa2` still defaults to vulp-lz.
+- **Determinism:** vulp-cm is in the cross-compiler digest. gcc and clang at -O0, -O3 and -O3 -march=native
+  -ffast-math give identical output, it matches the _vulp extension, and the pure-Python reference agrees bit for
+  bit. MSVC: not yet run.

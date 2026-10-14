@@ -486,8 +486,13 @@ class Writer2:
             if coder == CODER_CM:     # opt-in slow coder: keep it only where it beats vulp-lz (decodes ~100x faster)
                 lp, lpay = _lz_encode(fdata, self.level)
                 cm_size = len(payload) if payload is not None else None
-                if lpay is not None and (payload is None or len(lpay) <= len(payload)):
+                # compare what each choice writes: payload + params (vulp-cm's 2 coder bytes, and the 2-byte
+                # filter-params length that any params need); ties go to vulp-lz
+                def written(cp, pay): return len(pay) + (2 + len(fparams) + len(cp) if (fparams or cp) else 0)
+                if lpay is not None and (payload is None or written(lp, lpay) <= written(cparams, payload)):
                     coder, cparams, payload = CODER_LZ, lp, lpay
+                elif payload is not None and written(cparams, payload) >= len(raw):
+                    payload = None                  # the params would eat the gain: store the chunk
                 info = dict(info or {})
                 info["why"] = (info.get("why", "") + f"; vulp-cm {cm_size if cm_size is not None else 'no gain'} B, vulp-lz "
                                f"{len(lpay) if lpay is not None else 'no gain'} B: kept {CODERS[coder].name}").lstrip("; ")
