@@ -283,10 +283,15 @@ def make_installer(folder, tool, sfi_stub, out_file, version):
         cmd += ["--shortcut", f"startmenu:{folder.name}{exe}:{title}"]
     run(cmd)
     payload.unlink()
+    # it must actually start: a payload holding a PyInstaller program once made the stub's launcher fail
+    r = subprocess.run([str(out_file), "--info"], capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise SystemExit(f"[build] {out_file.name} --info failed (exit {r.returncode}):\n{(r.stdout + r.stderr)[-1500:]}")
+    print(f"[build] {out_file.name} --info: OK")
     return out_file
 
 def build_matrix(out, version, icon_path, debug=False):
-    out = pathlib.Path(out); made = []
+    out = pathlib.Path(out).resolve(); made = []
     for d in ("portable", "install", "archives", "installers"): (out / d).mkdir(parents=True, exist_ok=True)
     consoles = (True, False) if not is_linux() else (True,)
     if is_linux(): print("[build] Linux: no windowless variants (a Linux binary never opens a console window)")
@@ -337,7 +342,7 @@ def main():
     icon_path = ROOT / args.icon if args.icon else None
     if args.matrix:
         from vfa_version import __version__ as version
-        out = pathlib.Path(args.out) if args.out else ROOT / "release" / version / os_tag()
+        out = (pathlib.Path(args.out) if args.out else ROOT / "release" / version / os_tag()).resolve()
         made = build_matrix(out, version, icon_path, debug=args.debug)
         print(f"\n[build] {len(made)} artifact(s) in {out}")
         for m in made: print("   ", m.relative_to(out))

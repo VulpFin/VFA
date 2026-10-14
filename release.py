@@ -83,12 +83,13 @@ def run_tests(py, mode):
 
 def build_wheel(py, pypi):
     """Wheel for this Python into release/<ver>/pypi (Linux: repaired to manylinux by auditwheel)."""
-    tmp = ROOT / "build" / "wheels" / f"{OS_TAG}-{pathlib.Path(py).parent.parent.name}"
+    tmp = ROOT / "build" / "wheels" / pathlib.Path(py).parent.parent.name
     shutil.rmtree(tmp, ignore_errors=True); tmp.mkdir(parents=True)
     run([py, "-m", "pip", "wheel", ROOT, "--no-deps", "--no-build-isolation", "-w", tmp], cwd=ROOT)
     whl = next(tmp.glob("*.whl"))
     if IS_LINUX:
-        run([py, "-m", "auditwheel", "repair", whl, "-w", pypi])
+        env = dict(os.environ, PATH=str(pathlib.Path(py).parent) + os.pathsep + os.environ.get("PATH", ""))  # patchelf
+        run([py, "-m", "auditwheel", "repair", whl, "-w", pypi], env=env)
         return max(pypi.glob(whl.name.split("-linux_")[0] + "-*manylinux*.whl"), key=lambda p: p.stat().st_mtime)
     dst = pypi / whl.name; shutil.copy2(whl, dst)
     return dst
@@ -121,7 +122,8 @@ def main(argv=None):
                 ok_all &= ok
             if not a.no_wheels: row["wheel"] = build_wheel(py, pypi).name
             if ver == a.exe_python and not a.no_exes:
-                if not a.no_wheels: run([py, "-m", "build", "--sdist", "--no-isolation", "--outdir", pypi, ROOT], cwd=ROOT)
+                if not a.no_wheels:   # not from ROOT: "-m build" would find this repo's build.py first
+                    run([py, "-m", "build", "--sdist", "--no-isolation", "--outdir", pypi, ROOT], cwd=pypi)
                 run([py, ROOT / "build.py", "--matrix", "--out", OUT / OS_TAG], cwd=ROOT)
                 row["exes"] = f"release/{VERSION}/{OS_TAG}"
         except Exception as e:

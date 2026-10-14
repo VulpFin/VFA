@@ -45,6 +45,38 @@ python3 build.py
 python3 build.py --debug --name-suffix _beta
 ```
 
+### Releases (all platforms, all Python versions)
+
+`release.py` builds and tests a whole release into `release/<version>/` (version: `vfa_version.py`):
+
+```bash
+python release.py           # this OS
+python release.py --wsl     # Windows: then the same again inside WSL, for Linux
+```
+
+For each Python (3.10, 3.12, 3.13, 3.14 by default; `--pythons`), it:
+- creates a build environment in `.buildenv/` on first use;
+- builds the C codec;
+- runs `test_vfa.py --quick` (`--tests full|none`);
+- builds a wheel for the `vfvfa` PyPI package. Linux wheels are repaired to manylinux.
+
+With Python 3.13 (`--exe-python`), it then builds the executables:
+
+| folder | contents |
+|---|---|
+| `portable/` | single-file `vfa`, `vfa_viewer`, `vfa_sfx`, `vfa_sfi`, each also `-windowless` (Windows) |
+| `install/` | folder builds of `vfa` and `vfa_viewer` (faster start: nothing to unpack), console and windowless |
+| `archives/` | each folder build as `.zip` (Windows) / `.tar.gz` (Linux) |
+| `installers/` | each folder build as a VFA self-finishing installer (checked to start with `--info`) |
+| `pypi/` | wheels for every OS and Python, plus the sdist (upload with `twine upload release/<version>/pypi/*`) |
+
+Results per OS: `release/<version>/RESULTS-<os>.md`. Python versions come from the `py` launcher on Windows, and from
+`pythonX.Y` on PATH or [uv](https://docs.astral.sh/uv/) elsewhere. With `--wsl`, WSL needs a `python3` and either the
+Python versions or uv. A mapped network drive must first be mounted in WSL (`sudo mount -t drvfs U: /mnt/u`).
+
+To pack your own SFX or installer, use `pack_sfi.py` (`--sfx` for a plain SFX) rather than `copy /b` when the payload
+contains a PyInstaller program. It appends a copy of the stub's PyInstaller cookie, so the stub still starts.
+
 ---
 
 ## Current Features
