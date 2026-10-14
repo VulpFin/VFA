@@ -4,8 +4,13 @@
 # Requires: cryptography, zstandard, brotli (depending on methods used in your archives)
 
 import os, io, sys, struct, time, json, stat, hashlib
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+try:                                          # optional until the window opens: --version works without Tk
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    _TK_PROBLEM = None
+except ImportError as _e:                     # e.g. a headless Linux without the python3-tk package
+    tk = ttk = filedialog = messagebox = None
+    _TK_PROBLEM = _e
 
 from vfa_version import __version__, version_text, show
 import vfa_extract as vx                      # the shared, validated reader (also used by vfa.py and the stubs)
@@ -50,7 +55,7 @@ class VFAArchive:
         # a selected directory brings everything below it; every path is validated before writing
         self._c.extract(outdir, members=selected_paths)
 
-class Viewer(ttk.Frame):
+class Viewer(ttk.Frame if ttk else object):
     def __init__(self, master):
         super().__init__(master)
         self.pack(fill="both", expand=True)
@@ -222,6 +227,10 @@ class Viewer(ttk.Frame):
 def main():
     if sys.argv[1:2] in (["--version"], ["-V"]):
         show(version_text("vfa-viewer"), "VFA Viewer"); return
+    if tk is None:
+        show(f"vfa-viewer needs Tk, which this Python does not have ({_TK_PROBLEM}). On Linux install it with your "
+             "package manager (e.g. python3-tk).", "VFA Viewer")
+        raise SystemExit(1)
     root = tk.Tk()
     root.geometry("900x520")
     app = Viewer(root)

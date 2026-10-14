@@ -91,17 +91,27 @@ def codecs(level):
     level_cm = vfa2.cm_bits(level)
     try: import zstandard as zs
     except Exception: zs = None
-    filt = lambda d, k: C.filter_fwd(3, b"", d) if k == "executable" else d      # what VFA's router picks for x86 code
-    unf = lambda d, k: C.filter_inv(3, b"", d) if k == "executable" else d
+    # vulp codecs see the piece through the filter VFA's own router picked for it (r = (fid, fparams, filtered));
+    # xz and zstd get the raw bytes
+    unf = lambda r, d, n: vfa2.FILTERS[r[0]].decode(r[1], d, n)
     out = {
-        "vulp-lz": (lambda d, k: C.lz_encode(filt(d, k), level), lambda e, n, k: unf(C.lz_decode(e, n), k)),
-        "vulp-cm": (lambda d, k: C.cm_encode(filt(d, k), level_cm), lambda e, n, k: unf(C.cm_decode(e, n, level_cm), k)),
-        "xz -9e": (lambda d, k: lzma.compress(d, preset=9 | lzma.PRESET_EXTREME), lambda e, n, k: lzma.decompress(e)),
+        "vulp-lz": (True, lambda d, r: C.lz_encode(r[2], level), lambda e, n, r: unf(r, C.lz_decode(e, n), n)),
+        "vulp-cm": (True, lambda d, r: C.cm_encode(r[2], level_cm), lambda e, n, r: unf(r, C.cm_decode(e, n, level_cm), n)),
+        "xz -9e": (False, lambda d, r: lzma.compress(d, preset=9 | lzma.PRESET_EXTREME), lambda e, n, r: lzma.decompress(e)),
     }
     if zs:
-        out["zstd -19"] = (lambda d, k: zs.ZstdCompressor(level=19).compress(d),
-                           lambda e, n, k: zs.ZstdDecompressor().decompress(e, max_output_size=n))
+        out["zstd -19"] = (False, lambda d, r: zs.ZstdCompressor(level=19).compress(d),
+                           lambda e, n, r: zs.ZstdDecompressor().decompress(e, max_output_size=n))
     return out
+
+def route(piece):
+    """The filter 'vfa c --format vfa2' would choose for this piece (vfa2.route, as for vulp-lz and vulp-cm), applied.
+    Returns ((fid, fparams, filtered), seconds)."""
+    import vfa2
+    t = time.perf_counter()
+    fid, fp, _ = vfa2.route(piece, None, vfa2.CODER_LZ)
+    fparams, data = vfa2.FILTERS[fid].encode(piece, fp)
+    return (fid, fparams, data), time.perf_counter() - t
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -131,13 +141,14 @@ def main():
         blob, nread = read_blob(sel)
         if not blob: continue
         res = {}
-        for name, (enc, dec) in cods.items():
+        pieces = [blob[off:off + PIECE] for off in range(0, len(blob), PIECE)]
+        routed = [route(pc) for pc in pieces]            # filter choice + filtering count as vulp encode time
+        for name, (filtered, enc, dec) in cods.items():
             sizes = []; te = td = 0.0; ok = True; decoded = 0
-            for off in range(0, len(blob), PIECE):
-                piece = blob[off:off + PIECE]
-                t = time.perf_counter(); e = enc(piece, k); te += time.perf_counter() - t
+            for piece, (r, rt) in zip(pieces, routed):
+                t = time.perf_counter(); e = enc(piece, r); te += time.perf_counter() - t + (rt if filtered else 0)
                 if e is None: sizes.append(len(piece)); continue    # would not shrink: VFA stores it
-                t = time.perf_counter(); back = dec(e, len(piece), k); td += time.perf_counter() - t
+                t = time.perf_counter(); back = dec(e, len(piece), r); td += time.perf_counter() - t
                 ok &= back == piece; sizes.append(min(len(e), len(piece))); decoded += len(piece)
             size = sum(sizes)
             res[name] = (size, te, td, ok, sizes, decoded)
@@ -159,8 +170,9 @@ def write(path, rows, secs, a):
              f"sample up to {a.budget_mb} MB per kind, files capped at {a.max_file_mb} MB, --level {a.level}; "
              f"{secs / 60:.0f} min. Only totals: no names or contents.", "",
              "Ratio = compressed / original (lower is better); 'vfa --method cm' keeps the smaller of vulp-lz and vulp-cm "
-             "per 64 MiB piece. MB/s = compress / decompress (decompress counts only pieces that were compressed; '-' = all stored). Executables get VFA's bcj-x86 filter before vulp-lz and "
-             "vulp-cm (as VFA's router would pick); xz and zstd see them unfiltered.", "",
+             "per 64 MiB piece. MB/s = compress / decompress (decompress counts only pieces that were compressed; '-' = all stored). vulp-lz "
+             "and vulp-cm see each piece through the filter VFA's own router picks for it (none, delta, bcj-x86, ...); "
+             "xz and zstd see the raw bytes.", "",
              "| kind | files found | found GB | sampled MB | " + " | ".join(names) + " | VFA cm (best of lz, cm) | vs xz |",
              "|---|---:|---:|---:|" + "---:|" * len(names) + "---:|---:|"]
     for k, nfiles, total, nread, n, res in rows:
