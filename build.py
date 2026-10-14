@@ -26,6 +26,7 @@ Usage:
   python build.py --debug           # PyInstaller debug build (bigger)
   python build.py --name-suffix _x  # append suffix to output names
   python build.py --noconsole-sfx   # build sfx without console window
+  python build.py --matrix          # full release set for this OS (see build_matrix; release.py drives it)
 """
 
 import argparse, os, sys, shutil, subprocess, pathlib, platform
@@ -221,6 +222,98 @@ def check_build_deps():
             "        Use your venv (e.g. venv\\Scripts\\python build.py) or: pip install -r requirements.txt\n"
             "        Building anyway would produce executables that fail at runtime.")
 
+# ---------------------------------------------------------------- release matrix (--matrix; driven by release.py)
+#
+# Per OS, into <out>/:
+#   portable/<tool>[-windowless][.exe]      single-file builds of all four tools (unpack to a temp dir on each run)
+#   install/<tool>[-windowless]/            folder builds of vfa and vfa_viewer (start faster: nothing to unpack)
+#   archives/<tool>[-windowless]-<ver>-<os>-<arch>.zip|.tar.gz   each folder build, zipped
+#   installers/<tool>[-windowless]-<ver>-<os>-<arch>-setup[.exe] each folder build as a VFA self-finishing installer
+# The SFX/SFI stubs are portable only: a payload is appended to a single file, which a folder build cannot carry.
+# "Windowless" (PyInstaller --noconsole) only means something on Windows and macOS; Linux builds skip it.
+
+TOOLS = {
+    "vfa":        {"entry": "vfa.py", "install": True, "extra": []},
+    "vfa_viewer": {"entry": "vfa_viewer.py", "install": True, "extra": ["--hidden-import", "tkinter"]},
+    "vfa_sfx":    {"entry": "sfx_stub.py", "install": False, "extra": []},
+    "vfa_sfi":    {"entry": "sfi_stub.py", "install": False,
+                   "extra": ["--hidden-import", "sfi_gui", "--hidden-import", "tkinter"]},
+}
+
+def os_tag():
+    return "windows" if is_windows() else "linux" if is_linux() else "macos"
+
+def arch_tag():
+    m = platform.machine().lower()
+    return {"amd64": "x64", "x86_64": "x64", "aarch64": "arm64"}.get(m, m)
+
+def pyi_build(tool, onedir, console, icon_path, debug=False):
+    """One PyInstaller run; returns the produced file (onefile) or folder (onedir). Each OS gets its own
+    work/dist folders, so a Windows build and a WSL build of the same checkout never share state."""
+    spec = TOOLS[tool]; name = tool + ("" if console else "-windowless")
+    base = ROOT / "build" / "pyi" / os_tag()
+    args = PYI + base_pyinstaller_args(debug=debug)
+    if onedir: args[args.index("--onefile")] = "--onedir"
+    if "--noconfirm" not in args: args.append("--noconfirm")   # --debug omits it; onefile and onedir share dist names
+    args += ["--paths", str(ROOT), *spec["extra"], "-n", name,
+             "--distpath", str(base / "dist"), "--workpath", str(base / "work"), "--specpath", str(base / "spec")]
+    if not console: args += ["--noconsole"]
+    if icon_path and is_windows() and exists(icon_path): args += ["--icon", str(icon_path)]
+    run(args + [str(ROOT / spec["entry"])])
+    return base / "dist" / (name if onedir else name + (".exe" if is_windows() else ""))
+
+def pack_folder(folder, out_base):
+    """folder -> .zip on Windows, .tar.gz elsewhere (the folder's contents at the archive root, under its name)."""
+    fmt = "zip" if is_windows() else "gztar"
+    return pathlib.Path(shutil.make_archive(str(out_base), fmt, root_dir=str(folder.parent), base_dir=folder.name))
+
+def make_installer(folder, tool, sfi_stub, out_file, version):
+    """Folder build -> VFA2 archive (made by this checkout's vfa.py) -> pack_sfi with the portable SFI stub."""
+    payload = ROOT / "build" / "pyi" / os_tag() / f"{folder.name}.payload.vfa"
+    names = sorted(p.name for p in folder.iterdir())
+    run([sys.executable, str(ROOT / "vfa.py"), "c", str(payload), *names, "--format", "vfa2", "--solid"], cwd=str(folder))
+    exe = ".exe" if is_windows() else ""
+    title = {"vfa": "VFA", "vfa_viewer": "VFA Viewer"}[tool]
+    cmd = [sys.executable, str(ROOT / "pack_sfi.py"), "--stub", str(sfi_stub), "--archive", str(payload),
+           "-o", str(out_file), "--name", title + (" (windowless)" if folder.name.endswith("-windowless") else ""),
+           "--version", version, "--publisher", "TG11", "--license-file", str(ROOT / "LICENSE"),
+           "--description", "VulpFin Archive tools" if tool == "vfa" else "VulpFin Archive viewer"]
+    if tool == "vfa":
+        cmd += ["--path-add", "."] if is_windows() else ["--bin-link", f"vfa:{folder.name}{exe}"]
+    elif is_macos():      # the SFI stub creates no Start-menu entries on macOS: give the viewer a command instead
+        cmd += ["--bin-link", f"vfa-viewer:{folder.name}"]
+    else:
+        cmd += ["--shortcut", f"startmenu:{folder.name}{exe}:{title}"]
+    run(cmd)
+    payload.unlink()
+    # it must actually start: a payload holding a PyInstaller program once made the stub's launcher fail
+    r = subprocess.run([str(out_file), "--info"], capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise SystemExit(f"[build] {out_file.name} --info failed (exit {r.returncode}):\n{(r.stdout + r.stderr)[-1500:]}")
+    print(f"[build] {out_file.name} --info: OK")
+    return out_file
+
+def build_matrix(out, version, icon_path, debug=False):
+    out = pathlib.Path(out).resolve(); made = []
+    for d in ("portable", "install", "archives", "installers"): (out / d).mkdir(parents=True, exist_ok=True)
+    consoles = (True, False) if not is_linux() else (True,)
+    if is_linux(): print("[build] Linux: no windowless variants (a Linux binary never opens a console window)")
+    exe = ".exe" if is_windows() else ""; tag = f"{version}-{os_tag()}-{arch_tag()}"
+    for tool in TOOLS:
+        for console in consoles:
+            src = pyi_build(tool, onedir=False, console=console, icon_path=icon_path, debug=debug)
+            dst = out / "portable" / src.name; shutil.copy2(src, dst); made.append(dst)
+    sfi_stub = out / "portable" / f"vfa_sfi{exe}"
+    for tool in (t for t, spec in TOOLS.items() if spec["install"]):
+        for console in consoles:
+            src = pyi_build(tool, onedir=True, console=console, icon_path=icon_path, debug=debug)
+            dst = out / "install" / src.name
+            if dst.exists(): shutil.rmtree(dst)
+            shutil.copytree(src, dst); made.append(dst)
+            made.append(pack_folder(dst, out / "archives" / f"{src.name}-{tag}"))
+            made.append(make_installer(dst, tool, sfi_stub, out / "installers" / f"{src.name}-{tag}-setup{exe}", version))
+    return made
+
 def main():
     ap = argparse.ArgumentParser(description="Build VFA and SFX with PyInstaller")
     ap.add_argument("--no-clean", action="store_true", help="Do not clean build/dist before building")
@@ -233,6 +326,10 @@ def main():
     ap.add_argument("--noconsole-viewer", action="store_true", help="Build SFX without console on Windows")
     ap.add_argument("--no-vulp", action="store_true",
                     help="Do not (re)build the _vulp C extension (VFA2 then decodes with the slow pure-Python reference)")
+    ap.add_argument("--matrix", action="store_true",
+                    help="Release set for this OS: portable + windowless + install folders, archives and installers "
+                         "(see build_matrix; release.py runs this per OS)")
+    ap.add_argument("--out", help="--matrix output folder (default release/<version>/<os>)")
     args = ap.parse_args()
 
     check_build_deps()
@@ -245,10 +342,17 @@ def main():
         build_vulp.check()
         print(f"[build] _vulp: {', '.join(f'{b.name} ({b.stat().st_size // 1024} KiB)' for b in built)}")
 
+    icon_path = ROOT / args.icon if args.icon else None
+    if args.matrix:
+        from vfa_version import __version__ as version
+        out = (pathlib.Path(args.out) if args.out else ROOT / "release" / version / os_tag()).resolve()
+        made = build_matrix(out, version, icon_path, debug=args.debug)
+        print(f"\n[build] {len(made)} artifact(s) in {out}")
+        for m in made: print("   ", m.relative_to(out))
+        return
+
     if not args.no_clean:
         clean()
-
-    icon_path = ROOT / args.icon if args.icon else None
 
     # Build main CLI
     build_vfa(debug=args.debug, name_suffix=args.name_suffix, icon_path=icon_path)

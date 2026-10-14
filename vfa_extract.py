@@ -442,7 +442,21 @@ class _FileView:
         self._f.seek(self._base + k); return self._f.read(1)[0]
     def release(self): pass
 
+PYI_MAGIC = b"MEI\x0c\x0b\x0a\x0b\x0e"; PYI_COOKIE_LEN = 88    # see pack_sfi.pyi_trailer
+
 def effective_end(buf, size: int) -> int:
+    """Where the archive's footer ends: the end of the file, before an Authenticode certificate table if the
+    executable was signed, and before a PyInstaller cookie copy that pack_sfi puts after the archive."""
+    end = _authenticode_end(buf, size)
+    try:
+        c = end - PYI_COOKIE_LEN
+        if c >= 5 and bytes(buf[c:c + 8]) == PYI_MAGIC and bytes(buf[c - 5:c]) in (b"/VFA1", b"/VFA2"):
+            return c
+    except Exception:
+        pass
+    return end
+
+def _authenticode_end(buf, size: int) -> int:
     """Where the archive's footer ends. Normally the end of the file - but `signtool sign` on a stub+archive
     appends an Authenticode certificate table after it (recorded in the PE security directory, padded to 8 bytes).
     Then the footer ends where that table starts, minus up to 7 zero padding bytes."""
@@ -459,6 +473,7 @@ def effective_end(buf, size: int) -> int:
         end = cert_off
         for _ in range(7):                      # signtool's alignment padding
             if bytes(buf[end - 5:end - 1]) == b"/VFA" or buf[end - 1] != 0: break
+            if bytes(buf[end - PYI_COOKIE_LEN:end - PYI_COOKIE_LEN + 8]) == PYI_MAGIC: break   # ends in a cookie copy
             end -= 1
         LOGGER.debug(f"Authenticode certificate table at {cert_off}; archive ends at {end}")
         return end

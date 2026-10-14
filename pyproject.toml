@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vfvfa"
+dynamic = ["version"]
+description = "VFA (VulpFin Archive): archiver with a deterministic integer-only codec (vulp-lz), dedup and encryption"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "TG11" }]
+requires-python = ">=3.10"
+dependencies = [
+    "zstandard>=0.22.0",
+    "brotli>=1.1.0",
+    "cryptography>=42.0.0",
+    "argon2-cffi>=23.1.0",
+    "lz4>=4.0.0",
+    "xxhash>=3.0.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Archiving :: Compression",
+]
+
+[project.urls]
+Homepage = "https://github.com/VulpFin/VFA"
+
+[project.scripts]
+vfa = "vfa:main"
+
+[project.gui-scripts]
+vfa-viewer = "vfa_viewer:main"
+
+[tool.setuptools]
+py-modules = ["vfa", "vfa_extract", "vfa2", "vulp_ref", "vfa_viewer", "vfa_version"]
+
+[tool.setuptools.dynamic]
+version = { attr = "vfa_version.__version__" }

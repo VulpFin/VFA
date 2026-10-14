@@ -732,6 +732,37 @@ def t2_sfx(work, corpus):
         c.unlock(None)
         check("vfa2 SFI container: pack_sfi accepts VFA2, manifest found, archive reads",
               r.returncode == 0 and (c.manifest or {}).get("name") == "T" and c.verify_digest() is True, r.stderr[-300:])
+    # a PyInstaller stub finds its own data by searching backwards for its cookie; a payload holding a PyInstaller
+    # program has that cookie inside it, so pack_sfi appends a re-based copy of the stub's cookie after the archive
+    import pack_sfi as PS
+    pkg = os.urandom(3000); cookie = struct.pack("!8sIIII64s", PS.PYI_MAGIC, len(pkg) + 88, 100, 50, 313, b"libpython3.13.so")
+    pstub = work / "v2pyi_stub.exe"; pstub.write_bytes(b"MZ" + os.urandom(2000) + pkg + cookie + os.urandom(300))
+    stub_pkg_start = 2 + 2000
+    src = work / "v2pyi_src" / "app"; shutil.rmtree(src.parent, ignore_errors=True); src.mkdir(parents=True)
+    (src / "inner.exe").write_bytes(os.urandom(4000) + PS.PYI_MAGIC + os.urandom(80) + os.urandom(4000))
+    parc = work / "v2pyi.vfa"; vfa("c", parc, "app", "--format", "vfa2", "--method", "stored", cwd=src.parent)
+    for mode in ("sfi", "sfx"):
+        outf = work / f"v2pyi_{mode}.exe"
+        r = subprocess.run([PY, str(HERE / "pack_sfi.py"), "--stub", str(pstub), "--archive", str(parc), "-o", str(outf),
+                            *(["--sfx"] if mode == "sfx" else ["--name", "T"])], capture_output=True, text=True)
+        data = outf.read_bytes(); last = data.rfind(PS.PYI_MAGIC)
+        (plen,) = struct.unpack(">I", data[last + 8:last + 12])
+        ok_trailer = r.returncode == 0 and last == len(data) - 88 and last + 88 - plen == stub_pkg_start
+        ex = work / f"v2pyi_{mode}_out"; shutil.rmtree(ex, ignore_errors=True)
+        r2 = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(outf), "-o", str(ex)], capture_output=True, text=True)
+        check(f"{mode.upper()} with a PyInstaller program in the payload: the stub's cookie comes last and points at its "
+              f"own data, and the archive still extracts", ok_trailer and r2.returncode == 0
+              and (ex / "app/inner.exe").read_bytes() == (src / "inner.exe").read_bytes(), f"{r.stderr[-200:]} {r2.stderr[-300:]}")
+    # no PyInstaller program in the payload -> no trailer: stub + archive, byte for byte (as copy /b gives)
+    plain = work / "v2pyi_plain.exe"
+    r = subprocess.run([PY, str(HERE / "pack_sfi.py"), "--sfx", "--stub", str(pstub), "--archive", str(arc), "-o", str(plain)],
+                       capture_output=True, text=True)
+    check("SFX without a PyInstaller program in the payload: no trailer (stub + archive, as copy /b)",
+          r.returncode == 0 and plain.read_bytes() == pstub.read_bytes() + arc.read_bytes(), r.stderr[-200:])
+    # a trailer whose 32-bit length cannot reach the stub's data is refused, not written truncated
+    try: PS.pyi_trailer(pstub.read_bytes(), 5 << 30); refused = False
+    except ValueError: refused = True
+    check("pack_sfi refuses a PyInstaller trailer past 4 GiB (its length field is 32-bit)", refused)
     b = bytearray(exe.read_bytes()); b[len(b) // 2] ^= 0x10; exe.write_bytes(bytes(b))
     out2 = work / "v2sfx_out2"; shutil.rmtree(out2, ignore_errors=True)
     r = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(exe), "-o", str(out2)], capture_output=True, text=True)
@@ -753,15 +784,18 @@ def t_signed(work, corpus, fmt):
     if (so, sl) != (0, 0):                          # the interpreter is signed itself: strip that signature first
         if so + sl != len(pe): skip(f"{fmt} Authenticode layout", "cannot strip the test PE's own signature"); return
         pe = pe[:so]; pe[dd + 32:dd + 40] = bytes(8)
-    body = bytes(pe) + arc.read_bytes()
-    pad = (-len(body)) % 8; blob = os.urandom(1500)
-    cert = struct.pack("<IHH", 8 + len(blob), 0x0200, 2) + blob
-    pe[dd + 32:dd + 40] = struct.pack("<II", len(body) + pad, len(cert))
-    signed = work / f"signed_{fmt}.exe"; signed.write_bytes(bytes(pe) + arc.read_bytes() + b"\0" * pad + cert)
-    out = work / f"signed_out_{fmt}"; shutil.rmtree(out, ignore_errors=True)
-    r = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(signed), "-o", str(out)], capture_output=True, text=True)
-    check(f"{fmt}: archive found and verified behind an Authenticode certificate table (pad {pad})",
-          r.returncode == 0 and same_tree(corpus, out / corpus.name)[0], r.stderr[-300:])
+    import pack_sfi as PS
+    for trailer in (b"", struct.pack("!8sIIII64s", PS.PYI_MAGIC, 1, 2, 3, 4, b"lib")):   # + pack_sfi's cookie copy
+        body = bytes(pe) + arc.read_bytes() + trailer
+        pad = (-len(body)) % 8; blob = os.urandom(1500)
+        cert = struct.pack("<IHH", 8 + len(blob), 0x0200, 2) + blob
+        pe[dd + 32:dd + 40] = struct.pack("<II", len(body) + pad, len(cert))
+        signed = work / f"signed_{fmt}.exe"; signed.write_bytes(bytes(pe) + arc.read_bytes() + trailer + b"\0" * pad + cert)
+        out = work / f"signed_out_{fmt}"; shutil.rmtree(out, ignore_errors=True)
+        r = subprocess.run([PY, str(HERE / "sfx_stub.py"), "--from-file", str(signed), "-o", str(out)], capture_output=True, text=True)
+        check(f"{fmt}: archive found and verified behind an Authenticode certificate table (pad {pad})"
+              + (", with pack_sfi's PyInstaller cookie copy before it" if trailer else ""),
+              r.returncode == 0 and same_tree(corpus, out / corpus.name)[0], r.stderr[-300:])
 
 def t2_fuzz(work, n_cases, quick):
     rnd = random.Random(20261012)
