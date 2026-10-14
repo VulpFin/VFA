@@ -179,7 +179,7 @@ def vfa_cm_size(pieces, routed, res):
         def written(payload_len, cparams_len):
             return payload_len + (2 + len(fparams) + cparams_len if (fparams or cparams_len) else 0)
         lz, cm = res["vulp-lz"][4][i], res["vulp-cm"][4][i]
-        lz_w = written(lz, 0) if lz is not None else len(pc)
+        lz_w = min(written(lz, 0), len(pc)) if lz is not None else len(pc)   # never worse than stored
         pick = lz_w
         if cm is not None and written(cm, 2) * 100 <= lz_w * (100 - vfa2.CM_MIN_GAIN_PCT): pick = written(cm, 2)
         total += min(pick, len(pc))

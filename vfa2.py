@@ -492,7 +492,7 @@ class Writer2:
                 # filter-params length that any params need). vulp-cm must write at least CM_MIN_GAIN_PCT % less than
                 # vulp-lz (or than the raw chunk, when vulp-lz cannot shrink it); otherwise vulp-lz is kept
                 def written(cp, pay): return len(pay) + (2 + len(fparams) + len(cp) if (fparams or cp) else 0)
-                lz_w = written(lp, lpay) if lpay is not None else len(raw)
+                lz_w = min(written(lp, lpay), len(raw)) if lpay is not None else len(raw)   # never worse than stored
                 if payload is None or written(cparams, payload) * 100 > lz_w * (100 - CM_MIN_GAIN_PCT):
                     coder, cparams, payload = CODER_LZ, lp, lpay
                 if payload is not None and written(cparams, payload) >= len(raw):
