@@ -1,11 +1,12 @@
-# VFA2 container format: spec revision 3 (milestone M4)
+# VFA2 container format: spec revision 4 (milestone M5)
 
 VFA2 is VFA's chunked container. Revision 1 (M1) defined the container with the single coder `stored`. Revision 2
 (M3) added the `vulp-tans` coder, four filters, the `segmented` filter and the ROUTING record. **Revision 3 (M4) adds
 the `vulp-lz` coder (LZ77 with a local and a long-range match finder, tANS-coded streams) and, in the writer,
-content-defined dedup across chunks.** The container itself is unchanged since revision 1: an older reader opens a
-newer archive and refuses, by name, exactly the chunks whose coder or filter it lacks. Dedup needs no reader
-support at all; it is expressed with ordinary index extents. Context mixing (M5) is still to come.
+content-defined dedup across chunks. Revision 4 (M5) adds the `vulp-cm` coder (bit-wise context mixing), an opt-in
+maximum-compression tier that decodes about 100× slower than vulp-lz.** The container itself is unchanged since
+revision 1: an older reader opens a newer archive and refuses, by name, exactly the chunks whose coder or filter it
+lacks. Dedup needs no reader support at all; it is expressed with ordinary index extents.
 
 - `vfa2.py` implements it: `Writer2` for writing, `Archive2` for reading. The codecs are C (`vulp/vulp.c`, built by
   `build_vulp.py` into the `_vulp` extension); `vulp_ref.py` is an independent pure-Python implementation of the
@@ -92,7 +93,7 @@ Decoding a chunk: decrypt (if encrypted) → coder decode → inverse filter →
 |---|---|---|---|
 | 0 | stored | none | M1: payload = filtered data |
 | 1 | vulp-tans | none | M3: see *vulp-tans* |
-| 2 | vulp-cm | | reserved, M5 |
+| 2 | vulp-cm | u8 model (1), u8 table bits (16..24) | M5: see *vulp-cm*. Opt-in (`--method cm`) |
 | 3 | vulp-lz | none | M4: see *vulp-lz*. The writer's default. |
 
 **Filters** (all size-preserving bijections in this revision: filtered size = `raw_size`):
@@ -115,8 +116,8 @@ and names what is missing (for example "uses coder id 1 (vulp-tans (M3)), which 
 ### Integer-only rule
 
 Every coder and filter (and the writer's classifier) uses integer arithmetic only, so encoding and decoding are
-bit-identical on every compiler, optimisation level and CPU. A future context-mixing coder (M5) is held to the same
-rule: its predictor and mixer are fixed-point. `test_vfa.py --only native,codec` enforces this: source lint (C and
+bit-identical on every compiler, optimisation level and CPU. This includes the context-mixing coder (M5): its
+predictors, mixers and probability maps are fixed-point, and its arithmetic coder works on 32-bit integers. `test_vfa.py --only native,codec` enforces this: source lint (C and
 Python AST), a scan of the compiled code for floating-point instructions, identical output from gcc and clang at
 `-O0`, `-O3` and `-O3 -march=native -ffast-math` (MSVC `/Od` and `/O2` on Windows), and bit-exact agreement between
 the C codec and the pure-Python reference.
@@ -293,6 +294,47 @@ u32 footer CRC32   "/VFA2"
 4. Read the footer; `archive_start = end − archive_len`; the header magic must be there.
 5. An SFI manifest (`[JSON][u32 len]["/VFIM1"]`) may sit immediately before `archive_start`, exactly as in VFA1.
 
+### vulp-cm (coder 2)
+
+Context mixing: every bit of the (filtered) chunk is arithmetic-coded with a probability predicted for that bit
+from what came before it in the chunk. The decoder runs the same model, so it is exactly as slow as the encoder
+(about 0.5–1 MB/s) and needs the same memory. The model starts empty in every chunk.
+
+**Params:** `u8 model`, `u8 table_bits`. Model 1 is the one described here; a reader refuses any other model by
+number. `table_bits` (16..24) sizes the context tables: 9 tables of 2^table_bits bytes, a match table of
+4 · 2^table_bits bytes, plus about 5 MiB of fixed state (about 55 MiB at 22, 220 MiB at 24). Any other length or
+value is refused.
+
+**Payload:** the arithmetic coder's output, then nothing. The coder keeps a 32-bit range `[x1, x2]` (initially
+`[0, 2^32−1]`). For each bit, MSB first in each byte, with `p` = the model's 12-bit probability that the bit is 1
+(1..4095):
+
+```
+xmid = x1 + (x2 − x1 >> 12) · p + ((x2 − x1 & 0xfff) · p >> 12)      (32-bit unsigned)
+bit 1: x2 = xmid        bit 0: x1 = xmid + 1
+while the top bytes of x1 and x2 are equal: emit that byte; x1 <<= 8; x2 = (x2 << 8) | 255
+```
+
+After the last bit the encoder emits the 4 bytes of `x1`, high byte first. The decoder reads 4 bytes into `x`, decides
+`bit = (x <= xmid)`, and shifts in one payload byte wherever the encoder emitted one. A payload that runs out early,
+or has bytes left over at the end, is refused.
+
+**Model 1.** The normative definition is `vulp/vulp_cm.c`; `vulp_ref.py` is a line-by-line transcription, and the
+test harness requires the two to agree bit for bit. In outline:
+- *Context models (9):* hashes of the last 1, 2, 3, 4, 5 and 6 bytes; the current word (letters, case-folded); the
+  current and previous word; the byte above in the previous line together with the column. Each context gets a
+  16-byte bucket per nibble (a check byte, then one bit-history state per bit position in the nibble), found among
+  two neighbouring buckets by its check byte; on a miss the less-used bucket is reset and taken over. A bit history
+  (counts of 0s and 1s, capped at 7, the larger one halving past 2 when the other bit occurs, plus the last bit) is
+  mapped to a probability by a per-model adaptive table.
+- *Order 0* (the partial byte) and a *match model*: the position after the most recent occurrence of the last 6
+  bytes (found by hash, verified backwards, at least 6 bytes) predicts the next bit, with a confidence learned per
+  match length.
+- *Mixing:* the stretched predictions (ln(p/(1−p)) in fixed point) are combined by two single-layer mixers, whose
+  weight sets are chosen by the partial byte and match state, and by the previous byte and bit position. Their
+  average is refined by two adaptive probability maps (contexts: partial byte; partial byte and previous byte).
+  All weights and maps learn after every bit.
+
 ## Writer behaviour (vfa.py / Writer2)
 
 - **Non-solid** (default): each file starts a new chunk; files larger than the chunk size are split.
@@ -309,8 +351,13 @@ u32 footer CRC32   "/VFA2"
   once, and its bytes are written at the right offsets into every file that uses them), so deduplicated files do not
   cost repeated decodes, and extraction holds one decoded chunk at a time. Reading one file on its own (random
   access, the viewer) keeps the last two decoded chunks.
-- **Coder:** `--method lz` (default), `--method tans` or `--method stored`. A chunk that the coder does not make
-  smaller is stored, and the ROUTING record says so.
+- **Coder:** `--method lz` (default), `--method cm`, `--method tans` or `--method stored`. A chunk that the coder does
+  not make smaller is stored, and the ROUTING record says so.
+- **`--method cm`** is the maximum-compression tier. Each chunk is filtered as for vulp-lz, then coded with both
+  vulp-cm and vulp-lz. vulp-cm is kept only if it writes at least 1% less (payload and parameters) than vulp-lz, or
+  than the raw chunk when vulp-lz cannot shrink it; otherwise vulp-lz (about 100× faster to decode) is kept. So text,
+  code and other modelled data get vulp-cm, while already-compressed data stays on vulp-lz or stored. The ROUTING
+  record gives both sizes. `--level` picks the table size: 0–3 → 20 bits, 4–6 → 22 (the default), 7–9 → 24.
 - **Filter:** `--filter auto` (default) or a forced filter (`none`, `delta:N`, `shuffle:K`, `bitshuffle:K`,
   `bcj-x86`, `bcj-arm64`). Auto routing:
   1. The chunk is cut into *units* at file boundaries: a file piece of 256 KiB or more is its own unit (split at
@@ -421,16 +468,19 @@ u32 footer CRC32   "/VFA2"
 | `10e–111` | footer CRC32 |
 | `112–116` | `/VFA2` |
 
-## Known limits of revision 3
+## Known limits of revision 4
 
 - **vulp-lz is a zstd-class coder, not an LZMA-class one.** Its sequences are tANS-coded per stream with no context
-  modelling, so on text it stays a few percent behind xz -9e (see BENCHMARKS.md). The M5 context-mixing tier is
-  where that gap is meant to close.
-- **The `text` filter (id 5) is not implemented.** It will be designed against the M5 context-mixing coder, or
-  dropped if it does not help there.
+  modelling, so on text it stays a few percent behind xz -9e (see BENCHMARKS.md). `--method cm` closes that gap
+  (about 20% below xz -9e on text), at about 1 MB/s in both directions.
+- **vulp-cm decodes as slowly as it encodes**, and needs as much memory (55 MiB at the default table size,
+  220 MiB at `--level 7`+). It never helps already-compressed data (installers, media), which the writer then keeps
+  on vulp-lz.
+- **The `text` filter (id 5) is not implemented.** vulp-cm's word and column models cover what it was meant to do;
+  it stays reserved.
 - **Small or sparse blocks fall back to RAW:** the TANS frequency table is stored densely up to the highest symbol
   present (≤ 256 entries, 1–2 bytes each), about 0.2% of a 128 KiB block.
 - **No append yet.**
 - The container code (framing, index, CRCs) is Python; the codecs are C. Without the `_vulp` extension VFA2
-  decodes with `vulp_ref.py`, correctly but at roughly 1 MB/s.
+  decodes with `vulp_ref.py`, correctly but at roughly 1 MB/s (vulp-cm: a few KB/s).
 - **Path/metadata rules are VFA1's:** see VFA1.md, "Reader guarantees", items 5–7.

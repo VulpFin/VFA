@@ -23,7 +23,7 @@ Every chunk frame is independently decodable and names the filter and coder that
 end maps files to extents (chunk, offset, length). Readers refuse - by name - any version, feature bit, frame
 flag, coder, filter, entry type or critical index record they do not know.
 
-Coders: 0 stored, 1 vulp-tans (M3), 3 vulp-lz (M4). Filters: 0 none, 1 delta, 2 shuffle, 3 bcj-x86, 4 bcj-arm64,
+Coders: 0 stored, 1 vulp-tans (M3), 2 vulp-cm (M5), 3 vulp-lz (M4). Filters: 0 none, 1 delta, 2 shuffle, 3 bcj-x86, 4 bcj-arm64,
 6 segmented (M3). The writer also deduplicates content-defined segments across chunks (M4). The codecs are
 the C extension _vulp (vulp/vulp.c, built by build_vulp.py); without it, decoding falls back to the pure-Python
 reference vulp_ref.py (slow, same results). The writer picks a filter per chunk with an integer cost estimate over a
@@ -40,7 +40,8 @@ from vfa_extract import VFAError, ET_FILE, ET_DIR, ET_SYMLINK, ET_HARDLINK, ET_N
 
 MAGIC = b"VFA2"
 END_MAGIC = b"/VFA2"
-SPEC_VERSION = 3            # the VFA2.md revision this code writes (2 = M3: tANS + filters, 3 = M4: vulp-lz + dedup)
+SPEC_VERSION = 4            # the VFA2.md revision this code writes (2 = M3: tANS + filters, 3 = M4: vulp-lz + dedup,
+                            # 4 = M5: vulp-cm)
 READER_VERSION = 1          # archives whose min_reader_version is above this are refused
 
 HDR = struct.Struct("<4sHHHIIBBBBII16s")      # magic, header_size, spec_version, min_reader, required, optional,
@@ -87,11 +88,12 @@ class Codec:
     def __init__(self, cid, name, encode=None, decode=None):
         self.id, self.name, self.encode, self.decode = cid, name, encode, decode
 
-NATIVE_API = 3                               # vulp.h VULP_VERSION this code needs (2: vulp-lz, cdc; 3: optimal parser)
+NATIVE_API = 4                               # vulp.h VULP_VERSION this code needs (2: vulp-lz, cdc; 3: optimal parser;
+                                             # 4: vulp-cm)
 NATIVE_PROBLEM = ""                          # why the C extension is not used, if it is not
 try:
     import _vulp as _native                  # C codec core (build_vulp.py)
-    if getattr(_native, "VERSION", 0) < NATIVE_API or not all(hasattr(_native, f) for f in ("lz_encode", "lz_decode", "cdc")):
+    if getattr(_native, "VERSION", 0) < NATIVE_API or not all(hasattr(_native, f) for f in ("lz_encode", "lz_decode", "cdc", "cm_encode", "cm_decode")):
         # a module built from older sources (e.g. left over from M3): never call into it half-way
         NATIVE_PROBLEM = (f"the _vulp extension at {getattr(_native, '__file__', '?')} is out of date (API "
                           f"{getattr(_native, 'VERSION', 0)}, need {NATIVE_API}); rebuild it with: python build_vulp.py")
@@ -131,6 +133,31 @@ def _lz_decode(params, data, raw_size):
     if params: raise VFAError("vulp-lz takes no parameters")
     return _vulp_call(_native.lz_decode, data, raw_size)
 
+CM_MODEL = 1                                 # vulp-cm params: u8 model (1), u8 table bits (16..24)
+CM_MINBITS, CM_MAXBITS = 16, 24
+CM_MIN_GAIN_PCT = 1                          # --method cm keeps vulp-cm only if it writes >= 1% less than vulp-lz:
+                                             # below that, ~100x slower extraction is not worth it
+
+def cm_bits(level) -> int:
+    """--level -> vulp-cm table bits. Encoder and decoder each need about 13 * 2^bits bytes: 20 -> 14 MiB,
+    22 -> 55 MiB (the default, levels 4-6), 24 -> 220 MiB."""
+    level = int(level)
+    return 20 if level <= 3 else 22 if level <= 6 else 24
+
+def _cm_encode(raw, level=5):
+    """None when vulp-cm would not make the data smaller."""
+    if not NATIVE: raise VFAError(f"vulp-cm encoding needs the C codec: {NATIVE_PROBLEM}")
+    bits = cm_bits(level)
+    return bytes((CM_MODEL, bits)), _native.cm_encode(raw, bits)
+
+def _cm_decode(params, data, raw_size):
+    if len(params) != 2: raise VFAError(f"vulp-cm parameters must be 2 bytes, not {len(params)}")
+    if params[0] != CM_MODEL:
+        raise VFAError(f"vulp-cm model {params[0]} is not implemented by this reader (VFA2 spec {SPEC_VERSION}). "
+                       "Use a newer VFA.")
+    if not CM_MINBITS <= params[1] <= CM_MAXBITS: raise VFAError(f"vulp-cm table bits {params[1]} out of range")
+    return _vulp_call(_native.cm_decode, data, raw_size, params[1])
+
 def _filter_codec(fid, name):
     """Filters in this revision are size-preserving bijections; params are the filter's own bytes (VFA2.md)."""
     return Codec(fid, name, lambda raw, params=b"": (params, _vulp_call(_native.filter_fwd, fid, params, raw)),
@@ -138,7 +165,9 @@ def _filter_codec(fid, name):
 
 CODERS: Dict[int, Codec] = {0: Codec(0, "stored", _stored_encode, _stored_decode),
                             1: Codec(1, "vulp-tans", _tans_encode, _tans_decode),
+                            2: Codec(2, "vulp-cm", _cm_encode, _cm_decode),
                             3: Codec(3, "vulp-lz", _lz_encode, _lz_decode)}
+CODER_CM = 2
 CODER_LZ = 3
 FILTERS: Dict[int, Codec] = {0: _filter_codec(0, "none"), 1: _filter_codec(1, "delta"), 2: _filter_codec(2, "shuffle"),
                              3: _filter_codec(3, "bcj-x86"), 4: _filter_codec(4, "bcj-arm64")}
@@ -179,7 +208,7 @@ def _seg_apply(params, data, inverse):
 FILTERS[SEGMENTED] = Codec(SEGMENTED, "segmented", lambda raw, params=b"": (params, _seg_apply(params, raw, False)),
                            lambda params, data, raw_size: _seg_apply(params, data, True))
 # ids reserved for later milestones - named so a reader can say exactly what it is missing
-RESERVED_CODERS = {2: "vulp-cm (M5)"}
+RESERVED_CODERS: Dict[int, str] = {}
 RESERVED_FILTERS = {5: "text (reserved)"}
 CODER_NAMES = {**{k: v.name for k, v in CODERS.items()}, **RESERVED_CODERS}
 FILTER_NAMES = {**{k: v.name for k, v in FILTERS.items()}, **RESERVED_FILTERS}
@@ -449,11 +478,28 @@ class Writer2:
             idx = self.by_hash[h]
         else:
             coder = self.coder; info = None
-            if self.filt is None and coder != 0: fid, fp, info = route(raw, self.piece_bounds, coder)
+            # vulp-cm picks its filter the way vulp-lz does (BCJ, for one, helps both the same way)
+            if self.filt is None and coder != 0:
+                fid, fp, info = route(raw, self.piece_bounds, CODER_LZ if coder == CODER_CM else coder)
             elif self.filt is None: fid, fp = 0, b""
             else: fid, fp = self.filt; info = {"why": "forced (--filter)"} if coder != 0 else None
             fparams, fdata = FILTERS[fid].encode(raw, fp)
             cparams, payload = CODERS[coder].encode(fdata, self.level)
+            if coder == CODER_CM:     # opt-in slow coder: keep it only where it beats vulp-lz (decodes ~100x faster)
+                lp, lpay = _lz_encode(fdata, self.level)
+                cm_size = len(payload) if payload is not None else None
+                # compare what each choice writes: payload + params (vulp-cm's 2 coder bytes, and the 2-byte
+                # filter-params length that any params need). vulp-cm must write at least CM_MIN_GAIN_PCT % less than
+                # vulp-lz (or than the raw chunk, when vulp-lz cannot shrink it); otherwise vulp-lz is kept
+                def written(cp, pay): return len(pay) + (2 + len(fparams) + len(cp) if (fparams or cp) else 0)
+                lz_w = min(written(lp, lpay), len(raw)) if lpay is not None else len(raw)   # never worse than stored
+                if payload is None or written(cparams, payload) * 100 > lz_w * (100 - CM_MIN_GAIN_PCT):
+                    coder, cparams, payload = CODER_LZ, lp, lpay
+                if payload is not None and written(cparams, payload) >= len(raw):
+                    payload = None                  # whichever won, its params would eat the gain: store the chunk
+                info = dict(info or {})
+                info["why"] = (info.get("why", "") + f"; vulp-cm {cm_size if cm_size is not None else 'no gain'} B, vulp-lz "
+                               f"{len(lpay) if lpay is not None else 'no gain'} B: kept {CODERS[coder].name}").lstrip("; ")
             if coder != 0 and (payload is None or len(payload) >= len(raw)):   # the coder did not help: store the chunk
                 got = "no smaller output" if payload is None else f"{len(payload)} B >= {len(raw)} B raw"
                 info = dict(info or {}); info["why"] = (info.get("why", "") + f"; {CODERS[coder].name} gave {got}, "
@@ -464,7 +510,7 @@ class Writer2:
             off = self._frame(CHUNK_MAGIC, coder, fid, params, payload, len(raw), c, self.data_key)
             idx = len(self.chunks); self.chunks.append((off, len(raw), c, coder, fid))
             if info is not None:
-                self.routing.append({"chunk": idx, "filter": filter_label(fid, fparams), "coder": CODER_NAMES[coder],
+                self.routing.append({"chunk": idx, "filter": filter_label(fid, fparams), "coder": CODERS[coder].name,
                                      "raw": len(raw), "stored": len(payload), **info})
             if h is not None: self.by_hash[h] = idx
         for ext in self.pending: ext[0] = idx

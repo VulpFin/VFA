@@ -59,7 +59,10 @@ def extract_self(output_dir:str, need_password:bool=False, quiet:bool=False, fro
 # ---------------- CLI ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Self-extracting VFA archive")
+    from vfa_version import __version__, version_text, route_output
+    ap = argparse.ArgumentParser(description=f"Self-extracting VFA archive (VFA {__version__})")
+    route_output(ap, "VFA self-extractor")
+    ap.add_argument("-V", "--version", action="version", version=version_text("vfa-sfx"))
     ap.add_argument("-o", "--output", default="./_extracted", help="Output directory (default: ./_extracted)")
     ap.add_argument("--password", action="store_true", help="Prompt for password if archive is encrypted (if omitted, we'll still prompt when needed).")
     ap.add_argument("--log-level", choices=["quiet","error","warning","info","debug","trace"], default="warning")

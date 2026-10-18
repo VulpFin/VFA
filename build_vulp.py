@@ -14,7 +14,7 @@ Linux/macOS: the system C compiler.
 import argparse, os, pathlib, shutil, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent
-SRC = [ROOT / "vulp" / "vulp.c", ROOT / "vulp" / "vulp_lz.c", ROOT / "vulp" / "vulpmodule.c"]
+SRC = [ROOT / "vulp" / "vulp.c", ROOT / "vulp" / "vulp_lz.c", ROOT / "vulp" / "vulp_cm.c", ROOT / "vulp" / "vulpmodule.c"]
 
 def _vcvars_env():
     """Environment of an MSVC x64 developer prompt, or None."""

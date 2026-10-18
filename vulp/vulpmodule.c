@@ -126,6 +126,47 @@ static PyObject *py_lz_decode(PyObject *self, PyObject *args)
     return res;
 }
 
+static PyObject *py_cm_encode(PyObject *self, PyObject *args)
+{
+    Py_buffer in;
+    int tbits = 22, rc;
+    PyObject *res;
+    size_t cap, out_len = 0;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*|i", &in, &tbits)) return NULL;
+    if (in.len > MAX_IN) { PyBuffer_Release(&in); PyErr_SetString(PyExc_ValueError, "input too large"); return NULL; }
+    cap = (size_t)in.len + 4096;                     /* only output smaller than the input is useful */
+    res = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)cap);
+    if (!res) { PyBuffer_Release(&in); return NULL; }
+    Py_BEGIN_ALLOW_THREADS
+    rc = vulp_cm_encode((const uint8_t *)in.buf, (size_t)in.len, tbits, (uint8_t *)PyBytes_AS_STRING(res), cap, &out_len);
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&in);
+    if (rc == VULP_E_SPACE) { Py_DECREF(res); Py_RETURN_NONE; }
+    if (rc != VULP_OK) { Py_DECREF(res); return err(rc); }
+    if (_PyBytes_Resize(&res, (Py_ssize_t)out_len) < 0) return NULL;
+    return res;
+}
+
+static PyObject *py_cm_decode(PyObject *self, PyObject *args)
+{
+    Py_buffer in;
+    Py_ssize_t n;
+    int tbits, rc;
+    PyObject *res;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*ni", &in, &n, &tbits)) return NULL;
+    if (n < 0 || n > MAX_IN) { PyBuffer_Release(&in); PyErr_SetString(PyExc_ValueError, "bad output size"); return NULL; }
+    res = PyBytes_FromStringAndSize(NULL, n);
+    if (!res) { PyBuffer_Release(&in); return NULL; }
+    Py_BEGIN_ALLOW_THREADS
+    rc = vulp_cm_decode((const uint8_t *)in.buf, (size_t)in.len, tbits, (uint8_t *)PyBytes_AS_STRING(res), (size_t)n);
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&in);
+    if (rc != VULP_OK) { Py_DECREF(res); return err(rc); }
+    return res;
+}
+
 static PyObject *py_cdc(PyObject *self, PyObject *args)
 {
     Py_buffer in;
@@ -157,6 +198,8 @@ static PyMethodDef methods[] = {
     {"cost", py_cost, METH_VARARGS, "cost(data) -> estimated order-0 coded size in 1/65536 bits"},
     {"lz_encode", py_lz_encode, METH_VARARGS, "lz_encode(data, level=6) -> bytes, or None if it would not be smaller"},
     {"lz_decode", py_lz_decode, METH_VARARGS, "lz_decode(payload, raw_size) -> bytes (ValueError if corrupt)"},
+    {"cm_encode", py_cm_encode, METH_VARARGS, "cm_encode(data, tbits=22) -> bytes, or None if it would not be smaller"},
+    {"cm_decode", py_cm_decode, METH_VARARGS, "cm_decode(payload, raw_size, tbits) -> bytes (ValueError if corrupt)"},
     {"cdc", py_cdc, METH_VARARGS, "cdc(data, min_size, avg_log, max_size) -> list of segment end offsets"},
     {NULL, NULL, 0, NULL}
 };
