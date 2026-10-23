@@ -30,11 +30,25 @@ reference vulp_ref.py (slow, same results). The writer picks a filter per chunk 
 sample and records why in the index (ROUTING record). Standard library only otherwise, plus 'cryptography' for
 encrypted archives (exactly what VFA1 needs).
 """
-import collections, hashlib, io, json, os, struct, zlib
+import collections, hashlib, io, json, os, struct, threading, zlib
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import vfa_extract as vx
 from vfa_extract import VFAError, ET_FILE, ET_DIR, ET_SYMLINK, ET_HARDLINK, ET_NAMES
+
+# vfa.py supplies its VLog instance when the CLI selects --format vfa2.  Keeping
+# this bridge optional leaves Writer2 useful as a standalone library component.
+_LOGGER = None
+
+def set_logger(logger):
+    """Use the CLI logger for VFA2 trace messages when one is available."""
+    global _LOGGER
+    _LOGGER = logger
+
+def _trace(message:str):
+    if _LOGGER is not None:
+        _LOGGER.trace(message)
 
 # ---------------------------------------------------------------- constants (VFA2.md is normative)
 
@@ -143,6 +157,11 @@ def cm_bits(level) -> int:
     22 -> 55 MiB (the default, levels 4-6), 24 -> 220 MiB."""
     level = int(level)
     return 20 if level <= 3 else 22 if level <= 6 else 24
+
+def cm_model_bytes(tbits: int = CM_MAXBITS) -> int:
+    """Memory one vulp-cm encoder or decoder allocates (vulp_cm.c: nine 2^bits context tables, the 4-byte match
+    table and the two APMs). Thread pools add it per worker."""
+    return (13 << tbits) + (256 + 65536) * 33 * 2
 
 def _cm_encode(raw, level=5):
     """None when vulp-cm would not make the data smaller."""
@@ -391,6 +410,37 @@ def _aesgcm(key):
     if not vx.HAVE_AESGCM: raise VFAError("AES-GCM unavailable in this build (needs 'cryptography').")
     return vx.AESGCM(key)
 
+def _encode_chunk(raw, coder, fid, fp, level, info=None):
+    """Encode one chunk without touching writer state.
+
+    This is deliberately a pure worker operation.  Frame writes, encryption, chunk
+    indexes, and routing records remain on the writer thread so the archive stays
+    ordered and deterministic while codec work can use multiple cores.
+    """
+    fparams, fdata = FILTERS[fid].encode(raw, fp)
+    cparams, payload = CODERS[coder].encode(fdata, level)
+    if coder == CODER_CM:                 # keep cm only when it earns its slow decode cost
+        lp, lpay = _lz_encode(fdata, level)
+        cm_size = len(payload) if payload is not None else None
+
+        def written(cp, pay):
+            return len(pay) + (2 + len(fparams) + len(cp) if (fparams or cp) else 0)
+
+        lz_w = min(written(lp, lpay), len(raw)) if lpay is not None else len(raw)
+        if payload is None or written(cparams, payload) * 100 > lz_w * (100 - CM_MIN_GAIN_PCT):
+            coder, cparams, payload = CODER_LZ, lp, lpay
+        if payload is not None and written(cparams, payload) >= len(raw):
+            payload = None
+        info = dict(info or {})
+        info["why"] = (info.get("why", "") + f"; vulp-cm {cm_size if cm_size is not None else 'no gain'} B, "
+                       f"vulp-lz {len(lpay) if lpay is not None else 'no gain'} B: kept {CODERS[coder].name}").lstrip("; ")
+    if coder != 0 and (payload is None or len(payload) >= len(raw)):
+        got = "no smaller output" if payload is None else f"{len(payload)} B >= {len(raw)} B raw"
+        info = dict(info or {})
+        info["why"] = (info.get("why", "") + f"; {CODERS[coder].name} gave {got}, stored instead").lstrip("; ")
+        fid, fparams, coder, cparams, payload = 0, b"", 0, b"", raw
+    return fid, fparams, coder, cparams, payload, info
+
 # ---------------------------------------------------------------- writer
 
 class Writer2:
@@ -404,7 +454,8 @@ class Writer2:
     def __init__(self, f, *, chunk_size: int = 1 << 26, solid: bool = False, coder: int = 0, filt=0,
                  level: int = 0, dedup: bool = True, password: Optional[bytes] = None,
                  kdf: Tuple[int, int, int] = (3, 256 * 1024, 4), use_scrypt: bool = False,
-                 header_extra: bytes = b"", min_reader: int = 1, required_extra: int = 0, cdc: bool = False):
+                 header_extra: bytes = b"", min_reader: int = 1, required_extra: int = 0, cdc: bool = False,
+                 progress: Optional[Callable[[int], None]] = None, executor=None, max_pending: int = 1):
         """coder: 0 stored, 1 vulp-tans. filt: a filter id, an (id, params) tuple, or None = choose per chunk
         (classify(); needs a real coder). A chunk the coder cannot shrink is stored instead.
         header_extra / min_reader / required_extra exist so tests can write what a future VFA would."""
@@ -418,6 +469,13 @@ class Writer2:
             raise ValueError(f"filter {filt[0]} cannot encode")
         self.routing: List[dict] = []
         self.f, self.cs, self.solid, self.coder, self.filt, self.level, self.dedup = f, chunk_size, solid, coder, filt, level, dedup
+        self.progress = progress
+        self.executor = executor
+        self.max_pending = max(1, int(max_pending))
+        self.pending_chunks = collections.deque()  # (chunk index, raw bytes, crc, Future)
+        _trace(f"Writer2.__init__: chunk_size={chunk_size} solid={solid} coder={CODERS[coder].name} "
+               f"filter={'auto' if filt is None else filt[0]} dedup={self.dedup} cdc={self.cdc} "
+               f"workers={'enabled' if executor is not None else 1} pending={self.max_pending}")
         self.pos = 0; self.hasher = hashlib.sha256()
         self.chunks: List[tuple] = []               # (frame_offset, raw_size, raw_crc, coder, filter)
         self.by_hash: Dict[bytes, int] = {}
@@ -446,6 +504,7 @@ class Writer2:
         body = HDR.pack(MAGIC, self.header_size, SPEC_VERSION, min_reader, req | required_extra, 0, kdf_id, aead, kp, 0, kt, km, salt)
         body += header_extra
         self._out(body + struct.pack("<I", crc32(body)))
+        _trace(f"Writer2.__init__: wrote {self.header_size}-byte header")
         self.closed = False
 
     def _out(self, b):
@@ -463,10 +522,29 @@ class Writer2:
         if key is not None:
             payload = _aesgcm(key).encrypt(nonce, bytes(payload), hdr + nonce + params)   # header is authenticated
         self._out(hdr + nonce + params); self._out(payload)
+        _trace(f"Writer2._frame: {magic.decode(errors='replace')} offset={off} raw={raw_size} stored={len(payload)} "
+               f"coder={CODERS.get(coder, Codec(coder, str(coder))).name} filter={filt} encrypted={key is not None}")
         return off
+
+    def _write_encoded(self, idx, raw, raw_crc, result):
+        fid, fparams, coder, cparams, payload, info = result
+        params = struct.pack("<H", len(fparams)) + fparams + cparams if (fparams or cparams) else b""
+        off = self._frame(CHUNK_MAGIC, coder, fid, params, payload, len(raw), raw_crc, self.data_key)
+        self.chunks[idx] = (off, len(raw), raw_crc, coder, fid)
+        if info is not None:
+            self.routing.append({"chunk": idx, "filter": filter_label(fid, fparams), "coder": CODERS[coder].name,
+                                 "raw": len(raw), "stored": len(payload), **info})
+            _trace(f"Writer2._flush: chunk index={idx} route={CODERS[coder].name}/{filter_label(fid, fparams)} "
+                   f"raw={len(raw)} stored={len(payload)} why={info.get('why', '-')}")
+
+    def _drain_one(self):
+        idx, raw, raw_crc, future = self.pending_chunks.popleft()
+        self._write_encoded(idx, raw, raw_crc, future.result())
 
     def _flush(self):
         if not self.buf and not self.pending: return
+        _trace(f"Writer2._flush: preparing chunk raw={len(self.buf)} pending_extents={len(self.pending)} "
+               f"pending_refs={len(self.pending_refs)}")
         raw = bytes(self.buf); self.buf = bytearray()
         # file boundaries inside this chunk (dedup references split a file's stored bytes into several extents, but
         # those bytes are still one contiguous run per file, so units follow files, not extents)
@@ -476,6 +554,7 @@ class Writer2:
         h = hashlib.sha256(raw).digest() if self.dedup else None
         if h is not None and h in self.by_hash:
             idx = self.by_hash[h]
+            _trace(f"Writer2._flush: reusing identical chunk index={idx} raw={len(raw)}")
         else:
             coder = self.coder; info = None
             # vulp-cm picks its filter the way vulp-lz does (BCJ, for one, helps both the same way)
@@ -483,35 +562,16 @@ class Writer2:
                 fid, fp, info = route(raw, self.piece_bounds, CODER_LZ if coder == CODER_CM else coder)
             elif self.filt is None: fid, fp = 0, b""
             else: fid, fp = self.filt; info = {"why": "forced (--filter)"} if coder != 0 else None
-            fparams, fdata = FILTERS[fid].encode(raw, fp)
-            cparams, payload = CODERS[coder].encode(fdata, self.level)
-            if coder == CODER_CM:     # opt-in slow coder: keep it only where it beats vulp-lz (decodes ~100x faster)
-                lp, lpay = _lz_encode(fdata, self.level)
-                cm_size = len(payload) if payload is not None else None
-                # compare what each choice writes: payload + params (vulp-cm's 2 coder bytes, and the 2-byte
-                # filter-params length that any params need). vulp-cm must write at least CM_MIN_GAIN_PCT % less than
-                # vulp-lz (or than the raw chunk, when vulp-lz cannot shrink it); otherwise vulp-lz is kept
-                def written(cp, pay): return len(pay) + (2 + len(fparams) + len(cp) if (fparams or cp) else 0)
-                lz_w = min(written(lp, lpay), len(raw)) if lpay is not None else len(raw)   # never worse than stored
-                if payload is None or written(cparams, payload) * 100 > lz_w * (100 - CM_MIN_GAIN_PCT):
-                    coder, cparams, payload = CODER_LZ, lp, lpay
-                if payload is not None and written(cparams, payload) >= len(raw):
-                    payload = None                  # whichever won, its params would eat the gain: store the chunk
-                info = dict(info or {})
-                info["why"] = (info.get("why", "") + f"; vulp-cm {cm_size if cm_size is not None else 'no gain'} B, vulp-lz "
-                               f"{len(lpay) if lpay is not None else 'no gain'} B: kept {CODERS[coder].name}").lstrip("; ")
-            if coder != 0 and (payload is None or len(payload) >= len(raw)):   # the coder did not help: store the chunk
-                got = "no smaller output" if payload is None else f"{len(payload)} B >= {len(raw)} B raw"
-                info = dict(info or {}); info["why"] = (info.get("why", "") + f"; {CODERS[coder].name} gave {got}, "
-                                                        "stored instead").lstrip("; ")
-                fid, fparams, coder, cparams, payload = 0, b"", 0, b"", raw
-            params = struct.pack("<H", len(fparams)) + fparams + cparams if (fparams or cparams) else b""
-            c = crc32(raw)
-            off = self._frame(CHUNK_MAGIC, coder, fid, params, payload, len(raw), c, self.data_key)
-            idx = len(self.chunks); self.chunks.append((off, len(raw), c, coder, fid))
-            if info is not None:
-                self.routing.append({"chunk": idx, "filter": filter_label(fid, fparams), "coder": CODERS[coder].name,
-                                     "raw": len(raw), "stored": len(payload), **info})
+            raw_crc = crc32(raw)
+            idx = len(self.chunks)
+            self.chunks.append((0, len(raw), raw_crc, coder, fid))
+            if self.executor is None:
+                self._write_encoded(idx, raw, raw_crc, _encode_chunk(raw, coder, fid, fp, self.level, info))
+            else:
+                future = self.executor.submit(_encode_chunk, raw, coder, fid, fp, self.level, info)
+                self.pending_chunks.append((idx, raw, raw_crc, future))
+                if len(self.pending_chunks) >= self.max_pending:
+                    self._drain_one()
             if h is not None: self.by_hash[h] = idx
         for ext in self.pending: ext[0] = idx
         for ext in self.pending_refs: ext[0] = idx      # dedup references into this chunk, and its segment records
@@ -523,7 +583,10 @@ class Writer2:
         else: mt = float(mtime); sec = int(mt // 1); ns = int(round((mt - sec) * 1e9)) % 1_000_000_000
         e = {"type": etype, "path": path.replace("\\", "/"), "mode": mode & 0xFFFFFFFF, "mtime": sec, "mtime_ns": ns,
              "size": size, "meta": meta or b"", "extents": []}
-        self.entries.append(e); return e
+        self.entries.append(e)
+        kind = ET_NAMES[etype] if isinstance(etype, int) and 0 <= etype < len(ET_NAMES) else str(etype)
+        _trace(f"Writer2._entry: recorded {kind} {e['path']}")
+        return e
 
     def add_dir(self, path, mode=0o755, mtime=0, meta=None, mtime_ns=None):
         self._entry(ET_DIR, path, mode, mtime, 0, meta, mtime_ns)
@@ -575,7 +638,9 @@ class Writer2:
 
     def add_file(self, path, mode, mtime, src, meta=None, piece: int = 1 << 20, mtime_ns=None) -> int:
         """src: a binary file object or bytes. Returns the number of bytes stored."""
+        _trace(f"Writer2.add_file: reading {path} solid={self.solid} cdc={self.cdc}")
         e = self._entry(ET_FILE, path, mode, mtime, 0, meta, mtime_ns)
+        progress = self.progress
         if not self.solid and self.buf: self._flush()          # non-solid: every file starts a new chunk
         if isinstance(src, (bytes, bytearray, memoryview)): src = io.BytesIO(bytes(src))
         if not self.cdc:
@@ -583,6 +648,7 @@ class Writer2:
                 b = src.read(piece)
                 if not b: break
                 self._append(e, memoryview(b))
+                if progress: progress(len(b))
         else:
             # content-defined segments (cut points depend only on content, so shifted copies still line up);
             # the last segment of each read is carried over, since its end is the read size, not content
@@ -596,9 +662,11 @@ class Writer2:
                 last = len(cuts) if not b else len(cuts) - 1
                 for end in cuts[:last]:
                     self._segment(e, mv[start:end]); start = end
+                if progress: progress(len(b))
                 carry = bytes(mv[start:]) if b else b""
                 if not b: break
         if not self.solid: self._flush()
+        _trace(f"Writer2.add_file: finished {e['path']} size={e['size']} extents={len(e['extents'])}")
         return e["size"]
 
     def _index_bytes(self, records=()) -> bytes:
@@ -618,7 +686,10 @@ class Writer2:
     def close(self, records=()):
         """Flush the last chunk, write index + footer. records: extra (type, flags, data) index records."""
         if self.closed: return
+        _trace(f"Writer2.close: finalizing {len(self.entries)} entries and {len(self.chunks)} chunks")
         self._flush()
+        while self.pending_chunks:
+            self._drain_one()
         if self.routing:                     # non-critical: readers that do not know it skip it
             doc = {"v": 1, "chunks": self.routing}
             if self.cdc: doc["dedup"] = {"segments": self.dedup_segments, "bytes": self.dedup_bytes}
@@ -632,6 +703,7 @@ class Writer2:
         body = FOOT.pack(off, idx_len, archive_len, DIGEST_SHA256, digest)
         self.f.write(body + struct.pack("<I", crc32(body)) + END_MAGIC)
         self.pos += FOOTER_SIZE; self.closed = True
+        _trace(f"Writer2.close: wrote index={len(raw)} bytes archive={self.pos} bytes")
 
 # ---------------------------------------------------------------- reader
 
@@ -641,18 +713,21 @@ class Archive2(vx.Extractable):
     format = "VFA2"
 
     def __init__(self, path: str):
+        _trace(f"Archive2.__init__: opening {path}")
         self.path = path
         self._f = open(path, "rb")
         try:
             self.size = os.fstat(self._f.fileno()).st_size
             self.buf = vx._FileView(self._f, 0, self.size)
             self.entries = None; self.chunks: List[tuple] = []; self._cache = collections.OrderedDict()
+            self._read_lock = threading.Lock()  # _FileView uses one seekable handle; decode happens after the read
             self.data_key = self.index_key = None
             self._locate()
         except Exception:
             self._f.close(); raise
 
     def close(self):
+        _trace(f"Archive2.close: closing {self.path}")
         try: self._f.close()
         except Exception: pass
     def __enter__(self): return self
@@ -660,6 +735,7 @@ class Archive2(vx.Extractable):
 
     # -- locate --
     def _locate(self):
+        _trace("Archive2._locate: locating footer and archive body")
         E = vx.effective_end(self.buf, self.size)
         if E < HEADER_SIZE + FOOTER_SIZE: raise VFAError(f"File too small to hold a VFA2 archive (size={self.size}).")
         if self.buf[E - 5:E] != END_MAGIC:
@@ -679,8 +755,10 @@ class Archive2(vx.Extractable):
             raise VFAError("Index position in the footer is inconsistent (corrupted archive).")
         self.manifest, self.stub_end = vx.find_manifest(self.buf, self.arc_start)
         self._parse_header()
+        _trace(f"Archive2._locate: index_offset={self.index_off} archive_bytes={len(self.arc)}")
 
     def _parse_header(self):
+        _trace("Archive2._parse_header: validating VFA2 header")
         if len(self.arc) < HDR.size + 2: raise VFAError("Header truncated.")
         hsize, = struct.unpack("<H", self.arc[4:6])
         if not HEADER_SIZE <= hsize <= MAX_HEADER_SIZE or hsize > len(self.arc):
@@ -702,6 +780,7 @@ class Archive2(vx.Extractable):
         self.has_tocx = True                   # every chunk carries a CRC32 (vfa.py prints this)
         self.hash_kind = vx.H_SHA256 if self.digest_kind == DIGEST_SHA256 else self.digest_kind
         self.header = {"format": "VFA2", "version": self.spec_version, "flags": req, "default_method": None, "default_level": None}
+        _trace(f"Archive2._parse_header: spec={self.spec_version} encrypted={self.encrypted} header_bytes={self.header_size}")
 
     def routing(self) -> List[dict]:
         """Why each chunk got its filter and coder (ROUTING index record), or [] if the archive has none."""
@@ -719,13 +798,16 @@ class Archive2(vx.Extractable):
 
     # -- integrity --
     def verify_digest(self, progress: Optional[Callable[[int, int], None]] = None) -> Optional[bool]:
+        _trace("Archive2.verify_digest: hashing archive body")
         if self.digest_kind != DIGEST_SHA256:
             raise VFAError(f"Unknown digest kind {self.digest_kind}; use a newer VFA.")
         h = hashlib.sha256(); pos, end = self.arc_start, self.footer_pos; total = end - pos
         while pos < end:
             n = min(1 << 22, end - pos); h.update(self.buf[pos:pos + n]); pos += n
             if progress: progress(pos - self.arc_start, total)
-        return h.digest() == self.digest
+        ok = h.digest() == self.digest
+        _trace(f"Archive2.verify_digest: {'match' if ok else 'mismatch'}")
+        return ok
 
     # -- frames --
     def _read_frame_header(self, off: int, magic: bytes, what: str):
@@ -757,6 +839,7 @@ class Archive2(vx.Extractable):
 
     # -- unlock / index --
     def unlock(self, password: Optional[str] = None):
+        _trace(f"Archive2.unlock: {'deriving keys and reading' if self.encrypted else 'reading'} index")
         if self.encrypted:
             if password is None: raise VFAError("This archive is encrypted; a password is required.", code=5)
             kdf_id, kt, km, kp, salt = self.kdf
@@ -769,11 +852,13 @@ class Archive2(vx.Extractable):
         if len(raw) != fh["raw_size"] or crc32(raw) != fh["raw_crc"]:
             raise VFAError("Index failed its CRC32 check (corrupted archive).")
         self._parse_index(raw)
+        _trace(f"Archive2.unlock: loaded {len(self.entries)} entries and {len(self.chunks)} chunks")
         if not NATIVE and any(c[3] != 0 or c[4] != 0 for c in self.chunks):
             vx.LOGGER.warning(f"Decoding with the slow pure-Python reference codec: {NATIVE_PROBLEM}")
         return self.entries
 
     def _parse_index(self, raw: bytes):
+        _trace(f"Archive2._parse_index: parsing {len(raw)} index bytes")
         r = vx._Reader(raw, "Index")
         if bytes(r.need(4, "tag")) != INDEX_TAG: raise VFAError("Index tag missing (corrupted archive).")
         n = r.u("<I", "chunk count")
@@ -821,16 +906,26 @@ class Archive2(vx.Extractable):
                 raise VFAError(f"Archive uses index record type {rtype} this reader does not understand. Use a newer VFA.")
         if r.left: raise VFAError(f"Index has {r.left} unexpected trailing bytes (corrupted archive).")
         self.entries = entries
+        _trace(f"Archive2._parse_index: parsed {len(entries)} entries, {len(self.chunks)} chunks, {len(self.records)} records")
 
     # -- chunk access --
-    def chunk_data(self, i: int) -> bytes:
-        """Decode chunk i (frame -> decrypt -> coder -> inverse filter), checking size and CRC32. Caches the last one."""
-        if i in self._cache: self._cache.move_to_end(i); return self._cache[i]
+    def _decode_unit_bytes(self, sel_files) -> int:
+        """Memory one decoder worker holds: the decoded chunk and its payload (never larger than the chunk), plus
+        the vulp-cm model when the archive has vulp-cm chunks."""
+        cm = any(c[3] == CODER_CM for c in self.chunks)
+        return max((2 * c[1] for c in self.chunks), default=0) + (cm_model_bytes() if cm else 0)
+
+    def _decode_chunk(self, i: int) -> bytes:
+        """Decode one chunk without touching the shared LRU cache."""
+        _trace(f"Archive2._decode_chunk: decoding chunk={i}")
         off, raw_size, rcrc, coder, filt = self.chunks[i]
-        fh = self._read_frame_header(off, CHUNK_MAGIC, f"Chunk {i}")
+        # Header and payload are two reads through _FileView, so both must be
+        # covered by the same lock. Decryption and codec work happen outside it.
+        with self._read_lock:
+            fh = self._read_frame_header(off, CHUNK_MAGIC, f"Chunk {i}")
+            params, payload = self._frame_payload(fh, self.data_key)
         cdc = _codec(CODERS, RESERVED_CODERS, "coder", coder, f"Chunk {i}")
         flt = _codec(FILTERS, RESERVED_FILTERS, "filter", filt, f"Chunk {i}")
-        params, payload = self._frame_payload(fh, self.data_key)
         fparams, cparams = b"", b""
         if params:
             if len(params) < 2: raise VFAError(f"Chunk {i} parameters are malformed.")
@@ -844,6 +939,16 @@ class Archive2(vx.Extractable):
             raise VFAError(f"Chunk {i}: {e}")
         if len(raw) != raw_size: raise VFAError(f"Chunk {i} decoded to {len(raw)} bytes, expected {raw_size} (corrupted archive).")
         if crc32(raw) != rcrc: raise VFAError(f"Chunk {i} failed its CRC32 check (corrupted archive).")
+        _trace(f"Archive2._decode_chunk: verified chunk={i} raw={len(raw)} coder={CODERS[coder].name} filter={FILTERS[filt].name}")
+        return raw
+
+    def chunk_data(self, i: int) -> bytes:
+        """Decode chunk i (frame -> decrypt -> coder -> inverse filter), checking size and CRC32. Caches the last one."""
+        if i in self._cache:
+            self._cache.move_to_end(i)
+            _trace(f"Archive2.chunk_data: cache hit chunk={i}")
+            return self._cache[i]
+        raw = self._decode_chunk(i)
         # keep the last CACHE_CHUNKS decoded chunks: a deduplicated file alternates between its own chunk and the
         # chunk holding the shared segments, which would otherwise be decoded again for every extent
         self._cache[i] = raw
@@ -855,15 +960,17 @@ class Archive2(vx.Extractable):
             yield memoryview(self.chunk_data(ch))[off:off + ln]
 
     def test(self, progress=None) -> dict:
+        _trace(f"Archive2.test: checking {len(self.chunks)} chunks")
         total = 0
         for i in range(len(self.chunks)):
             total += len(self.chunk_data(i))
             if progress: progress(i + 1, len(self.chunks))
+        _trace(f"Archive2.test: verified {total} raw bytes")
         return {"blocks": len(self.chunks), "bytes": total}
 
     MAX_OPEN = 128                            # extraction: files kept open at once (the rest are reopened as needed)
 
-    def _write_files(self, sel_files, start, commit, finish, check_cancel, active):
+    def _write_files(self, sel_files, start, commit, finish, check_cancel, active, workers=1):
         """Chunk-major extraction: every needed chunk is decoded exactly once, in order, and its bytes are written
         at the right offset into every file that uses them. Dedup makes files share chunks, so a file-by-file order
         would decode the same chunk again and again. Memory: one decoded chunk at a time."""
@@ -899,7 +1006,31 @@ class Archive2(vx.Extractable):
         for e in sel_files:                           # empty files first: nothing to decode
             if remaining[id(e)] == 0:
                 check_cancel(); handle(e); done(e)
-        for ch in sorted(plan):
+        chunk_ids = sorted(plan)
+        if workers > 1 and chunk_ids:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                pending = collections.deque()
+                chunk_iter = iter(chunk_ids)
+                for _ in range(min(workers, len(chunk_ids))):
+                    ch = next(chunk_iter)
+                    pending.append((ch, pool.submit(self._decode_chunk, ch)))
+                while pending:
+                    check_cancel()
+                    ch, future = pending.popleft()
+                    data = memoryview(future.result())
+                    try:
+                        next_ch = next(chunk_iter)
+                    except StopIteration:
+                        next_ch = None
+                    if next_ch is not None:
+                        pending.append((next_ch, pool.submit(self._decode_chunk, next_ch)))
+                    for e, fpos, off, ln in plan[ch]:
+                        fw = handle(e); fw.seek(fpos); fw.write(data[off:off + ln])
+                        remaining[id(e)] -= ln
+                        if remaining[id(e)] == 0: done(e)
+                    del data
+            return
+        for ch in chunk_ids:
             check_cancel()
             data = memoryview(self.chunk_data(ch))
             for e, fpos, off, ln in plan[ch]:

@@ -7,4 +7,5 @@ from setuptools import Extension, setup
 
 flags = ["/W4"] if os.name == "nt" else ["-O2", "-std=c99"]
 setup(ext_modules=[Extension("_vulp", ["vulp/vulp.c", "vulp/vulp_lz.c", "vulp/vulp_cm.c", "vulp/vulpmodule.c"],
-                             include_dirs=["vulp"], extra_compile_args=flags)])
+                             include_dirs=["vulp"], extra_compile_args=flags)],
+      options={"egg_info": {"egg_base": os.environ.get("VFA_EGG_BASE", ".")}})

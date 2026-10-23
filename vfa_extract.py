@@ -31,7 +31,9 @@ Rules this reader enforces (see VFA1.md):
   - nothing is written outside the destination directory (safe_join()).
 """
 
-import sys, os, io, struct, getpass, hashlib, zlib, lzma, bz2, json, stat, unicodedata, shutil
+import sys, os, io, struct, getpass, hashlib, zlib, lzma, bz2, json, stat, unicodedata, shutil, threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -102,6 +104,7 @@ HEADER_LEN = 4 + 2 + 4 + 1 + 1 + 1 + 2 + 4 + 1 + 4 + 4 + 1 + 16 + 1 + 12 + 16   
 FOOTER_LEN = 8 + 4 + 1 + 32 + 5  # toc_off u64, toc_sz u32, hash_kind u8, digest[32], END_MAGIC[5]
 FRAME_HDR = 5                    # u32 payload_len, u8 method
 MAX_BLOCK = 1 << 30              # writers never put more than this in one block
+AUTO_DECODE_BUDGET = 1 << 30     # extract with workers=0 runs only as many decoders as fit in this (blocks can be 1 GiB)
 
 # TOC extension: [b"VTX1"][u32 nrec] then nrec * ([u16 type][u16 rflags][u32 len][data])
 TOCX_MAGIC = b"VTX1"
@@ -501,6 +504,7 @@ def open_container(path: str):
         f.seek(max(0, end - 5)); tail = f.read(5)
     if tail == b"/VFA2":
         import vfa2
+        vfa2.set_logger(LOGGER)
         return vfa2.Archive2(path)
     return Container(path)
 
@@ -581,7 +585,8 @@ def _alias_key_for(dest: str):
 
 class Extractable:
     """Selection + safe extraction shared by every container format. A subclass provides entries (dicts with path,
-    mode, mtime, size, entry_type, meta) and _write_files(), which writes the selected regular files."""
+    mode, mtime, size, entry_type, meta), _write_files(), which writes the selected regular files, and
+    _decode_unit_bytes(), the memory one decoder worker holds (it bounds the automatic worker count)."""
     manifest: Optional[dict] = None
     stub_end = 0
 
@@ -614,7 +619,8 @@ class Extractable:
     def extract(self, dest: str, progress: Optional[ProgressCB] = None,
                 cancel: Optional[Callable[[], bool]] = None, members: Optional[Iterable[str]] = None,
                 links: bool = False, keep_mode_bits: int = 0o777,
-                after_entry: Optional[Callable[[dict, str], None]] = None) -> Tuple[List[str], List[str]]:
+                after_entry: Optional[Callable[[dict, str], None]] = None,
+                workers: int = 0) -> Tuple[List[str], List[str]]:
         """Extract everything (or `members`) into dest. Returns (files, dirs) as '/'-separated relative paths.
         Order: dirs, files, then (links=True, POSIX only) hardlinks and symlinks - links are created last so
         no file is ever written through a link from the archive. after_entry(entry, out_path) runs for every
@@ -627,6 +633,16 @@ class Extractable:
         total_files = len(sel_files); total_bytes = sum(e["size"] for e in sel_files)
         done = {"files": 0, "bytes": 0}
         posix = os.name != "nt"
+        requested_workers = int(workers or 0)
+        if requested_workers < 0:
+            raise VFAError("Extraction worker count cannot be negative.")
+        workers = min(32, requested_workers or min(8, os.cpu_count() or 1))
+        if not requested_workers and workers > 1:
+            # each worker holds a decoded unit while one more is being written out
+            workers = min(workers, AUTO_DECODE_BUDGET // max(1, self._decode_unit_bytes(sel_files)) - 1)
+        workers = max(1, workers)
+        if workers > 1:
+            LOGGER.info(f"Extraction decoder worker target: {workers} threads")
 
         def check_cancel():
             if cancel and cancel(): raise VFAError("Cancelled.", code=4)
@@ -696,7 +712,7 @@ class Extractable:
 
         active: list = []            # (entry, out, handle) currently open - closed + cleaned up on any failure
         try:
-            self._write_files(sel_files, start, commit, finish, check_cancel, active)
+            self._write_files(sel_files, start, commit, finish, check_cancel, active, workers)
         finally:
             for _, _, fw in active:
                 try: fw.close()
@@ -753,6 +769,7 @@ class Container(Extractable):
     def __init__(self, path: str):
         self.path = path
         self._f = open(path, "rb")
+        self._read_lock = threading.Lock()   # _FileView seeks the shared handle; decode after the read runs in parallel
         self.size = os.fstat(self._f.fileno()).st_size
         if self.size < FOOTER_LEN + HEADER_LEN:
             self._f.close(); raise VFAError(f"File too small to hold a VFA payload (size={self.size}).")
@@ -878,7 +895,8 @@ class Container(Extractable):
     def block_data(self, i: int, limit: Optional[int] = None) -> bytes:
         """Decrypt + decompress block i, checking its size and CRC32 when the archive records them."""
         b = self.blocks[i]
-        payload = bytes(self.arc[b.off + FRAME_HDR:b.off + FRAME_HDR + b.csz])
+        with self._read_lock:
+            payload = bytes(self.arc[b.off + FRAME_HDR:b.off + FRAME_HDR + b.csz])
         if self.encrypted:
             h = self.header
             payload = _aead_decrypt(self.key, h["aead_id"], h["nonce_prefix"], i, payload, aad=b"vfa-data")
@@ -938,9 +956,79 @@ class Container(Extractable):
         return {"blocks": nblk, "bytes": total}
 
 
-    def _write_files(self, sel_files, start, commit, finish, check_cancel, active):
+    def _decode_unit_bytes(self, sel_files) -> int:
+        """Memory one decoder worker holds: a decoded block and its payload."""
+        if self.solid: return max(((b.usz or 0) + b.csz for b in self.blocks), default=0)
+        return max((usz + csz for e in sel_files for _, usz, csz, _ in e["blocks"]), default=0)
+
+    def _solid_blocks_parallel(self, intervals: List[Tuple[int, int]], workers: int) -> Iterator[Tuple[int, bytes]]:
+        """Decode needed solid blocks concurrently, yielding them in stream order.
+
+        VFA 1.0 archives do not record uncompressed block sizes, so their block
+        boundaries must still be discovered serially and use the normal path.
+        """
+        if not intervals: return
+        if not all(b.usz is not None for b in self.blocks):
+            yield from self._solid_blocks(intervals)
+            return
+        last = max(e for _, e in intervals)
+        jobs = []
+        pos = 0
+        for i, b in enumerate(self.blocks):
+            if pos >= last and last > 0: break
+            end = pos + b.usz
+            if any(s < end and e > pos for s, e in intervals):
+                jobs.append((i, pos))
+            pos = end
+        if pos < last:
+            raise VFAError(f"Solid stream ended at {pos} bytes, the TOC needs {last} (corrupted archive).")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pending = deque()
+            job_iter = iter(jobs)
+            for _ in range(min(workers, len(jobs))):
+                i, stream_pos = next(job_iter)
+                pending.append((i, stream_pos, pool.submit(self.block_data, i, self.stream_len - stream_pos)))
+            while pending:
+                i, stream_pos, future = pending.popleft()
+                yield stream_pos, future.result()
+                try:
+                    ni, npos = next(job_iter)
+                except StopIteration:
+                    continue
+                pending.append((ni, npos, pool.submit(self.block_data, ni, self.stream_len - npos)))
+
+    def _write_files(self, sel_files, start, commit, finish, check_cancel, active, workers=1):
         """VFA1: non-solid files block by block; solid files in one forward pass over the needed blocks."""
         if not self.solid:
+            if workers > 1:
+                jobs = [(e, idx) for e in sel_files for idx, _, _, _ in e["blocks"]]
+                for e in sel_files:
+                    if not e["blocks"]:
+                        check_cancel(); out, fw = start(e); commit(out, fw); finish(e, out)
+                if not jobs:
+                    return
+                current = None; out = fw = None
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    pending = deque()
+                    job_iter = iter(jobs)
+                    for _ in range(min(workers, len(jobs))):
+                        e, idx = next(job_iter)
+                        pending.append((e, pool.submit(self.block_data, idx)))
+                    while pending:
+                        e, future = pending.popleft()
+                        if e is not current:
+                            if current is not None:
+                                active.clear(); commit(out, fw); finish(current, out)
+                            check_cancel(); out, fw = start(e); active[:] = [(e, out, fw)]; current = e
+                        check_cancel(); fw.write(future.result())
+                        try:
+                            ne, nidx = next(job_iter)
+                        except StopIteration:
+                            continue
+                        pending.append((ne, pool.submit(self.block_data, nidx)))
+                if current is not None:
+                    active.clear(); commit(out, fw); finish(current, out)
+                return
             for e in sel_files:
                 check_cancel()
                 out, fw = start(e); active[:] = [(e, out, fw)]
@@ -953,7 +1041,9 @@ class Container(Extractable):
                 out, fw = start(e); commit(out, fw); finish(e, out)
             pending = [e for e in pending if e["size"] > 0]
             nxt = 0
-            for pos, data in self._solid_blocks([(e["start_off"], e["start_off"] + e["size"]) for e in pending]):
+            intervals = [(e["start_off"], e["start_off"] + e["size"]) for e in pending]
+            solid_blocks = self._solid_blocks_parallel(intervals, workers) if workers > 1 else self._solid_blocks(intervals)
+            for pos, data in solid_blocks:
                 check_cancel()
                 q = pos + len(data); mv = memoryview(data)
                 while nxt < len(pending) and pending[nxt]["start_off"] < q:

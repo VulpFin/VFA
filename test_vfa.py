@@ -285,6 +285,27 @@ def t_determinism(work, corpus):
         a1, a2 = work / "det1.vfa", work / "det2.vfa"
         vfa("c", a1, corpus.name, "--method", m, *flags, cwd=corpus.parent); vfa("c", a2, corpus.name, "--method", m, *flags, cwd=corpus.parent)
         check(f"determinism: same input -> identical archive ({m}{' solid' if flags else ''})", a1.read_bytes() == a2.read_bytes())
+    # --threads N compresses blocks in parallel and decodes them in parallel on extract (the header records the
+    # --threads hint, so VFA1 archives differ there; the round trip is what must hold)
+    for flags in ([], ["--solid", "--solid-chunk-exp", "16"]):
+        arc = work / "thr.vfa"; vfa("c", arc, corpus.name, "--block-exp", "16", "--threads", "4", *flags, cwd=corpus.parent)
+        ok, why = extract_cmp(arc, corpus, work, "--threads", "4")
+        check(f"--threads 4: round-trip ({' '.join(flags) or 'non-solid'})", ok, why)
+    # the worker count is sized by the unit a worker holds: with --solid that is the solid chunk, not --block-exp
+    import vfa as V, concurrent.futures as cf, contextlib, io
+    pools = []; real_pool = V.ThreadPoolExecutor
+    class Pool(cf.ThreadPoolExecutor):
+        def __init__(self, max_workers=None, *a, **k): pools.append(max_workers); super().__init__(max_workers, *a, **k)
+    def used(*flags):
+        pools.clear(); V.ThreadPoolExecutor = Pool; cwd = os.getcwd(); os.chdir(corpus.parent)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                V.main(["c", str(work / "thrb.vfa"), corpus.name, "--threads", "8", "--log-level", "quiet", *flags])
+        finally: V.ThreadPoolExecutor = real_pool; os.chdir(cwd)
+        return pools[:]
+    solid_pools, plain_pools = used("--solid", "--max-ram-mib", "64"), used("--max-ram-mib", "64")
+    check("--threads: the RAM budget counts the solid chunk (64 MiB budget, 64 MiB chunks -> one worker)",
+          solid_pools == [] and plain_pools == [8], f"solid {solid_pools}, non-solid {plain_pools}")
     # VFA1 uses only library codecs (zlib/lzma/zstd/...); the native-codec determinism tests are VFA2's 'native' group
 
 def t_sfx(work, corpus):
@@ -709,6 +730,29 @@ def t2_determinism(work, corpus):
         a1, a2 = work / "d2a.vfa", work / "d2b.vfa"
         vfa("c", a1, corpus.name, "--format", "vfa2", *flags, cwd=corpus.parent); vfa("c", a2, corpus.name, "--format", "vfa2", *flags, cwd=corpus.parent)
         check(f"vfa2 determinism: same input -> identical archive ({' '.join(flags) or 'non-solid'})", a1.read_bytes() == a2.read_bytes())
+    # parallel chunk encoding must not change a byte, and parallel decoding must restore the same tree
+    for flags in ([], ["--solid"], ["--solid", "--method", "cm"]):
+        a1, a4 = work / "d2t1.vfa", work / "d2t4.vfa"
+        for arc, t in ((a1, "1"), (a4, "4")):
+            vfa("c", arc, corpus.name, "--format", "vfa2", "--chunk-exp", "14", "--threads", t, *flags, cwd=corpus.parent)
+        label = ' '.join(flags) or 'non-solid'
+        check(f"vfa2 determinism: --threads 1 and 4 write identical archives ({label})", a1.read_bytes() == a4.read_bytes())
+        ok, why = extract_cmp(a4, corpus, work, "--threads", "4")
+        check(f"vfa2 --threads 4: round-trip ({label})", ok, why)
+    # workers=0 (the default) runs only as many decoders as fit in vx.AUTO_DECODE_BUDGET; an explicit count is used
+    import concurrent.futures as cf, vfa2 as V2
+    arc = work / "d2t4.vfa"; real_budget, real_pool = vx.AUTO_DECODE_BUDGET, cf.ThreadPoolExecutor; pools = []
+    class Pool(real_pool):
+        def __init__(self, max_workers=None, *a, **k): pools.append(max_workers); super().__init__(max_workers, *a, **k)
+    def used(budget, workers):
+        vx.AUTO_DECODE_BUDGET = budget; pools.clear(); V2.ThreadPoolExecutor = Pool
+        try:
+            with V2.Archive2(str(arc)) as a: a.unlock(); a.extract(str(work / "d2budget"), workers=workers)
+        finally: vx.AUTO_DECODE_BUDGET = real_budget; V2.ThreadPoolExecutor = real_pool; shutil.rmtree(work / "d2budget", ignore_errors=True)
+        return pools[:]
+    check("vfa2 extract: the automatic decoder count stays inside the memory budget",
+          used(1 << 20, 0) == [] and len(used(1 << 40, 0)) == (1 if (os.cpu_count() or 1) > 1 else 0) and used(1 << 20, 3) == [3],
+          f"{used(1 << 20, 0)} {used(1 << 40, 0)} {used(1 << 20, 3)}")
     # the archive must not depend on the order the filesystem lists directory entries in (NTFS sorts, ext4 does not)
     import vfa as V
     real_walk = os.walk

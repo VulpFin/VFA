@@ -16,6 +16,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse, getpass, io, os, sys, struct, time, pathlib, platform, json, stat, subprocess, ctypes
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+import threading
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from datetime import datetime
@@ -70,6 +74,7 @@ class VLog:
     LEVELS = {"quiet":0, "error":1, "warning":2, "info":3, "debug":4, "trace":5}
     def __init__(self, level:str="warning"):
         self.level = self.LEVELS.get(level, 2)
+        self._lock = threading.Lock()
     def _fmt(self, level_name:str, msg:str):
         now = datetime.now().strftime("%m/%d/%Y %H:%M:%S.%f")[:-1]  # 5 decimals
         prefix = f"[VFA {level_name.upper():<7}] {now}"
@@ -78,7 +83,8 @@ class VLog:
         return f"{prefix}{' ' * pad}| {msg}"
     def _emit(self, lvl:int, name:str, msg:str):
         if self.level >= lvl:
-            print(self._fmt(name, msg))
+            with self._lock:
+                print(self._fmt(name, msg))
     def error(self, msg:str):   self._emit(1, "ERROR", msg)
     def warning(self, msg:str): self._emit(2, "WARNING", msg)
     def info(self, msg:str):    self._emit(3, "INFO", msg)
@@ -94,16 +100,93 @@ def human_bytes(n:int) -> str:
         v /= 1024.0; i += 1
     return f"{v:.2f} {units[i]}"
 
+def _parallel_workers(requested:int, unit_bytes:int, ram_mib:int=0, *, enabled:bool=True, extra_bytes:int=0) -> int:
+    """Choose bounded worker count for independent compression units.
+
+    Each in-flight unit keeps both raw input and compressed output alive. With no
+    explicit limit, use a conservative 1 GiB scheduler budget; --max-ram-mib can
+    raise or lower it. extra_bytes is per-worker codec memory (the vulp-cm model).
+    """
+    if not enabled: return 1
+    cpu = os.cpu_count() or 1
+    wanted = cpu if not requested else int(requested)
+    if wanted <= 1: return 1
+    wanted = min(wanted, 32)
+    budget = max(64, int(ram_mib) if ram_mib else 1024) * (1 << 20)
+    by_memory = max(1, budget // max(1, int(unit_bytes) * 2 + int(extra_bytes)))
+    return max(1, min(wanted, by_memory))
+
+def _parallel_pending(workers:int) -> int:
+    """Keep a small ordered queue: enough work to occupy workers without hoarding input."""
+    return max(1, workers)
+
 class Progress:
-    def __init__(self, total_files:int, total_bytes:int):
+    def __init__(self, total_files:int, total_bytes:int, *, live:Optional[bool]=None, stream=None):
         self.total_files = total_files
         self.total_bytes = total_bytes
         self.done_files = 0
         self.done_bytes = 0
         self.start_ts = time.time()
-    def add_file(self, size:int, duration_s:float):
+        self.current_file = ""
+        self.current_size = 0
+        self.current_done = 0
+        self.phase = "Compressing"
+        self.stream = stream or sys.stderr
+        self.live = bool(self.stream.isatty()) if live is None else bool(live and self.stream.isatty())
+        self._last_render = 0.0
+        self._rendered = False
+
+    def begin_file(self, path:str, size:int):
+        self.current_file = path
+        self.current_size = max(0, int(size))
+        self.current_done = 0
+        self.phase = "Compressing"
+        self.render(force=True)
+
+    def update(self, amount:int):
+        amount = max(0, int(amount))
+        if not amount: return
+        self.current_done += amount
+        self.done_bytes += amount
+        self.render()
+
+    def finish_file(self):
         self.done_files += 1
-        self.done_bytes += size
+        self.render(force=True)
+
+    def set_phase(self, phase:str):
+        self.phase = phase
+        self.render(force=True)
+
+    def render(self, *, force:bool=False):
+        if not self.live: return
+        now = time.time()
+        if not force and now - self._last_render < 0.10: return
+        self._last_render = now
+        elapsed = max(0.0, now - self.start_ts)
+        rate = self.done_bytes / elapsed if elapsed > 0 else 0.0
+        remain = max(0, self.total_bytes - self.done_bytes)
+        eta = remain / rate if rate > 0 else float("inf")
+        ratio = (self.done_bytes / self.total_bytes) if self.total_bytes else 1.0
+        pct = min(100.0, max(0.0, ratio * 100.0))
+        eta_text = "--" if eta == float("inf") else f"{eta:.1f}s"
+        name = self.current_file.replace("\\", "/")
+        if len(name) > 42: name = "..." + name[-39:]
+        msg = (f"\r{self.phase}: {pct:6.2f}% | files {self.done_files}/{self.total_files} | "
+               f"bytes {human_bytes(self.done_bytes)}/{human_bytes(self.total_bytes)} | "
+               f"{human_bytes(rate)}/s | ETA {eta_text}")
+        if name: msg += f" | {name}"
+        print(msg, end="", file=self.stream, flush=True)
+        self._rendered = True
+
+    def finish(self):
+        if self.live and self._rendered:
+            print(file=self.stream, flush=True)
+            self._rendered = False
+
+    def add_file(self, size:int, duration_s:float):
+        self.update(size)
+        self.finish_file()
     def estimate(self):
         elapsed = time.time() - self.start_ts
         rate = self.done_bytes / elapsed if elapsed > 0 else 0.0
@@ -292,7 +375,7 @@ class TOC:
     def pack(self, solid: bool=False, block_recs=None)->bytes:
         """block_recs (frame_off, csz, usz, method, crc32) -> appended as the VTX1 extension (needs F_TOCX).
         Older readers stop after the entries and ignore it."""
-        if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("dataclass TOC function pack")
+        if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("TOC.pack: serializing archive index")
         if block_recs is not None:
             body = self.pack(solid)
             return body + vx.pack_tocx(block_recs, body)
@@ -320,7 +403,7 @@ class TOC:
 
 # ---------- Crypto ----------
 def kdf_derive_key(password:bytes, header:HeaderV1)->bytes:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("crypto func kdf derive key")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("kdf_derive_key: deriving archive data key")
     if header.kdf_id==KDF_ARGON2ID:
         argon2ll = vx._argon2()
         if argon2ll is None: raise RuntimeError("argon2-cffi not installed")
@@ -337,19 +420,19 @@ def kdf_derive_key(password:bytes, header:HeaderV1)->bytes:
     raise RuntimeError("Archive not password-protected")
 
 def aead_encrypt(key:bytes, header:HeaderV1, index:int, plaintext:bytes, aad:bytes=b"")->bytes:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"crypto func aead encrypt with index {index}")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"aead_encrypt: encrypting record index={index}")
     AESGCM = vx._crypto()[0]
     if header.aead_id!=AEAD_AESGCM or AESGCM is None: raise RuntimeError("AESGCM unavailable")
     return AESGCM(key).encrypt(nonce_from(header.aead_nonce_prefix, index), plaintext, aad)
 def aead_decrypt(key:bytes, header:HeaderV1, index:int, ciphertext:bytes, aad:bytes=b"")->bytes:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"crypto func aead decrypt with index {index}")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"aead_decrypt: decrypting record index={index}")
     AESGCM = vx._crypto()[0]
     if header.aead_id!=AEAD_AESGCM or AESGCM is None: raise RuntimeError("AESGCM unavailable")
     return AESGCM(key).decrypt(nonce_from(header.aead_nonce_prefix, index), ciphertext, aad)
 
 # ---------- Compression ----------
 def compress_block(method:int, level:int, data:bytes)->bytes:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"compression func compress block with method {method} data {len(data)} level {level}")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"compress_block: method={METHOD_NAMES.get(method, method)} raw={len(data)} level={level}")
     if method==M_NONE: return data
     if method==M_ZLIB: return zlib.compress(data, level if 1<=level<=9 else 6)
     if method==M_LZMA:
@@ -375,7 +458,7 @@ def compress_block(method:int, level:int, data:bytes)->bytes:
     raise RuntimeError("unknown method")
 
 def decompress_block(method:int, data:bytes)->bytes:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"compression func decompress block with method {method} data {len(data)}")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"decompress_block: method={METHOD_NAMES.get(method, method)} payload={len(data)}")
     if method==M_NONE: return data
     if method==M_ZLIB: return zlib.decompress(data)
     if method==M_LZMA: return lzma.decompress(data, format=lzma.FORMAT_ALONE)
@@ -396,7 +479,7 @@ def decompress_block(method:int, data:bytes)->bytes:
 
 # ---------- Footer ----------
 def write_footer(bw:io.BufferedWriter, toc_offset:int, toc_size:int, hash_kind:int, digest:bytes):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("footer func write footer")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("write_footer: writing digest and end marker")
     bw.write(struct.pack("<Q", toc_offset)); bw.write(struct.pack("<I", toc_size))
     bw.write(struct.pack("<B", hash_kind))
     if len(digest)==32: bw.write(digest)
@@ -408,7 +491,7 @@ def write_footer(bw:io.BufferedWriter, toc_offset:int, toc_size:int, hash_kind:i
 # ---------- Walkers & Metadata ----------
 def iter_tree(paths: List[str]):
     """Yield (pathlib.Path, lstat, entry_type). Includes dirs (even empty), symlinks, files."""
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func iter tree")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("iter_tree: walking input paths")
     for p in paths:
         pth = pathlib.Path(p)
         if pth.is_dir():
@@ -438,11 +521,11 @@ def iter_tree(paths: List[str]):
 
 # Hardlink table (Linux): map (dev, ino) -> first path
 def hl_key(st):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func hl key")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("hl_key: checking inode identity")
     return (getattr(st, "st_dev", None), getattr(st, "st_ino", None))
 
 def posix_capture_meta(path:str, st)->dict:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func posix capture meta")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("posix_capture_meta: capturing Unix metadata")
     meta={"posix":{
         "uid": getattr(st,"st_uid",0),
         "gid": getattr(st,"st_gid",0),
@@ -454,7 +537,7 @@ def posix_capture_meta(path:str, st)->dict:
     return meta
 
 def list_xattrs(path:str, follow_symlinks:bool)->Dict[str,bytes]:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func list xattrs")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("list_xattrs: reading extended attributes")
     out={}
     if hasattr(os, "listxattr") and hasattr(os, "getxattr"):
         try:
@@ -468,14 +551,14 @@ def list_xattrs(path:str, follow_symlinks:bool)->Dict[str,bytes]:
     return out
 
 def apply_xattrs(path:str, xattrs:Dict[str,bytes], follow_symlinks:bool):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func apply xattrs")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("apply_xattrs: restoring extended attributes")
     if hasattr(os, "setxattr"):
         for n,v in xattrs.items():
             try: os.setxattr(path, n, v, follow_symlinks=follow_symlinks)
             except Exception: pass
 
 def getfacl_dump(path:str)->Optional[str]:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func getfacl dump")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("getfacl_dump: capturing POSIX ACL")
     try:
         r = subprocess.run(["getfacl","--absolute-names","--tabs","-p","--", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if r.returncode==0: return r.stdout.decode("utf-8", "replace")
@@ -483,21 +566,21 @@ def getfacl_dump(path:str)->Optional[str]:
     return None
 
 def setfacl_restore(text:str, path:str):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func setfacl restore")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("setfacl_restore: restoring POSIX ACL")
     try:
         p = subprocess.Popen(["setfacl","--restore=-"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         p.communicate(input=text.encode("utf-8", "replace"))
     except Exception: pass
 
 def selinux_get(path:str, follow_symlinks:bool)->Optional[bytes]:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func selinux get")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("selinux_get: reading SELinux context")
     try:
         return os.getxattr(path, "security.selinux", follow_symlinks=follow_symlinks)
     except Exception:
         return None
 
 def fallocate_punch_hole(fd:int, offset:int, length:int):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"walkers and metadata func fallocate punch hole")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("fallocate_punch_hole: attempting sparse-hole restore")
     # Linux only, best-effort
     if not LIN: return
     try:
@@ -510,7 +593,7 @@ def fallocate_punch_hole(fd:int, offset:int, length:int):
 
 def detect_sparse(path:str)->List[Tuple[int,int]]:
     """Return list of (offset,length) holes using SEEK_HOLE/SEEK_DATA if supported; else []"""
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func detect sparse")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("detect_sparse: scanning file holes")
     holes=[]
     if not LIN: return holes
     try:
@@ -530,7 +613,7 @@ def detect_sparse(path:str)->List[Tuple[int,int]]:
 
 # ---------- Windows meta helpers ----------
 def win_capture_meta(path:str)->dict:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func win capture meta")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("win_capture_meta: capturing Windows metadata")
     meta={}
     if not (WIN and HAVE_WIN32): return meta
     try:
@@ -585,7 +668,7 @@ def _safe_ads_name(name) -> bool:
 def win_apply_meta(path:str, meta:dict, is_dir:bool, full:bool=False):
     """Attributes and timestamps always; owner/DACL (sddl) and alternate data streams only with full=True
     (vfa x --winmeta), because they let an archive decide who may write the extracted files."""
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("walkers and metadata func win apply meta")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("win_apply_meta: restoring Windows metadata")
     if not (WIN and HAVE_WIN32): return
     if not full:
         meta = {k: v for k, v in meta.items() if k not in ("sddl", "ads")}
@@ -654,7 +737,7 @@ def _unlock(c: "vx.Container", args):
     c.unlock(pw)
 
 def _recompute_hash_until(bf, upto:int, hash_kind:int)->bytes:
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func recompute hash util")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("_recompute_hash_until: hashing archive prefix")
     bf.seek(0); h=make_hasher(hash_kind); done=0
     while done<upto:
         chunk=bf.read(min(1024*1024, upto-done))
@@ -677,8 +760,10 @@ class _BlockSink:
         self.f=f; self.header=header; self.key=key; self.hasher=hasher; self.index=index
         self.recs = recs if recs is not None else []
     def put(self, method:int, level:int, chunk:bytes):
-        off = self.f.tell()
         comp = compress_block(method, level, chunk)
+        return self.put_compressed(method, chunk, comp)
+    def put_compressed(self, method:int, chunk:bytes, comp:bytes):
+        off = self.f.tell()
         payload = comp if self.key is None else aead_encrypt(self.key, self.header, self.index, comp, aad=b"vfa-data")
         if len(payload) > 0xFFFFFFFF: raise SystemExit("A compressed block exceeded 4 GiB; use a smaller --block-exp")
         frame = struct.pack("<IB", len(payload), method)
@@ -687,24 +772,60 @@ class _BlockSink:
             hasher_update(self.hasher, frame, default_hash_kind()); hasher_update(self.hasher, payload, default_hash_kind())
         self.recs.append((off, len(payload), len(chunk), method, vx.crc32(chunk)))
         idx = self.index; self.index += 1
+        if LOGGER.level >= VLog.LEVELS["trace"]:
+            LOGGER.trace(f"_BlockSink.put: block={idx} raw={len(chunk)} stored={len(payload)} method={METHOD_NAMES.get(method, method)}")
         return (idx, len(chunk), len(payload), method)
 
 class _SolidStream:
     """Buffers the solid byte stream and emits a block every chunk_size bytes, so memory stays at about one block."""
-    def __init__(self, sink:_BlockSink, method:int, level:int, chunk_size:int):
+    def __init__(self, sink:_BlockSink, method:int, level:int, chunk_size:int, executor=None, max_pending:int=1):
         self.sink=sink; self.method=method; self.level=level; self.cs=chunk_size; self.buf=bytearray(); self.pos=0
-    def write(self, data:bytes):
+        self.executor = executor; self.max_pending = max(1, max_pending); self.pending = deque()
+    def _drain_one(self):
+        raw, future = self.pending.popleft()
+        self.sink.put_compressed(self.method, raw, future.result())
+    def _emit(self, chunk:bytes):
+        if self.executor is None:
+            self.sink.put(self.method, self.level, chunk)
+            return
+        self.pending.append((chunk, self.executor.submit(compress_block, self.method, self.level, chunk)))
+        if len(self.pending) >= self.max_pending:
+            self._drain_one()
+    def write(self, data:bytes, progress=None):
         self.pos += len(data); mv = memoryview(data)
         while len(mv):
             take = min(self.cs - len(self.buf), len(mv))
             self.buf += mv[:take]; mv = mv[take:]
             if len(self.buf) == self.cs:
                 chunk = bytes(self.buf); self.buf = bytearray()    # release the buffer before compressing
-                self.sink.put(self.method, self.level, chunk); del chunk
+                self._emit(chunk); del chunk
+                if LOGGER.level >= VLog.LEVELS["trace"]:
+                    LOGGER.trace(f"_SolidStream.write: emitted full block raw={self.cs} stream_pos={self.pos}")
+        if progress is not None: progress(len(data))
     def flush(self):
         if self.buf:
             chunk = bytes(self.buf); self.buf = bytearray()
-            self.sink.put(self.method, self.level, chunk)
+            self._emit(chunk)
+            if LOGGER.level >= VLog.LEVELS["trace"]:
+                LOGGER.trace(f"_SolidStream.flush: emitted final block raw={len(chunk)} stream_pos={self.pos}")
+        while self.pending:
+            self._drain_one()
+
+def _parallel_blocks(sink:_BlockSink, method:int, level:int, chunks, executor, max_pending:int):
+    """Compress chunks concurrently, but yield completed blocks in input order."""
+    if executor is None:
+        for chunk in chunks:
+            yield sink.put(method, level, chunk)
+        return
+    pending = deque()
+    for chunk in chunks:
+        pending.append((chunk, executor.submit(compress_block, method, level, chunk)))
+        if len(pending) >= max_pending:
+            raw, future = pending.popleft()
+            yield sink.put_compressed(method, raw, future.result())
+    while pending:
+        raw, future = pending.popleft()
+        yield sink.put_compressed(method, raw, future.result())
 
 def _check_exp(name:str, v, lo:int):
     if v is not None and not (lo <= int(v) <= MAX_BLOCK_EXP):
@@ -761,6 +882,8 @@ def cmd_create_v2(args):
     """VFA2 (see VFA2.md). Coders: lz (default), cm (vulp-cm where it beats lz), tans or stored; filter per chunk: auto (default) or forced with
     --filter; content-defined dedup across chunks unless --no-dedup or encrypting."""
     import vfa2
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("cmd_create_v2: creating VFA2 archive")
+    vfa2.set_logger(LOGGER)
     if args.method not in (None, "lz", "cm", "tans", "none", "stored"):
         raise SystemExit(f"VFA2 has the coders 'lz' (default), 'cm', 'tans' and 'stored'/'none'; --method {args.method} is a VFA1 method")
     coder = {"none": 0, "stored": 0, "tans": 1, "cm": vfa2.CODER_CM}.get(args.method, vfa2.CODER_LZ)
@@ -778,26 +901,43 @@ def cmd_create_v2(args):
     _check_exp("--chunk-exp", args.chunk_exp, 12)
     pw = get_password(args) if _wants_password(args) else None
     items = _collect_items(args, args.solid)
+    file_items = [it for it in items if it[2] == ET_FILE]
+    total_files = len(file_items)
+    total_bytes = sum(int(getattr(st, "st_size", 0)) for _, st, _ in file_items)
+    prog = Progress(total_files, total_bytes, live=bool(args.solid))
+    chunk_size = 1 << args.chunk_exp
+    workers = _parallel_workers(args.threads, chunk_size, args.max_ram_mib, enabled=coder != 0,
+                                extra_bytes=vfa2.cm_model_bytes(vfa2.cm_bits(args.level)) if coder == vfa2.CODER_CM else 0)
+    executor_context = ThreadPoolExecutor(max_workers=workers) if workers > 1 else nullcontext()
+    if workers > 1:
+        LOGGER.info(f"Parallel compression enabled: {workers} worker threads, up to {_parallel_pending(workers)} chunks in flight")
     nfiles = 0; total = 0; t0 = time.time()
-    with open(args.output, "wb") as f:
-        w = vfa2.Writer2(f, chunk_size=1 << args.chunk_exp, solid=args.solid, password=pw, coder=coder, filt=filt,
+    with open(args.output, "wb") as f, executor_context as executor:
+        w = vfa2.Writer2(f, chunk_size=chunk_size, solid=args.solid, password=pw, coder=coder, filt=filt,
                          level=args.level, dedup=not args.no_dedup, cdc=not args.no_dedup,
-                         kdf=(args.kdf_time or 3, args.kdf_mem_kib or 256 * 1024, args.kdf_parallel or 4))
+                         kdf=(args.kdf_time or 3, args.kdf_mem_kib or 256 * 1024, args.kdf_parallel or 4),
+                         progress=prog.update, executor=executor, max_pending=_parallel_pending(workers))
         for et, rel, st, meta in _scan_inputs(items, args):
             mode = st.st_mode & 0o7777; ns = st.st_mtime_ns
             if et == ET_DIR: w.add_dir(rel, mode, 0, meta, mtime_ns=ns)
-            elif et in (ET_SYMLINK, ET_HARDLINK): w.add_link(rel, et == ET_HARDLINK, mode, 0, meta, mtime_ns=ns)
+            elif et in (ET_SYMLINK, ET_HARDLINK):
+                w.add_link(rel, et == ET_HARDLINK, mode, 0, meta, mtime_ns=ns)
+                if et == ET_HARDLINK:
+                    prog.begin_file(rel, st.st_size); prog.update(st.st_size); prog.finish_file()
             else:
+                prog.begin_file(rel, st.st_size)
                 with open(rel, "rb") as fr: n = w.add_file(rel, mode, 0, fr, meta, mtime_ns=ns)
                 if n != st.st_size: LOGGER.warning(f"{rel} changed size while being archived ({st.st_size} -> {n} bytes)")
+                prog.finish_file()
                 nfiles += 1; total += n
         w.close()
+    prog.finish()
     LOGGER.info(f"Done in {time.time() - t0:.2f}s | files {nfiles} | src {human_bytes(total)} | chunks {len(w.chunks)} | arch {human_bytes(w.pos)}"
                 + (f" | dedup {w.dedup_segments} segments, {human_bytes(w.dedup_bytes)}" if w.cdc else ""))
     print(f"Created {args.output} (VFA2) with {len(w.entries)} entry(s), {len(w.chunks)} chunk(s). Solid={bool(args.solid)}")
 
 def cmd_create(args):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd create")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace(f"cmd_create: dispatching format={args.format}")
     if args.format == "vfa2": return cmd_create_v2(args)
     if args.method in ("tans", "lz", "cm"): raise SystemExit(f"--method {args.method} is a VFA2 coder; add --format vfa2")
     if args.filter != "auto": raise SystemExit("--filter applies to --format vfa2 only")
@@ -824,7 +964,14 @@ def cmd_create(args):
     toc=TOC()
     hk = default_hash_kind()
 
-    with open(args.output,"wb") as f:
+    # a worker holds one unit: a solid chunk, or one block of a non-solid file
+    chunk_exp = int(args.solid_chunk_exp if args.solid_chunk_exp is not None else DEFAULT_SOLID_CHUNK_EXP)
+    unit_size = 1 << chunk_exp if args.solid else block_size
+    workers = _parallel_workers(args.threads, unit_size, args.max_ram_mib, enabled=method != M_NONE)
+    executor_context = ThreadPoolExecutor(max_workers=workers) if workers > 1 else nullcontext()
+    if workers > 1:
+        LOGGER.info(f"Parallel compression enabled: {workers} worker threads, up to {_parallel_pending(workers)} blocks in flight")
+    with open(args.output,"wb") as f, executor_context as executor:
         bw=f
         header_bytes = header.pack()
         bw.write(header_bytes)
@@ -838,37 +985,41 @@ def cmd_create(args):
         file_items = [it for it in items if it[2] == ET_FILE]
         total_files = len(file_items)
         total_bytes = sum(int(getattr(st, "st_size", 0)) for _, st, _ in file_items)
-        prog = Progress(total_files, total_bytes)
+        prog = Progress(total_files, total_bytes, live=bool(header.flags & F_SOLID))
         LOGGER.info(f"Preparing to compress {total_files} files ({human_bytes(total_bytes)}). Solid={bool(args.solid)} method={args.method} lvl={args.level}")
         solid = None
         if header.flags & F_SOLID:
-            chunk_exp = args.solid_chunk_exp if args.solid_chunk_exp is not None else DEFAULT_SOLID_CHUNK_EXP
-            LOGGER.info(f"Solid chunk size {human_bytes(1<<int(chunk_exp))}")
-            solid = _SolidStream(sink, method, args.level, 1 << int(chunk_exp))
+            LOGGER.info(f"Solid chunk size {human_bytes(unit_size)}")
+            solid = _SolidStream(sink, method, args.level, unit_size, executor, _parallel_pending(workers))
 
         for et, rel, st, meta_bytes in _scan_inputs(items, args):
             st_mode = (st.st_mode & 0o7777)
             st_mtime = int(getattr(st, "st_mtime", time.time()))
             if et != ET_FILE:
                 toc.entries.append(FileEntry(rel, st_mode, st_mtime, 0, [], 0, et, meta_bytes))
+                if et == ET_HARDLINK:
+                    prog.begin_file(rel, st.st_size); prog.update(st.st_size); prog.finish_file()
                 continue
             size = int(st.st_size)
             t0 = time.time()
+            prog.begin_file(rel, size)
+            if LOGGER.level >= VLog.LEVELS["trace"]:
+                LOGGER.trace(f"cmd_create: encoding file {rel} raw={size} solid={solid is not None}")
             if solid is not None:
                 LOGGER.debug(f"Streaming file {rel} ({human_bytes(size)}) into solid stream")
                 entry = FileEntry(rel, st_mode, st_mtime, 0, [], solid.pos, ET_FILE, meta_bytes)
                 for piece in _read_pieces(rel):
-                    solid.write(piece); entry.size += len(piece)
+                    solid.write(piece, prog.update); entry.size += len(piece)
             else:
                 LOGGER.debug(f"Compressing file {rel} ({human_bytes(size)})")
                 entry = FileEntry(rel, st_mode, st_mtime, 0, [], 0, ET_FILE, meta_bytes)
-                for chunk in _read_pieces(rel, block_size):
-                    entry.blocks.append(sink.put(method, args.level, chunk)); entry.size += len(chunk)
+                for block in _parallel_blocks(sink, method, args.level, _read_pieces(rel, block_size), executor, _parallel_pending(workers)):
+                    entry.blocks.append(block); entry.size += block[1]; prog.update(block[1])
             if entry.size != size:
                 LOGGER.warning(f"{rel} changed size while being archived ({size} -> {entry.size} bytes); stored what was read")
             toc.entries.append(entry)
             duration = time.time() - t0
-            prog.add_file(entry.size, duration)
+            prog.finish_file()
             if LOGGER.level >= VLog.LEVELS["debug"]:
                 arch_so_far = bw.tell()
                 elapsed, eta, rate, ratio = prog.estimate()
@@ -881,6 +1032,7 @@ def cmd_create(args):
                 )
 
         if solid is not None:
+            prog.set_phase("Finalizing solid stream")
             solid.flush()
             arch_so_far = bw.tell()
             saved = max(0, prog.done_bytes - arch_so_far)
@@ -891,13 +1043,14 @@ def cmd_create(args):
             )
 
         toc_data = toc.pack(solid=bool(header.flags & F_SOLID), block_recs=sink.recs)
-        LOGGER.trace("Writing TOC...")
+        LOGGER.trace("cmd_create: writing VFA1 TOC and footer")
         if key is not None: toc_data = aead_encrypt(key, header, vx.toc_nonce_index(0), toc_data, aad=b"vfa-toc")
         toc_off = bw.tell(); bw.write(toc_data); toc_sz=len(toc_data); hasher_update(hasher, toc_data, hk)
         digest=hasher_digest(hasher, hk); write_footer(bw, toc_off, toc_sz, hk, digest)
         arch_final = bw.tell()
 
     elapsed, eta, rate, ratio = prog.estimate()
+    prog.finish()
     saved = max(0, prog.done_bytes - arch_final)
     ratio_final = (arch_final / prog.done_bytes) if prog.done_bytes else 0.0
     LOGGER.info(
@@ -914,7 +1067,7 @@ def vfa2_coder_name(cid):
     import vfa2; return vfa2.CODER_NAMES.get(cid, f"#{cid}")
 
 def cmd_list(args):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd list")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("cmd_list: reading archive index")
     with vx.open_container(args.archive) as c:
         _unlock(c, args)
         if getattr(c, "format", "VFA1") == "VFA2":
@@ -946,7 +1099,7 @@ def cmd_list(args):
 
 def cmd_test(args):
     """Exit code 0 only if the footer digest matches and every block decodes (and passes its CRC32)."""
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd test")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("cmd_test: verifying archive")
     LOGGER.info("Verifying archive footer hash and block integrity...")
     with vx.open_container(args.archive) as c:
         ok = c.verify_digest()
@@ -963,7 +1116,7 @@ def cmd_test(args):
         if ok is False: raise SystemExit(1)
 
 def cmd_extract(args):
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd extract")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("cmd_extract: extracting archive")
     outdir = args.output or "."
     with vx.open_container(args.archive) as c:
         if not args.no_verify:
@@ -1006,13 +1159,14 @@ def cmd_extract(args):
             LOGGER.trace(f"Restored metadata for {e['path']}")
 
         files, dirs = c.extract(outdir, members=args.members or None, links=LIN,
-                                keep_mode_bits=(0o7777 if args.posixmeta else 0o777), after_entry=after)
+                                keep_mode_bits=(0o7777 if args.posixmeta else 0o777), after_entry=after,
+                                workers=args.threads)
         LOGGER.info(f"Extracted {len(files)} file(s) to {outdir}")
 
 def cmd_append(args):
     """Append files. Non-solid: new blocks per file. Solid: the new files continue the solid stream in new
     blocks (existing blocks are never rewritten). The archive is upgraded to VFA 1.1 (block table, SHA-256)."""
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa core func cmd append")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("cmd_append: appending to archive")
     with vx.open_container(args.archive) as c:
         if getattr(c, "format", "VFA1") == "VFA2":
             raise SystemExit("Append to VFA2 archives is not implemented yet (the format allows it; see VFA2.md)")
@@ -1096,7 +1250,7 @@ def cmd_append(args):
 
 # ---------- CLI ----------
 def build_argparser():
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa cli func build argparser")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("build_argparser: building command-line parser")
     from vfa_version import __version__, version_text, route_output
     ap = argparse.ArgumentParser(
         prog="vfa", description=f"VulpFin Archive (.vfa) {__version__}"
@@ -1140,7 +1294,7 @@ def build_argparser():
     )
     ap_c.add_argument("--threads", type=int, default=0, help="Worker threads (0=auto)")
     ap_c.add_argument(
-        "--max-ram-mib", type=int, default=0, help="Max RAM usage (MiB, 0=unlimited)"
+        "--max-ram-mib", type=int, default=0, help="Compression worker RAM budget (MiB, 0=auto/1 GiB)"
     )
     ap_c.add_argument(
         "--password",
@@ -1242,6 +1396,10 @@ def build_argparser():
     ap_x.add_argument(
         "--password", action="store_true", help="Prompt for password if encrypted"
     )
+    ap_x.add_argument(
+        "--threads", type=int, default=0,
+        help="Extraction decoder threads (0=automatic, 1=single-threaded; default: 0)"
+    )
     ap_x.add_argument("members", nargs="*", help="Only extract these archive paths (a directory selects everything below it)")
     ap_x.add_argument("--no-verify", action="store_true", help="Skip the whole-archive digest check (blocks are still size/CRC checked)")
     ap_x.add_argument("--winmeta", action="store_true", help="Windows: also restore owner/ACL (SDDL) and alternate data streams")
@@ -1266,7 +1424,7 @@ def build_argparser():
 def main(argv=None):
     # set global logger
     global LOGGER
-    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("vfa runner main")
+    if LOGGER.level >= VLog.LEVELS["trace"]: LOGGER.trace("main: starting VFA command")
     for stream in (sys.stdout, sys.stderr):    # a legacy console code page must not crash `vfa l` on a Unicode name
         try: stream.reconfigure(errors="backslashreplace")
         except Exception: pass
