@@ -724,6 +724,20 @@ def t2_determinism(work, corpus):
         check(f"vfa2 determinism: --threads 1 and 4 write identical archives ({label})", a1.read_bytes() == a4.read_bytes())
         ok, why = extract_cmp(a4, corpus, work, "--threads", "4")
         check(f"vfa2 --threads 4: round-trip ({label})", ok, why)
+    # workers=0 (the default) runs only as many decoders as fit in vx.AUTO_DECODE_BUDGET; an explicit count is used
+    import concurrent.futures as cf, vfa2 as V2
+    arc = work / "d2t4.vfa"; real_budget, real_pool = vx.AUTO_DECODE_BUDGET, cf.ThreadPoolExecutor; pools = []
+    class Pool(real_pool):
+        def __init__(self, max_workers=None, *a, **k): pools.append(max_workers); super().__init__(max_workers, *a, **k)
+    def used(budget, workers):
+        vx.AUTO_DECODE_BUDGET = budget; pools.clear(); V2.ThreadPoolExecutor = Pool
+        try:
+            with V2.Archive2(str(arc)) as a: a.unlock(); a.extract(str(work / "d2budget"), workers=workers)
+        finally: vx.AUTO_DECODE_BUDGET = real_budget; V2.ThreadPoolExecutor = real_pool; shutil.rmtree(work / "d2budget", ignore_errors=True)
+        return pools[:]
+    check("vfa2 extract: the automatic decoder count stays inside the memory budget",
+          used(1 << 20, 0) == [] and len(used(1 << 40, 0)) == (1 if (os.cpu_count() or 1) > 1 else 0) and used(1 << 20, 3) == [3],
+          f"{used(1 << 20, 0)} {used(1 << 40, 0)} {used(1 << 20, 3)}")
     # the archive must not depend on the order the filesystem lists directory entries in (NTFS sorts, ext4 does not)
     import vfa as V
     real_walk = os.walk

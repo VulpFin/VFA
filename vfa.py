@@ -100,12 +100,12 @@ def human_bytes(n:int) -> str:
         v /= 1024.0; i += 1
     return f"{v:.2f} {units[i]}"
 
-def _parallel_workers(requested:int, unit_bytes:int, ram_mib:int=0, *, enabled:bool=True) -> int:
+def _parallel_workers(requested:int, unit_bytes:int, ram_mib:int=0, *, enabled:bool=True, extra_bytes:int=0) -> int:
     """Choose bounded worker count for independent compression units.
 
     Each in-flight unit keeps both raw input and compressed output alive. With no
     explicit limit, use a conservative 1 GiB scheduler budget; --max-ram-mib can
-    raise or lower it.
+    raise or lower it. extra_bytes is per-worker codec memory (the vulp-cm model).
     """
     if not enabled: return 1
     cpu = os.cpu_count() or 1
@@ -113,7 +113,7 @@ def _parallel_workers(requested:int, unit_bytes:int, ram_mib:int=0, *, enabled:b
     if wanted <= 1: return 1
     wanted = min(wanted, 32)
     budget = max(64, int(ram_mib) if ram_mib else 1024) * (1 << 20)
-    by_memory = max(1, budget // max(1, int(unit_bytes) * 2))
+    by_memory = max(1, budget // max(1, int(unit_bytes) * 2 + int(extra_bytes)))
     return max(1, min(wanted, by_memory))
 
 def _parallel_pending(workers:int) -> int:
@@ -906,7 +906,8 @@ def cmd_create_v2(args):
     total_bytes = sum(int(getattr(st, "st_size", 0)) for _, st, _ in file_items)
     prog = Progress(total_files, total_bytes, live=bool(args.solid))
     chunk_size = 1 << args.chunk_exp
-    workers = _parallel_workers(args.threads, chunk_size, args.max_ram_mib, enabled=coder != 0)
+    workers = _parallel_workers(args.threads, chunk_size, args.max_ram_mib, enabled=coder != 0,
+                                extra_bytes=vfa2.cm_model_bytes(vfa2.cm_bits(args.level)) if coder == vfa2.CODER_CM else 0)
     executor_context = ThreadPoolExecutor(max_workers=workers) if workers > 1 else nullcontext()
     if workers > 1:
         LOGGER.info(f"Parallel compression enabled: {workers} worker threads, up to {_parallel_pending(workers)} chunks in flight")

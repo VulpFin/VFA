@@ -158,6 +158,11 @@ def cm_bits(level) -> int:
     level = int(level)
     return 20 if level <= 3 else 22 if level <= 6 else 24
 
+def cm_model_bytes(tbits: int = CM_MAXBITS) -> int:
+    """Memory one vulp-cm encoder or decoder allocates (vulp_cm.c: nine 2^bits context tables, the 4-byte match
+    table and the two APMs). Thread pools add it per worker."""
+    return (13 << tbits) + (256 + 65536) * 33 * 2
+
 def _cm_encode(raw, level=5):
     """None when vulp-cm would not make the data smaller."""
     if not NATIVE: raise VFAError(f"vulp-cm encoding needs the C codec: {NATIVE_PROBLEM}")
@@ -904,6 +909,12 @@ class Archive2(vx.Extractable):
         _trace(f"Archive2._parse_index: parsed {len(entries)} entries, {len(self.chunks)} chunks, {len(self.records)} records")
 
     # -- chunk access --
+    def _decode_unit_bytes(self, sel_files) -> int:
+        """Memory one decoder worker holds: the decoded chunk and its payload (never larger than the chunk), plus
+        the vulp-cm model when the archive has vulp-cm chunks."""
+        cm = any(c[3] == CODER_CM for c in self.chunks)
+        return max((2 * c[1] for c in self.chunks), default=0) + (cm_model_bytes() if cm else 0)
+
     def _decode_chunk(self, i: int) -> bytes:
         """Decode one chunk without touching the shared LRU cache."""
         _trace(f"Archive2._decode_chunk: decoding chunk={i}")

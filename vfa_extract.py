@@ -104,6 +104,7 @@ HEADER_LEN = 4 + 2 + 4 + 1 + 1 + 1 + 2 + 4 + 1 + 4 + 4 + 1 + 16 + 1 + 12 + 16   
 FOOTER_LEN = 8 + 4 + 1 + 32 + 5  # toc_off u64, toc_sz u32, hash_kind u8, digest[32], END_MAGIC[5]
 FRAME_HDR = 5                    # u32 payload_len, u8 method
 MAX_BLOCK = 1 << 30              # writers never put more than this in one block
+AUTO_DECODE_BUDGET = 1 << 30     # extract with workers=0 runs only as many decoders as fit in this (blocks can be 1 GiB)
 
 # TOC extension: [b"VTX1"][u32 nrec] then nrec * ([u16 type][u16 rflags][u32 len][data])
 TOCX_MAGIC = b"VTX1"
@@ -584,7 +585,8 @@ def _alias_key_for(dest: str):
 
 class Extractable:
     """Selection + safe extraction shared by every container format. A subclass provides entries (dicts with path,
-    mode, mtime, size, entry_type, meta) and _write_files(), which writes the selected regular files."""
+    mode, mtime, size, entry_type, meta), _write_files(), which writes the selected regular files, and
+    _decode_unit_bytes(), the memory one decoder worker holds (it bounds the automatic worker count)."""
     manifest: Optional[dict] = None
     stub_end = 0
 
@@ -635,6 +637,9 @@ class Extractable:
         if requested_workers < 0:
             raise VFAError("Extraction worker count cannot be negative.")
         workers = min(32, requested_workers or min(8, os.cpu_count() or 1))
+        if not requested_workers and workers > 1:
+            # each worker holds a decoded unit while one more is being written out
+            workers = min(workers, AUTO_DECODE_BUDGET // max(1, self._decode_unit_bytes(sel_files)) - 1)
         workers = max(1, workers)
         if workers > 1:
             LOGGER.info(f"Extraction decoder worker target: {workers} threads")
@@ -950,6 +955,11 @@ class Container(Extractable):
             if unused: LOGGER.warning(f"{unused} block(s) are not referenced by any entry.")
         return {"blocks": nblk, "bytes": total}
 
+
+    def _decode_unit_bytes(self, sel_files) -> int:
+        """Memory one decoder worker holds: a decoded block and its payload."""
+        if self.solid: return max(((b.usz or 0) + b.csz for b in self.blocks), default=0)
+        return max((usz + csz for e in sel_files for _, usz, csz, _ in e["blocks"]), default=0)
 
     def _solid_blocks_parallel(self, intervals: List[Tuple[int, int]], workers: int) -> Iterator[Tuple[int, bytes]]:
         """Decode needed solid blocks concurrently, yielding them in stream order.
