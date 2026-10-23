@@ -64,7 +64,7 @@ def msvc_tool(env, name):
     *parent's* PATH, which may hold a different, broken copy."""
     return shutil.which(name, path=_env_get(env, "PATH"))
 
-def build():
+def build(build_temp=None):
     from setuptools import Extension, Distribution
     if os.name == "nt":
         env = msvc_env()
@@ -79,7 +79,8 @@ def build():
     flags = ["/W4"] if os.name == "nt" else ["-O2", "-std=c99", "-Wall", "-Wextra"]      # setuptools already passes /O2
     ext = Extension("_vulp", [str(p.relative_to(ROOT)) for p in SRC], include_dirs=["vulp"], extra_compile_args=flags)
     dist = Distribution({"name": "vulp", "ext_modules": [ext], "script_name": "build_vulp.py"})
-    cmd = dist.get_command_obj("build_ext"); cmd.inplace = True; cmd.build_temp = str(ROOT / "build" / "vulp")
+    cmd = dist.get_command_obj("build_ext"); cmd.inplace = True
+    cmd.build_temp = str(pathlib.Path(build_temp) if build_temp else ROOT / "build" / "vulp")
     cmd.force = True       # setuptools tracks only the .c files, not vulp.h: never reuse an old object or module
     cwd = os.getcwd(); os.chdir(ROOT)
     try:
@@ -99,6 +100,8 @@ def check():
     print(f"[vulp] import OK ({m.__file__}); {len(data)} -> {len(enc)} bytes round-trips")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("--check", action="store_true"); a = ap.parse_args()
-    build()
+    ap = argparse.ArgumentParser(); ap.add_argument("--check", action="store_true")
+    ap.add_argument("--build-temp", help="private compiler temporary directory")
+    a = ap.parse_args()
+    build(a.build_temp)
     if a.check: check()

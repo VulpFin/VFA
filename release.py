@@ -17,10 +17,12 @@ runtime packages from pyproject.toml plus the build tools), builds the _vulp C e
     release/<version>/RESULTS-<os>.md           which test runs passed, on which Python, and what was built
 
 Finding Python X: Windows uses the py launcher (py -X), elsewhere pythonX on PATH, then `uv python find X`
-(and `uv python install X` if uv is there and X is missing). Linux wheels are repaired with auditwheel to a
+(and `uv python install X` if uv is there and X is missing). The selected Python jobs run concurrently, with
+private compiler/wheel build directories so their native builds do not collide. Linux wheels are repaired with auditwheel to a
 manylinux tag, which PyPI requires; the tag follows the glibc of the machine that builds them.
 """
 import argparse, hashlib, os, pathlib, platform, re, shutil, subprocess, sys, tarfile, threading, time, zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -30,10 +32,13 @@ from vfa_version import __version__ as VERSION
 IS_WIN = platform.system() == "Windows"; IS_LINUX = platform.system() == "Linux"
 OS_TAG = "windows" if IS_WIN else "linux" if IS_LINUX else "macos"
 OUT = ROOT / "release" / VERSION
+MULTI_STATUS = False
+OUTPUT_LOCK = threading.Lock()
 
 def clock(t=None): return time.strftime("%H:%M:%S", time.localtime(t))
 
-def log(msg): print(f"[{clock()}] [release] {msg}", flush=True)
+def log(msg):
+    with OUTPUT_LOCK: print(f"[{clock()}] [release] {msg}", flush=True)
 
 def run(cmd, check=True, **kw):
     log("$ " + " ".join(str(c) for c in cmd))
@@ -48,7 +53,7 @@ class Status:
     SPIN_U, SPIN_A = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", "|/-\\"
     def __init__(self, label):
         self.label, self.t0, self.note, self.done, self.total, self.i = label, time.time(), "", 0, 0, 0
-        self.tty = sys.stdout.isatty(); self.lock = threading.Lock(); self.stop = threading.Event(); self.last = 0
+        self.tty = sys.stdout.isatty() and not MULTI_STATUS; self.lock = threading.Lock(); self.stop = threading.Event(); self.last = 0
         enc = sys.stdout.encoding or "ascii"
         def ok(t):
             try: t.encode(enc); return True
@@ -75,14 +80,15 @@ class Status:
         return f"{self._when()} {self._elapsed()}  {self.spin[self.i % len(self.spin)]} {self.label}{bar}  {self.note}"
     def _draw(self):
         width = shutil.get_terminal_size((100, 20)).columns - 1
-        print("\r" + self._line()[:width].ljust(width), end="", flush=True)
+        with OUTPUT_LOCK: print("\r" + self._line()[:width].ljust(width), end="", flush=True)
     def _tick(self):
         while not self.stop.wait(0.15):
             with self.lock:
                 self.i += 1
                 if self.tty: self._draw()
-                elif time.time() - self.last >= 30:
-                    self.last = time.time(); print(self._line(), flush=True)
+                elif time.time() - self.last >= (5 if MULTI_STATUS else 30):
+                    self.last = time.time()
+                    with OUTPUT_LOCK: print(self._line(), flush=True)
     def update(self, note=None, done=None):
         with self.lock:
             if note is not None: self.note = note
@@ -90,15 +96,17 @@ class Status:
     def say(self, text):
         """A line that stays (a failure), printed above the status line."""
         with self.lock:
-            if self.tty: print("\r" + " " * (shutil.get_terminal_size((100, 20)).columns - 1) + "\r", end="")
-            print(f"[{clock()}] {text.strip()}", flush=True)
+            with OUTPUT_LOCK:
+                if self.tty: print("\r" + " " * (shutil.get_terminal_size((100, 20)).columns - 1) + "\r", end="")
+                print(f"[{clock()}] {text.strip()}", flush=True)
     def finish(self, ok, note=""):
         with self.lock:
             self.stop.set()
             mark = self.ok_mark if ok else self.bad_mark
             text = f"{self._when(time.time())} {self._elapsed()}  {mark} {self.label}  {note}".rstrip()
-            if self.tty: print("\r" + text.ljust(shutil.get_terminal_size((100, 20)).columns - 1), flush=True)
-            else: print(text, flush=True)
+            with OUTPUT_LOCK:
+                if self.tty: print("\r" + text.ljust(shutil.get_terminal_size((100, 20)).columns - 1), flush=True)
+                else: print(text, flush=True)
 
 def run_status(cmd, label, logname, cwd=None, env=None, on_line=None, total=0):
     """Run cmd with a one-line status instead of its output; the full output goes to release/<ver>/logs/<logname>.
@@ -201,8 +209,13 @@ def build_wheel(py, pypi):
     tmp = ROOT / "build" / "wheels" / pathlib.Path(py).parent.parent.name
     shutil.rmtree(tmp, ignore_errors=True); tmp.mkdir(parents=True)
     tag = pathlib.Path(py).parent.parent.name          # <os>-pyX
-    run_quiet([py, "-m", "pip", "wheel", ROOT, "--no-deps", "--no-build-isolation", "-w", tmp],
-              f"{tag.split('-')[-1]}: wheel", f"{tag}-wheel.log", cwd=ROOT)
+    # setuptools otherwise shares ROOT/build between concurrent Python jobs.
+    build_base = tmp / "setuptools-build"
+    egg_base = tmp / "egg-info"; egg_base.mkdir()
+    env = dict(os.environ, VFA_EGG_BASE=str(egg_base))
+    run_quiet([py, ROOT / "setup.py", "build", f"--build-base={build_base}", "bdist_wheel",
+               f"--dist-dir={tmp}"],
+              f"{tag.split('-')[-1]}: wheel", f"{tag}-wheel.log", cwd=ROOT, env=env)
     whl = next(tmp.glob("*.whl"))
     if IS_LINUX:
         env = dict(os.environ, PATH=str(pathlib.Path(py).parent) + os.pathsep + os.environ.get("PATH", ""))  # patchelf
@@ -211,6 +224,39 @@ def build_wheel(py, pypi):
         return max(pypi.glob(whl.name.split("-linux_")[0] + "-*manylinux*.whl"), key=lambda p: p.stat().st_mtime)
     dst = pypi / whl.name; shutil.copy2(whl, dst)
     return dst
+
+def build_version(ver, a, pypi):
+    """Build one Python version; safe to run concurrently with other versions."""
+    row = {"python": ver, "tests": "-", "wheel": "-", "exes": "-"}
+    try:
+        py = env_python(ver, a.exe_python)
+        vulp_temp = ROOT / "build" / "vulp" / f"{OS_TAG}-py{ver}"
+        run_quiet([py, ROOT / "build_vulp.py", "--build-temp", vulp_temp],
+                  f"py{ver}: build _vulp", f"{OS_TAG}-py{ver}-vulp.log", cwd=ROOT)
+        if a.tests != "none":
+            ok, summary = run_tests(py, a.tests, ver)
+            row["tests"] = ("PASS " if ok else "FAIL ") + summary
+            if not ok:
+                raise RuntimeError(f"test_vfa.py failed on Python {ver}; not packaging it")
+        if not a.no_wheels:
+            row["wheel"] = build_wheel(py, pypi).name
+        if ver == a.exe_python and not a.no_exes:
+            if not a.no_wheels:
+                run_quiet([py, "-m", "build", "--sdist", "--no-isolation", "--outdir", pypi, ROOT],
+                          f"py{ver}: sdist", f"{OS_TAG}-sdist.log", cwd=pypi)
+            def step(line, st):
+                if line.startswith("[build]"): st.update(note=line[len("[build]"):].strip())
+            shutil.rmtree(OUT / OS_TAG, ignore_errors=True)
+            # build_vulp.py already produced this interpreter's extension. Avoid rebuilding the
+            # shared compiler temp tree while other Python versions are running.
+            run_quiet([py, ROOT / "build.py", "--matrix", "--no-vulp", "--out", OUT / OS_TAG],
+                      f"py{ver}: executables, installers, archives", f"{OS_TAG}-exes.log", cwd=ROOT, on_line=step)
+            row["exes"] = f"release/{VERSION}/{OS_TAG}"
+    except Exception as e:
+        row["tests"] = row["tests"] if row["tests"] != "-" else f"ERROR {e}"
+        log(f"Python {ver}: {e}")
+        return row, False
+    return row, True
 
 def to_wsl_path(p):
     r = subprocess.run(["wsl", "wslpath", "-a", str(p).replace("\\", "/")], capture_output=True, text=True)
@@ -398,7 +444,7 @@ def main(argv=None):
     ap.add_argument("--tests", choices=["quick", "full", "none"], default="quick", help="test_vfa.py per Python")
     ap.add_argument("--no-wheels", action="store_true"); ap.add_argument("--no-exes", action="store_true")
     ap.add_argument("--wsl", action="store_true", help="Windows: afterwards run the same release inside WSL (Linux)")
-    ap.add_argument("--keep-going", action="store_true", help="Continue with the next Python if one fails")
+    ap.add_argument("--keep-going", action="store_true", help="Compatibility option; selected Python jobs now run concurrently")
     ap.add_argument("--verbose", action="store_true", help="Show every command's full output (always saved to "
                                                           "release/<version>/logs/ either way)")
     ap.add_argument("--no-assemble", action="store_true", help="Skip collecting release/<version>/upload/ at the end")
@@ -412,37 +458,19 @@ def main(argv=None):
     # the commit the binaries come from, taken before building; WSL gets it from Windows (its own git would see the
     # Windows checkout as foreign or, through line endings and file modes, as modified)
     commit = a.build_commit or git_state()
-    global VERBOSE; VERBOSE = a.verbose
+    global VERBOSE, MULTI_STATUS; VERBOSE = a.verbose
 
     pythons = [v.strip() for v in a.pythons.split(",") if v.strip()]
     if a.exe_python not in pythons and not a.no_exes: pythons.append(a.exe_python)
+    pythons = list(dict.fromkeys(pythons))
+    MULTI_STATUS = len(pythons) > 1
     pypi = OUT / "pypi"; pypi.mkdir(parents=True, exist_ok=True)
-    rows, ok_all, t0 = [], True, time.time()
-    for ver in pythons:
-        row = {"python": ver, "tests": "-", "wheel": "-", "exes": "-"}
-        try:
-            py = env_python(ver, a.exe_python)
-            run_quiet([py, ROOT / "build_vulp.py"], f"py{ver}: build _vulp", f"{OS_TAG}-py{ver}-vulp.log", cwd=ROOT)
-            if a.tests != "none":
-                ok, summary = run_tests(py, a.tests, ver); row["tests"] = ("PASS " if ok else "FAIL ") + summary
-                if not ok:   # never package code that fails its tests (--keep-going moves on to the next Python)
-                    raise RuntimeError(f"test_vfa.py failed on Python {ver}; not packaging it")
-            if not a.no_wheels: row["wheel"] = build_wheel(py, pypi).name
-            if ver == a.exe_python and not a.no_exes:
-                if not a.no_wheels:   # not from ROOT: "-m build" would find this repo's build.py first
-                    run_quiet([py, "-m", "build", "--sdist", "--no-isolation", "--outdir", pypi, ROOT],
-                              f"py{ver}: sdist", f"{OS_TAG}-sdist.log", cwd=pypi)
-                def step(line, st):   # build.py's own "[build] ..." lines say what it is doing
-                    if line.startswith("[build]"): st.update(note=line[len("[build]"):].strip())
-                shutil.rmtree(OUT / OS_TAG, ignore_errors=True)   # nothing left over from an earlier build
-                run_quiet([py, ROOT / "build.py", "--matrix", "--out", OUT / OS_TAG],
-                          f"py{ver}: executables, installers, archives", f"{OS_TAG}-exes.log", cwd=ROOT, on_line=step)
-                row["exes"] = f"release/{VERSION}/{OS_TAG}"
-        except Exception as e:
-            row["tests"] = row["tests"] if row["tests"] != "-" else f"ERROR {e}"; ok_all = False
-            log(f"Python {ver}: {e}")
-            if not a.keep_going: rows.append(row); break
-        rows.append(row)
+    t0 = time.time()
+    log(f"Starting {len(pythons)} Python release job(s) concurrently: {', '.join(pythons)}")
+    with ThreadPoolExecutor(max_workers=len(pythons)) as pool:
+        results = list(pool.map(lambda ver: build_version(ver, a, pypi), pythons))
+    rows = [row for row, _ in results]
+    ok_all = all(ok for _, ok in results)
 
     report = OUT / f"RESULTS-{OS_TAG}.md"
     lines = [f"# VFA {VERSION} release, {OS_TAG} ({platform.platform()}), {time.strftime('%Y-%m-%d %H:%M')}", "",

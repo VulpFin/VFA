@@ -285,6 +285,12 @@ def t_determinism(work, corpus):
         a1, a2 = work / "det1.vfa", work / "det2.vfa"
         vfa("c", a1, corpus.name, "--method", m, *flags, cwd=corpus.parent); vfa("c", a2, corpus.name, "--method", m, *flags, cwd=corpus.parent)
         check(f"determinism: same input -> identical archive ({m}{' solid' if flags else ''})", a1.read_bytes() == a2.read_bytes())
+    # --threads N compresses blocks in parallel and decodes them in parallel on extract (the header records the
+    # --threads hint, so VFA1 archives differ there; the round trip is what must hold)
+    for flags in ([], ["--solid", "--solid-chunk-exp", "16"]):
+        arc = work / "thr.vfa"; vfa("c", arc, corpus.name, "--block-exp", "16", "--threads", "4", *flags, cwd=corpus.parent)
+        ok, why = extract_cmp(arc, corpus, work, "--threads", "4")
+        check(f"--threads 4: round-trip ({' '.join(flags) or 'non-solid'})", ok, why)
     # VFA1 uses only library codecs (zlib/lzma/zstd/...); the native-codec determinism tests are VFA2's 'native' group
 
 def t_sfx(work, corpus):
@@ -709,6 +715,15 @@ def t2_determinism(work, corpus):
         a1, a2 = work / "d2a.vfa", work / "d2b.vfa"
         vfa("c", a1, corpus.name, "--format", "vfa2", *flags, cwd=corpus.parent); vfa("c", a2, corpus.name, "--format", "vfa2", *flags, cwd=corpus.parent)
         check(f"vfa2 determinism: same input -> identical archive ({' '.join(flags) or 'non-solid'})", a1.read_bytes() == a2.read_bytes())
+    # parallel chunk encoding must not change a byte, and parallel decoding must restore the same tree
+    for flags in ([], ["--solid"], ["--solid", "--method", "cm"]):
+        a1, a4 = work / "d2t1.vfa", work / "d2t4.vfa"
+        for arc, t in ((a1, "1"), (a4, "4")):
+            vfa("c", arc, corpus.name, "--format", "vfa2", "--chunk-exp", "14", "--threads", t, *flags, cwd=corpus.parent)
+        label = ' '.join(flags) or 'non-solid'
+        check(f"vfa2 determinism: --threads 1 and 4 write identical archives ({label})", a1.read_bytes() == a4.read_bytes())
+        ok, why = extract_cmp(a4, corpus, work, "--threads", "4")
+        check(f"vfa2 --threads 4: round-trip ({label})", ok, why)
     # the archive must not depend on the order the filesystem lists directory entries in (NTFS sorts, ext4 does not)
     import vfa as V
     real_walk = os.walk
