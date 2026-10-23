@@ -964,7 +964,10 @@ def cmd_create(args):
     toc=TOC()
     hk = default_hash_kind()
 
-    workers = _parallel_workers(args.threads, block_size, args.max_ram_mib, enabled=method != M_NONE)
+    # a worker holds one unit: a solid chunk, or one block of a non-solid file
+    chunk_exp = int(args.solid_chunk_exp if args.solid_chunk_exp is not None else DEFAULT_SOLID_CHUNK_EXP)
+    unit_size = 1 << chunk_exp if args.solid else block_size
+    workers = _parallel_workers(args.threads, unit_size, args.max_ram_mib, enabled=method != M_NONE)
     executor_context = ThreadPoolExecutor(max_workers=workers) if workers > 1 else nullcontext()
     if workers > 1:
         LOGGER.info(f"Parallel compression enabled: {workers} worker threads, up to {_parallel_pending(workers)} blocks in flight")
@@ -986,9 +989,8 @@ def cmd_create(args):
         LOGGER.info(f"Preparing to compress {total_files} files ({human_bytes(total_bytes)}). Solid={bool(args.solid)} method={args.method} lvl={args.level}")
         solid = None
         if header.flags & F_SOLID:
-            chunk_exp = args.solid_chunk_exp if args.solid_chunk_exp is not None else DEFAULT_SOLID_CHUNK_EXP
-            LOGGER.info(f"Solid chunk size {human_bytes(1<<int(chunk_exp))}")
-            solid = _SolidStream(sink, method, args.level, 1 << int(chunk_exp), executor, _parallel_pending(workers))
+            LOGGER.info(f"Solid chunk size {human_bytes(unit_size)}")
+            solid = _SolidStream(sink, method, args.level, unit_size, executor, _parallel_pending(workers))
 
         for et, rel, st, meta_bytes in _scan_inputs(items, args):
             st_mode = (st.st_mode & 0o7777)

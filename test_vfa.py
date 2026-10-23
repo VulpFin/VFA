@@ -291,6 +291,21 @@ def t_determinism(work, corpus):
         arc = work / "thr.vfa"; vfa("c", arc, corpus.name, "--block-exp", "16", "--threads", "4", *flags, cwd=corpus.parent)
         ok, why = extract_cmp(arc, corpus, work, "--threads", "4")
         check(f"--threads 4: round-trip ({' '.join(flags) or 'non-solid'})", ok, why)
+    # the worker count is sized by the unit a worker holds: with --solid that is the solid chunk, not --block-exp
+    import vfa as V, concurrent.futures as cf, contextlib, io
+    pools = []; real_pool = V.ThreadPoolExecutor
+    class Pool(cf.ThreadPoolExecutor):
+        def __init__(self, max_workers=None, *a, **k): pools.append(max_workers); super().__init__(max_workers, *a, **k)
+    def used(*flags):
+        pools.clear(); V.ThreadPoolExecutor = Pool; cwd = os.getcwd(); os.chdir(corpus.parent)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                V.main(["c", str(work / "thrb.vfa"), corpus.name, "--threads", "8", "--log-level", "quiet", *flags])
+        finally: V.ThreadPoolExecutor = real_pool; os.chdir(cwd)
+        return pools[:]
+    solid_pools, plain_pools = used("--solid", "--max-ram-mib", "64"), used("--max-ram-mib", "64")
+    check("--threads: the RAM budget counts the solid chunk (64 MiB budget, 64 MiB chunks -> one worker)",
+          solid_pools == [] and plain_pools == [8], f"solid {solid_pools}, non-solid {plain_pools}")
     # VFA1 uses only library codecs (zlib/lzma/zstd/...); the native-codec determinism tests are VFA2's 'native' group
 
 def t_sfx(work, corpus):
